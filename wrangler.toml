@@ -2,3 +2,8 @@ name = "advisor-api"
 main = "worker.js"
 compatibility_date = "2026-10-19"
 # Deployed via Cloudflare Workers Builds from GitHub
+
+# Keep the LEADS KV binding in sync with the Cloudflare dashboard
+[[kv_namespaces]]
+binding = "LEADS"
+id = "1ed2126e01ef4891be0ce12890136b03"
