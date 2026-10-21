@@ -16,3 +16,4 @@ service = "seller-api"
 [[services]]
 binding = "NEWSLETTER"
 service = "newsletter-signup"
+# Retrigger Cloudflare Workers build (Google sign-in endpoints)
