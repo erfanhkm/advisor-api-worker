@@ -52,6 +52,48 @@ function limited(ip, max, windowMs) {
   return r.count > max;
 }
 
+// ---- KV op reduction (free-tier write/list caps are the tight resource) ----
+// 1) /api/track aggregates beacons in isolate memory and flushes the daily
+//    stats doc to KV in batches (same 'stat:<day>' key and doc format),
+//    instead of one KV read+write per pageview.
+// 2) Admin list endpoints (portal tabs) are cached in-isolate for a few
+//    seconds; any non-GET request clears the cache, so portal edits are
+//    never hidden by it.
+// 3) Visitor session + ban lookups are cached in-isolate briefly; purges and
+//    ban changes evict/update their entries immediately.
+const ADMIN_CACHE_TTL = 20000;
+const adminCache = new Map();
+function adminCached(name, loader) {
+  const now = Date.now();
+  const hit = adminCache.get(name);
+  if (hit && now - hit.t < ADMIN_CACHE_TTL) return hit.promise;
+  const promise = Promise.resolve().then(loader);
+  adminCache.set(name, { t: now, promise: promise });
+  promise.catch(function () {
+    const c = adminCache.get(name);
+    if (c && c.promise === promise) adminCache.delete(name);
+  });
+  return promise;
+}
+const SESS_CACHE_TTL = 60000;
+const sessCache = new Map(); // 'usess:<token>' -> { t, email|null }
+const BAN_CACHE_TTL = 60000;
+const banCache = new Map(); // normalized email -> { t, banned }
+const TRACK_FLUSH_EVENTS = 25;
+const TRACK_FLUSH_MS = 60000;
+let trackBuf = null; // { day, doc, events, firstTs, loading }
+let trackFlushChain = Promise.resolve();
+function flushTrack(env) {
+  const buf = trackBuf;
+  if (!buf || buf.events === 0) return trackFlushChain;
+  const key = 'stat:' + buf.day;
+  const snapshot = JSON.stringify(buf.doc);
+  buf.events = 0;
+  buf.firstTs = 0;
+  trackFlushChain = trackFlushChain.then(function () { return env.LEADS.put(key, snapshot); }).catch(function () {});
+  return trackFlushChain;
+}
+
 async function sha256hex(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
@@ -148,12 +190,18 @@ async function userAuth(request, env) {
   const h = request.headers.get('Authorization') || '';
   const m = h.match(/^Bearer (u_[0-9a-f]{32})$/);
   if (!m) return null;
-  const raw = await env.LEADS.get('usess:' + m[1]);
-  if (!raw) return null;
-  let s = null;
-  try { s = JSON.parse(raw); } catch (e) {}
-  if (!s || Date.now() > s.exp) return null;
-  return s.email;
+  const key = 'usess:' + m[1];
+  const c = sessCache.get(key);
+  if (c && Date.now() - c.t < SESS_CACHE_TTL) return c.email;
+  const raw = await env.LEADS.get(key);
+  let email = null;
+  if (raw) {
+    let s = null;
+    try { s = JSON.parse(raw); } catch (e) {}
+    if (s && Date.now() <= s.exp) email = s.email;
+  }
+  sessCache.set(key, { t: Date.now(), email: email });
+  return email;
 }
 async function userSaved(env, email) {
   return (await env.LEADS.get('usaved:' + email, { type: 'json' })) || [];
@@ -177,13 +225,18 @@ function normEmail(email) {
 }
 async function isBanned(env, email) {
   if (!email) return false;
-  return !!(await env.LEADS.get('ban:' + normEmail(email)));
+  const ne = normEmail(email);
+  const c = banCache.get(ne);
+  if (c && Date.now() - c.t < BAN_CACHE_TTL) return c.banned;
+  const banned = !!(await env.LEADS.get('ban:' + ne));
+  banCache.set(ne, { t: Date.now(), banned: banned });
+  return banned;
 }
 async function purgeUserSessions(env, email) {
   const list = await env.LEADS.list({ prefix: 'usess:', limit: 1000 });
   for (const k of list.keys) {
     const s = await env.LEADS.get(k.name, { type: 'json' });
-    if (s && s.email === email) await env.LEADS.delete(k.name);
+    if (s && s.email === email) { sessCache.delete(k.name); await env.LEADS.delete(k.name); }
   }
 }
 
@@ -252,6 +305,9 @@ async function allTasks(env) {
   return out;
 }
 async function buildContacts(env) {
+  return adminCached('contacts', function () { return buildContactsFresh(env); });
+}
+async function buildContactsFresh(env) {
   const byKey = {};
   function entry(email) {
     const key = normEmail(email);
@@ -473,6 +529,8 @@ export default {
       if (cl > 32768) return json({ ok: false, error: 'too_large' }, 413, origin);
     }
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+    // Any write request may change CRM data: drop cached admin list results.
+    if (request.method !== 'GET' && request.method !== 'OPTIONS') adminCache.clear();
     try {
       // ---- public: health ----
       if (path === '/api/health') {
@@ -519,8 +577,18 @@ export default {
         try { d = await request.json(); } catch (e) {}
         d = d || {};
         const day = new Date().toISOString().slice(0, 10);
-        const key = 'stat:' + day;
-        const doc = (await env.LEADS.get(key, { type: 'json' })) || { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} };
+        // Aggregate into the in-isolate buffer; flushed to KV in batches by
+        // flushTrack (same 'stat:<day>' key and doc shape as before).
+        if (!trackBuf || trackBuf.day !== day) {
+          if (trackBuf && trackBuf.events > 0) { const p0 = flushTrack(env); if (ctx && ctx.waitUntil) ctx.waitUntil(p0); }
+          const fresh = { day: day, doc: null, events: 0, firstTs: 0, loading: null };
+          fresh.loading = env.LEADS.get('stat:' + day, { type: 'json' })
+            .then(function (dd) { fresh.doc = dd || { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} }; })
+            .catch(function () { fresh.doc = { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} }; });
+          trackBuf = fresh;
+        }
+        if (!trackBuf.doc) await trackBuf.loading;
+        const doc = trackBuf.doc;
         const type = String(d.type || 'pageview').slice(0, 30);
         const page = String(d.page || '').slice(0, 80);
         if (type === 'pageview' && page) doc.pv[page] = (doc.pv[page] || 0) + 1;
@@ -541,7 +609,12 @@ export default {
         const ua = request.headers.get('User-Agent') || '';
         const uh = (await sha256hex(ip + '|' + ua + '|' + day)).slice(0, 16);
         if (Object.keys(doc.uv).length < 5000) doc.uv[uh] = 1;
-        await env.LEADS.put(key, JSON.stringify(doc));
+        trackBuf.events++;
+        if (!trackBuf.firstTs) trackBuf.firstTs = Date.now();
+        if (trackBuf.events >= TRACK_FLUSH_EVENTS || Date.now() - trackBuf.firstTs >= TRACK_FLUSH_MS) {
+          const p = flushTrack(env);
+          if (ctx && ctx.waitUntil) ctx.waitUntil(p);
+        }
         return json({ ok: true }, 200, origin);
       }
 
@@ -894,11 +967,14 @@ export default {
       }
 
       if (path === '/api/leads' && request.method === 'GET') {
-        const list = await env.LEADS.list({ prefix: 'lead:', limit: 1000 });
-        const leads = (await Promise.all(
-          list.keys.map(k => env.LEADS.get(k.name, { type: 'json' }))
-        )).filter(Boolean);
-        leads.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+        const leads = await adminCached('leads', async function () {
+          const list = await env.LEADS.list({ prefix: 'lead:', limit: 1000 });
+          const out = (await Promise.all(
+            list.keys.map(k => env.LEADS.get(k.name, { type: 'json' }))
+          )).filter(Boolean);
+          out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          return out;
+        });
         return json({ ok: true, leads: leads }, 200, origin);
       }
 
@@ -969,11 +1045,14 @@ export default {
       }
 
       if (path === '/api/market-leads' && request.method === 'GET') {
-        const list = await env.LEADS.list({ prefix: 'mlead:', limit: 1000 });
-        const mleads = (await Promise.all(
-          list.keys.map(k => env.LEADS.get(k.name, { type: 'json' }))
-        )).filter(Boolean);
-        mleads.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+        const mleads = await adminCached('mleads', async function () {
+          const list = await env.LEADS.list({ prefix: 'mlead:', limit: 1000 });
+          const out = (await Promise.all(
+            list.keys.map(k => env.LEADS.get(k.name, { type: 'json' }))
+          )).filter(Boolean);
+          out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          return out;
+        });
         return json({ ok: true, leads: mleads }, 200, origin);
       }
 
@@ -1030,16 +1109,19 @@ export default {
 
       // ---- admin: newsletter subscribers (grouped by language) ----
       if (path === '/api/admin/newsletter' && request.method === 'GET') {
-        const list = await env.LEADS.list({ prefix: 'nlsub:', limit: 1000 });
-        const subs = [];
-        for (const k of list.keys) {
-          const raw = await env.LEADS.get(k.name);
-          if (raw) subs.push(JSON.parse(raw));
-        }
-        subs.sort(function (a, b) { return String(b.created_at).localeCompare(String(a.created_at)); });
-        const byLang = { en: 0, fa: 0, hi: 0, zh: 0 };
-        subs.forEach(function (s) { if (byLang[s.lang] != null) byLang[s.lang]++; });
-        return json({ ok: true, subscribers: subs, byLang: byLang, count: subs.length }, 200, origin);
+        const data = await adminCached('newsletter', async function () {
+          const list = await env.LEADS.list({ prefix: 'nlsub:', limit: 1000 });
+          const subs = [];
+          for (const k of list.keys) {
+            const raw = await env.LEADS.get(k.name);
+            if (raw) subs.push(JSON.parse(raw));
+          }
+          subs.sort(function (a, b) { return String(b.created_at).localeCompare(String(a.created_at)); });
+          const byLang = { en: 0, fa: 0, hi: 0, zh: 0 };
+          subs.forEach(function (s) { if (byLang[s.lang] != null) byLang[s.lang]++; });
+          return { subscribers: subs, byLang: byLang, count: subs.length };
+        });
+        return json({ ok: true, subscribers: data.subscribers, byLang: data.byLang, count: data.count }, 200, origin);
       }
       if (path === '/api/admin/newsletter' && request.method === 'DELETE') {
         const em = String(url.searchParams.get('email') || '').trim().toLowerCase();
@@ -1160,6 +1242,7 @@ export default {
 
       // ---- admin: registered visitors (summary) + delete / ban by email ----
       if (path === '/api/admin/users' && request.method === 'GET') {
+        const data = await adminCached('users', async function () {
         const list = await env.LEADS.list({ prefix: 'user:', limit: 200 });
         const bans = await env.LEADS.list({ prefix: 'ban:', limit: 500 });
         const banSet = {};
@@ -1176,7 +1259,9 @@ export default {
         }
         out.sort(function (a, b) { return String(b.created_at).localeCompare(String(a.created_at)); });
         const banList = Object.keys(banSet).map(function (nk) { return { email: banSet[nk].email || nk, normalized: nk, reason: banSet[nk].reason || '', at: banSet[nk].at || '' }; });
-        return json({ ok: true, users: out, count: out.length, bans: banList }, 200, origin);
+        return { users: out, count: out.length, bans: banList };
+        });
+        return json({ ok: true, users: data.users, count: data.count, bans: data.bans }, 200, origin);
       }
       const aum = path.match(/^\/api\/admin\/users\/(.+)$/);
       if (aum && (request.method === 'DELETE' || request.method === 'POST')) {
@@ -1209,11 +1294,13 @@ export default {
         }
         if (d.action === 'ban') {
           await env.LEADS.put('ban:' + normEmail(target), JSON.stringify({ email: target, reason: String(d.reason || '').slice(0, 200), at: new Date().toISOString() }));
+          banCache.set(normEmail(target), { t: Date.now(), banned: true });
           await purgeUserSessions(env, target);
           return json({ ok: true }, 200, origin);
         }
         if (d.action === 'unban') {
           await env.LEADS.delete('ban:' + normEmail(target));
+          banCache.set(normEmail(target), { t: Date.now(), banned: false });
           return json({ ok: true }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
@@ -1225,6 +1312,7 @@ export default {
         return json({ ok: true, contacts: contacts, count: contacts.length }, 200, origin);
       }
       if (path === '/api/admin/desk' && request.method === 'GET') {
+        const data = await adminCached('desk', async function () {
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Vancouver' });
         const vidx2 = (await env.LEADS.get('vidx', { type: 'json' })) || [];
         const allV = [];
@@ -1247,7 +1335,9 @@ export default {
         const tasksDue = (await allTasks(env)).filter(function (t) { return !t.done && t.due <= todayStr; })
           .sort(function (a, b) { return String(a.due).localeCompare(String(b.due)); }).slice(0, 8)
           .map(function (t) { return { id: t.id, email: t.email, name: nameByKey[t.email] || t.email, text: t.text, due: t.due, overdue: t.due < todayStr }; });
-        return json({ ok: true, today: todayStr, upcomingViewings: upcoming, viewingsToday: upcoming.filter(function (v) { return v.date === todayStr; }).length, newLeads24h: newLeads24h, followUps: followUps.slice(0, 5).map(function (c) { return { email: c.email, name: c.name, hours: c.followUp.hours, kind: c.followUp.kind, score: c.score }; }), followUpCount: followUps.length, hotCount: contacts2.filter(function (c) { return c.tier === 'hot'; }).length, usersTotal: ulist2.keys.length, mailUnsent: mailUnsent, tasksDue: tasksDue, tasksDueCount: tasksDue.length }, 200, origin);
+        return { today: todayStr, upcomingViewings: upcoming, viewingsToday: upcoming.filter(function (v) { return v.date === todayStr; }).length, newLeads24h: newLeads24h, followUps: followUps.slice(0, 5).map(function (c) { return { email: c.email, name: c.name, hours: c.followUp.hours, kind: c.followUp.kind, score: c.score }; }), followUpCount: followUps.length, hotCount: contacts2.filter(function (c) { return c.tier === 'hot'; }).length, usersTotal: ulist2.keys.length, mailUnsent: mailUnsent, tasksDue: tasksDue, tasksDueCount: tasksDue.length };
+        });
+        return json(Object.assign({ ok: true }, data), 200, origin);
       }
 
       // ---- admin: outgoing mail queue (drained by the mailer cron once a sender is configured) ----
