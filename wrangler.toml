@@ -16,4 +16,8 @@ service = "seller-api"
 [[services]]
 binding = "NEWSLETTER"
 service = "newsletter-signup"
+
+[[services]]
+binding = "AICHAT"
+service = "ai-chat"
 # Retrigger Cloudflare Workers build (Google sign-in endpoints)
