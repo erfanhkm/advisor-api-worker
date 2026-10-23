@@ -3274,4 +3274,3 @@ export default {
     }
   }
 };
-};
