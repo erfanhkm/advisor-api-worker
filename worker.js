@@ -277,6 +277,14 @@ function perfPendingEvents() {
   for (const k of Object.keys(perfPending.sources)) n += perfPending.sources[k];
   return n;
 }
+function perfPendingReal() {
+  // Pack E (R-01 N6): dropped events ride along with the next real
+  // flush — they are persisted inside the delta doc but NEVER trigger
+  // a flush (or the trailing timer) on their own, so a burst of junk
+  // beacons cannot burn the KV write budget.
+  if (!perfPending) return 0;
+  return perfPendingEvents() - perfPending.dropped;
+}
 // Flush = write the pending delta under this isolate's OWN next key.
 // The pending buffer is cleared ONLY after the put resolves (F-01 H2);
 // on failure the delta merges back into the live buffer and a later
@@ -300,6 +308,29 @@ function flushPerf(env) {
   });
   return perfFlushChain;
 }
+const PERF_TIMER_MS = 20000;
+let perfTimerArmed = false;
+// Pack E (R-01 N1): trailing-edge flush. An isolate that goes idle
+// below the count/age thresholds used to lose its tail entirely (the
+// cron isolate's flushPerf sees an empty buffer; the request isolate
+// that buffered the events is gone). A bump that did not threshold-
+// flush arms a one-shot ~20s timer inside ctx.waitUntil instead; at
+// this site's volume the extra put per idle tail is worth not losing
+// most events pre-launch.
+function perfArm(env, ctx) {
+  if (perfTimerArmed || !ctx || !ctx.waitUntil) return;
+  perfTimerArmed = true;
+  const p = (async function () {
+    try { await new Promise(function (r) { setTimeout(r, PERF_TIMER_MS); }); } catch (e) {}
+    perfTimerArmed = false;
+    // Flush AND fold: the delta alone only surfaces via perfRead's
+    // merge — the stored totals (the portal's aggregates) move only
+    // at a fold, and an idle isolate may never see a scheduled() tick.
+    await flushPerf(env);
+    await perfFold(env);
+  })();
+  try { ctx.waitUntil(p); } catch (e) { perfTimerArmed = false; }
+}
 async function perfBump(env, ctx, kind, key) {
   try {
     const doc = perfPendingDoc();
@@ -312,7 +343,14 @@ async function perfBump(env, ctx, kind, key) {
       // trivially plantable via /api/track beacons — must not open a
       // dashboard row either; it counts as dropped, exactly like a
       // malformed key. (The fold's catalog prune stays as backstop.)
-      else if (!catalogByMls(key)) doc.dropped++;
+      // Pack E (R-01 N2): the nonexistent check only bites once this
+      // isolate has actually loaded the catalog (customCatalogAt != 0).
+      // /api/track skips the pre-route refresh, so on a cold isolate
+      // catalogByMls() sees only seed samples and a portal-managed
+      // listing's views were dropped as "nonexistent"; those ids are
+      // now accepted provisionally and the (freshness-guarded) fold
+      // prunes any that truly are not in the catalog.
+      else if (!catalogByMls(key) && customCatalogAt !== 0) doc.dropped++;
       else {
         let e = Object.hasOwn(doc.listings, key) ? doc.listings[key] : null;
         if (!e) {
@@ -324,10 +362,10 @@ async function perfBump(env, ctx, kind, key) {
     } else return;
     if (!perfFirstTs) perfFirstTs = Date.now();
     if (!perfPendingAt) perfPendingAt = new Date().toISOString();
-    if (perfPendingEvents() >= PERF_FLUSH_EVENTS || Date.now() - perfFirstTs >= PERF_FLUSH_MS) {
+    if (perfPendingReal() >= PERF_FLUSH_EVENTS || (perfPendingReal() > 0 && Date.now() - perfFirstTs >= PERF_FLUSH_MS)) {
       const p = flushPerf(env);
       if (ctx && ctx.waitUntil) ctx.waitUntil(p);
-    }
+    } else if (perfPendingReal() > 0) perfArm(env, ctx); // trailing edge (N1); dropped-only buffers never arm (N6)
   } catch (e) {}
 }
 // The fold — runs ONLY from scheduled(), the sole writer of
@@ -345,28 +383,58 @@ async function perfFold(env) {
     catch (e) { return { ok: false }; } // totals unreadable: fold nothing, delete nothing — deltas retry next run
     const totals = perfNormalize(raw);
     let startedAt = (raw && typeof raw === 'object' && typeof raw.startedAt === 'string' && raw.startedAt) ? raw.startedAt : null;
+    // Pack E (R-01 N3): the fold is idempotent. totals carries a
+    // `folded` name map: a listed delta already in the map is
+    // re-DELETED without re-adding (the totals put lands before the
+    // deletes, so a failed delete used to double-count on the next
+    // fold), and a key whose read returns null (propagation lag) is
+    // left in place — never deleted unfolded (that was silent data
+    // loss). perfRead skips map-named deltas for the same reason.
+    const foldedMap = Object.create(null);
+    if (raw && typeof raw === 'object' && raw.folded && typeof raw.folded === 'object' && !Array.isArray(raw.folded)) {
+      for (const fk of Object.keys(raw.folded)) if (/^perf:d:[A-Za-z0-9:_-]{1,96}$/.test(fk)) foldedMap[fk] = 1;
+    }
     const foldedKeys = [];
     let cursor;
     do {
       const page = await kvList(env, { prefix: 'perf:d:', limit: 1000, cursor: cursor });
       for (const k of page.keys) {
+        if (Object.hasOwn(foldedMap, k.name)) { foldedKeys.push(k.name); continue; } // already counted: retry the delete only
         let draw = null, getFailed = false;
         try { draw = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) { getFailed = true; }
         if (getFailed) continue; // transient read failure: leave the key for the next fold
         if (draw && typeof draw === 'object') {
           perfAddInto(totals, perfNormalize(draw));
-          if (!startedAt && typeof draw.at === 'string' && draw.at) startedAt = draw.at;
+          if (typeof draw.at === 'string' && draw.at && (!startedAt || draw.at < startedAt)) startedAt = draw.at; // startedAt = the MINIMUM delta at (R-01 low)
+          foldedMap[k.name] = 1;
+          foldedKeys.push(k.name);
         }
-        foldedKeys.push(k.name); // merged (or unreadable garbage): cleared below either way
+        // draw === null: the key is listed but not yet readable —
+        // skip it WITHOUT deleting; its 7-day TTL is the backstop.
       }
       cursor = page.list_complete ? undefined : page.cursor;
     } while (cursor);
-    const ids = Object.create(null);
-    mergedCatalog().forEach(function (c) { ids[c.mls] = 1; });
-    for (const k of Object.keys(totals.listings)) if (!Object.hasOwn(ids, k)) delete totals.listings[k];
+    // Pack E (R-01 N2): prune ONLY against a proven-fresh catalog.
+    // The old unconditional prune ran against whatever catalog the
+    // cron isolate happened to hold — seed-only there permanently
+    // deleted portal-listing counters.
+    if (catalogIsFresh()) {
+      const ids = Object.create(null);
+      mergedCatalog().forEach(function (c) { ids[c.mls] = 1; });
+      for (const k of Object.keys(totals.listings)) if (!Object.hasOwn(ids, k)) delete totals.listings[k];
+    }
     totals.startedAt = startedAt || new Date().toISOString();
+    // Bound the folded map so the totals doc cannot grow forever:
+    // entries are re-derivable from a still-listed key, and delta
+    // keys themselves expire after 7 days.
+    const fkeys = Object.keys(foldedMap);
+    if (fkeys.length > 2000) { for (const fk of fkeys.slice(0, fkeys.length - 2000)) delete foldedMap[fk]; }
+    totals.folded = foldedMap;
     await env.LEADS.put('perf:totals', JSON.stringify(totals));
     for (const name of foldedKeys) { try { await env.LEADS.delete(name); } catch (e) {} }
+    // Fold health (R-01 N3): the admin route exposes this and the
+    // portal warns when the last successful fold is >36h old.
+    try { await env.LEADS.put('perf:lastfold', new Date().toISOString()); } catch (e) {}
     return { ok: true, folded: foldedKeys.length };
   } catch (e) { return { ok: false }; }
 }
@@ -381,22 +449,31 @@ async function perfRead(env) {
   catch (e) { return null; }
   const out = perfNormalize(raw);
   let startedAt = (raw && typeof raw === 'object' && typeof raw.startedAt === 'string' && raw.startedAt) ? raw.startedAt : null;
+  // Pack E (R-01 N3): deltas already folded into totals are skipped —
+  // while their deletes propagate, counting them again would double.
+  const foldedMap = (raw && typeof raw === 'object' && raw.folded && typeof raw.folded === 'object' && !Array.isArray(raw.folded)) ? raw.folded : {};
+  let stale = false;
   let cursor;
-  do {
-    const page = await kvList(env, { prefix: 'perf:d:', limit: 1000, cursor: cursor });
-    for (const k of page.keys) {
-      let draw = null;
-      try { draw = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) {}
-      if (draw && typeof draw === 'object') {
-        perfAddInto(out, perfNormalize(draw));
-        if (!startedAt && typeof draw.at === 'string' && draw.at) startedAt = draw.at;
+  try {
+    do {
+      const page = await kvList(env, { prefix: 'perf:d:', limit: 1000, cursor: cursor });
+      for (const k of page.keys) {
+        if (Object.hasOwn(foldedMap, k.name)) continue;
+        let draw = null, getFailed = false;
+        try { draw = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) { getFailed = true; }
+        if (getFailed) { stale = true; continue; } // Pack E (R-01 N4): a partial read SAYS so — a silent undercount presented as complete breaks the never-fabricated rule; the route maps this to stale:true (the portal banner exists for exactly this)
+        if (draw && typeof draw === 'object') {
+          perfAddInto(out, perfNormalize(draw));
+          if (typeof draw.at === 'string' && draw.at && (!startedAt || draw.at < startedAt)) startedAt = draw.at;
+        }
       }
-    }
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch (e) { return null; } // Pack E (R-01 N4): a failed list is a failed read — the ok:false path, not a bare 500 from the catch-all
   if (perfPending) perfAddInto(out, perfPending);
-  if (!startedAt) startedAt = perfPendingAt;
+  if (perfPendingAt && (!startedAt || perfPendingAt < startedAt)) startedAt = perfPendingAt;
   out.startedAt = startedAt;
+  if (stale) out.stale = true;
   return out;
 }
 function bumpC(map, key, cap) {
@@ -409,6 +486,17 @@ async function sha256hex(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
+// Pack E (RDR-01 M2/L4 + M8): pool identity normalisation (trim /
+// collapse whitespace / lowercase — the hash input is side + '|' +
+// this, so the same post in different case or spacing is ONE record,
+// and a demand and a supply post can never clobber each other);
+// phone storage form (digits and a single leading + only); posted_at
+// parsing for relist detection; the radar switch read for the write
+// gate.
+function normIkey(v) { return cleanText(v, 300).replace(/\s+/g, ' ').trim().toLowerCase(); }
+function normPoolPhone(v) { const s = String(v || '').replace(/[^0-9+]/g, ''); return ((s.charAt(0) === '+' ? '+' : '') + s.replace(/\+/g, '')).slice(0, 20); }
+function postedMs(v) { const s = String(v || '').trim(); if (!s) return null; const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00Z' : s); return isFinite(t) ? t : null; }
+async function radarEnabled(env) { try { const s = await env.LEADS.get('radar:settings', { type: 'json' }); return !!(s && s.enabled === true); } catch (e) { return false; } }
 function timingSafeEqual(a, b) {
   a = String(a == null ? '' : a);
   b = String(b == null ? '' : b);
@@ -623,6 +711,10 @@ function parseBedBath(v, max, halves) {
   if (v === undefined || v === null) return { value: null };
   if (typeof v === 'string' && v.trim() === '') return { value: null };
   if (typeof v !== 'number' && typeof v !== 'string') return { invalid: true };
+  // Pack E (R-02 L5): strings pass a strict shape gate BEFORE Number()
+  // — Number("0x10") is 16 and Number("1e1") is 10, so hex/scientific
+  // strings used to be silently accepted as bed/bath counts.
+  if (typeof v === 'string' && !(halves ? /^\d{1,2}(\.5)?$/ : /^\d{1,2}$/).test(v.trim())) return { invalid: true };
   const n = Number(v);
   if (!isFinite(n) || n < 0 || n > max) return { invalid: true };
   if (halves ? ((n * 2) % 1 !== 0) : !Number.isInteger(n)) return { invalid: true };
@@ -642,10 +734,13 @@ function trimOutliers(sorted) {
 }
 // Interquartile band of a sorted series x mult; a degenerate (zero-width)
 // band widens to median ±5% — the same treatment in both estimate paths
-// (F-02 M3).
+// (F-02 M3). Pack E (R-02 M4): the widening is now a MINIMUM WIDTH, not
+// just a zero-width rescue — two comps 0.2% apart used to yield a ~$5k
+// band implying certainty the data does not support; any band narrower
+// than hi/lo = 1.1 widens to median ±5% (ratio 1.105).
 function bandOf(sorted, mult) {
   let lo = pctile(sorted, 0.25) * mult, hi = pctile(sorted, 0.75) * mult;
-  if (!(hi > lo)) { const mid = pctile(sorted, 0.5) * mult; lo = mid * 0.95; hi = mid * 1.05; }
+  if (!(hi > lo) || hi / lo < 1.1) { const mid = pctile(sorted, 0.5) * mult; lo = mid * 0.95; hi = mid * 1.05; }
   return [lo, hi];
 }
 // The single exit gate for every estimate (F-02 H3): both ends finite,
@@ -658,79 +753,123 @@ function finishEst(lo, hi, comps, basis) {
   lo = Math.floor(lo / 5000) * 5000;
   hi = Math.ceil(hi / 5000) * 5000;
   if (!(lo >= 50000) || !(hi <= 50000000) || !(hi > lo) || hi / lo > 1.6) return null;
-  return { low: lo, high: hi, comps: comps, basis: basis, confidence: comps >= 5 ? 'medium' : 'low' };
+  // Pack E (R-02 L3): the size-blind 'price' band never claims
+  // 'medium' — comp count cannot cure not knowing the subject's size.
+  return { low: lo, high: hi, comps: comps, basis: basis, confidence: (basis === 'price' ? 'low' : (comps >= 5 ? 'medium' : 'low')) };
 }
+// Pack E (R-02 L4): the ONE comp-type normaliser, applied to BOTH the
+// visitor's type and each catalog record's type. 'apartment' and
+// 'condo' are the same stock under two names (visitor-facing synonym
+// vs catalog vocabulary, and portal listings may carry either), so
+// both normalise to 'condo' — the old one-way alias missed apartment-
+// typed catalog records for a 'condo' query. 'duplex' deliberately
+// gets no proxy: there is no honest comp set for it, it stays manual.
+function compTypeOf(t) {
+  const n = normPlace(t);
+  return (n === 'apartment' || n === 'condo') ? 'condo' : n;
+}
+// Entry-wise twin of trimOutliers for [mls, value] pairs (Pack E,
+// R-02 L2): trimming must keep the mls attached to its value so the
+// lead's audit trail names the comps actually USED, not every
+// candidate that was merely considered. Entries arrive sorted by v.
+function trimOutliersE(entries) {
+  if (entries.length < 3) return entries;
+  const med = pctile(entries.map(function (e) { return e.v; }), 0.5);
+  if (!(med > 0)) return entries;
+  return entries.filter(function (e) { return e.v >= med * 0.5 && e.v <= med * 2; });
+}
+// Returns an estimate object, or { none: <reason> } when no honest
+// estimate exists (Pack E, R-02 L2): the route stores the reason on
+// the lead ('no_comps' / 'no_sqft_comps' / 'gate_rejected' /
+// 'read_failed'; 'catalog_stale' is the route's own case) instead of
+// every null reading as "no comparable listings".
 async function valuationEstimate(env, q) {
   q = q || {};
   const city = normPlace(q.city), type = normPlace(q.type);
-  if (!city || !type) return null;
-  // Comp-matching alias (Pack D, F-03S L10): 'apartment' has no
-  // catalog population of its own — the word is the visitor-facing
-  // synonym for the condo stock, so apartments are priced from condo
-  // comparables. The alias lives ONLY here: the lead record keeps the
-  // type the visitor actually submitted. 'duplex' deliberately gets
-  // no proxy — there is no honest comp set for it, so it stays manual.
-  const compType = type === 'apartment' ? 'condo' : type;
+  if (!city || !type) return { none: 'no_comps' };
+  // Comp matching normalises BOTH sides through compTypeOf (Pack E,
+  // R-02 L4). The lead record keeps the type the visitor actually
+  // submitted; est.alias marks that the alias fired so the route can
+  // note "(condo comparables)" in the lead text.
+  const compType = compTypeOf(type);
   const ps = parseSqft(q.sqft);
-  if (ps.given && !ps.valid) return null;
+  if (ps.given && !ps.valid) return { none: 'gate_rejected' };
   const sqft = ps.valid ? ps.value : 0;
-  const comps = mergedCatalog().filter(function (l) {
-    return (!l.status || l.status === 'active') && normPlace(l.city) === city && normPlace(l.type) === compType && okCompPrice(Number(l.price));
-  }).slice(0, 25);
-  if (!comps.length) return null;
-  const seedSqft = Object.create(null);
-  SEED_LISTINGS.forEach(function (s) { const n = Number(s.sqft); if (okCompSqft(n)) seedSqft[s.mls] = n; });
-  // Full records in parallel (F-02 M4). Any failed read is tracked (F-02
-  // M1): an estimate computed from a silently-shrunken comp set is a
-  // wrong number with a confident face, so a failure abandons it.
-  const fulls = await Promise.all(comps.map(function (c) {
-    if (!c.mls) return Promise.resolve({ skip: true });
-    let p;
-    try { p = env.LEADS.get('listing:' + c.mls, { type: 'json' }); } catch (e) { return Promise.resolve({ failed: true }); }
-    return Promise.resolve(p).then(function (full) { return { full: full }; }, function () { return { failed: true }; });
-  }));
-  if (fulls.some(function (r) { return r.failed; })) return null;
-  const ppsf = [];
-  const prices = [];
-  comps.forEach(function (c, i) {
-    const price = Number(c.price);
-    prices.push(price);
-    let sf = 0;
-    if (c.mls) {
-      const full = fulls[i].full;
-      if (full) { const n = Number(full.sqft); if (okCompSqft(n)) sf = n; }
-      else sf = seedSqft[c.mls] || 0;
-    }
-    if (sf > 0) ppsf.push(price / sf);
+  let comps = mergedCatalog().filter(function (l) {
+    return (!l.status || l.status === 'active') && normPlace(l.city) === city && compTypeOf(l.type) === compType && okCompPrice(Number(l.price));
   });
+  if (!comps.length) return { none: 'no_comps' };
+  // Pack E (R-02 L1): an over-cap candidate set keeps the 25 closest
+  // in price to the set's own median — deterministic (distance, then
+  // mls) instead of catalog order.
+  if (comps.length > 25) {
+    const med = pctile(comps.map(function (c) { return Number(c.price); }).sort(function (a, b) { return a - b; }), 0.5);
+    comps = comps.slice().sort(function (a, b) {
+      return (Math.abs(Number(a.price) - med) - Math.abs(Number(b.price) - med)) || String(a.mls || '').localeCompare(String(b.mls || ''));
+    }).slice(0, 25);
+  }
+  // The alias fired iff a comp that was actually USED carries a raw
+  // type different from the subject's (an apartment comp behind a
+  // condo subject, or vice versa) — comparing canonical types on both
+  // sides made the flag unreachable in the condo-subject direction.
+  const rawTypeByMls = Object.create(null);
+  comps.forEach(function (c) { if (c.mls) rawTypeByMls[c.mls] = normPlace(c.type); });
+  const withAlias = function (est, kept) {
+    if (est && Array.isArray(kept) && kept.some(function (e) { return e.mls && rawTypeByMls[e.mls] && rawTypeByMls[e.mls] !== type; })) est.alias = compType;
+    return est;
+  };
   if (sqft > 0) {
+    const seedSqft = Object.create(null);
+    SEED_LISTINGS.forEach(function (s) { const n = Number(s.sqft); if (okCompSqft(n)) seedSqft[s.mls] = n; });
+    // Full records in parallel (F-02 M4) — ONLY on this path (Pack E,
+    // R-02 L1): the price band never reads them, and 25 wasted reads
+    // burned the subrequest budget the lead put itself needs. Any
+    // failed read is tracked (F-02 M1): an estimate computed from a
+    // silently-shrunken comp set is a wrong number with a confident
+    // face, so a failure abandons it.
+    const fulls = await Promise.all(comps.map(function (c) {
+      if (!c.mls) return Promise.resolve({ skip: true });
+      let p;
+      try { p = env.LEADS.get('listing:' + c.mls, { type: 'json' }); } catch (e) { return Promise.resolve({ failed: true }); }
+      return Promise.resolve(p).then(function (full) { return { full: full }; }, function () { return { failed: true }; });
+    }));
+    if (fulls.some(function (r) { return r.failed; })) return { none: 'read_failed' };
+    const ppsfE = [];
+    comps.forEach(function (c, i) {
+      let sf = 0;
+      if (c.mls) {
+        const full = fulls[i].full;
+        if (full) { const n = Number(full.sqft); if (okCompSqft(n)) sf = n; }
+        else sf = seedSqft[c.mls] || 0;
+      }
+      if (sf > 0) ppsfE.push({ mls: c.mls, v: Number(c.price) / sf });
+    });
     // A stated size is honoured or the estimate is abandoned (F-02 H2):
     // with no sqft-bearing comparable there is no honest size-based band,
     // and the visitor's known size is never thrown away for a size-blind
     // price band.
-    if (!ppsf.length) return null;
-    ppsf.sort(function (a, b) { return a - b; });
-    const kept = trimOutliers(ppsf);
-    if (!kept.length) return null;
-    const b = bandOf(kept, sqft);
-    return finishEstWithComps(finishEst(b[0], b[1], kept.length, 'ppsf'), comps);
+    if (!ppsfE.length) return { none: 'no_sqft_comps' };
+    ppsfE.sort(function (a, b) { return a.v - b.v; });
+    const keptE = trimOutliersE(ppsfE);
+    if (!keptE.length) return { none: 'gate_rejected' };
+    const b = bandOf(keptE.map(function (e) { return e.v; }), sqft);
+    const est = finishEst(b[0], b[1], keptE.length, 'ppsf');
+    if (!est) return { none: 'gate_rejected' };
+    est.compMls = keptE.map(function (e) { return e.mls; }).filter(Boolean); // the comps actually USED (R-02 L2)
+    return withAlias(est, keptE);
   }
   // No sqft supplied: the typical asking-price band for this city + type,
-  // only from >=3 comparables after trimming (F-02 H2).
-  prices.sort(function (a, b) { return a - b; });
-  const keptP = trimOutliers(prices);
-  if (keptP.length < 3) return null;
-  const bp = bandOf(keptP, 1);
-  return finishEstWithComps(finishEst(bp[0], bp[1], keptP.length, 'price'), comps);
-}
-// Pack A (F-03 L5): the estimate carries the candidate comp set it was
-// derived from (same city + type, active, sane price, capped at 25) so
-// the valuation route can store an audit trail on the lead. The route
-// extracts it into the lead record and strips it from the response —
-// visitors never see comp ids.
-function finishEstWithComps(est, comps) {
-  if (est) est.compMls = comps.map(function (c) { return c.mls; }).filter(Boolean);
-  return est;
+  // only from >=3 comparables after trimming (F-02 H2). No full-record
+  // reads happen on this path (R-02 L1).
+  const priceE = comps.map(function (c) { return { mls: c.mls, v: Number(c.price) }; });
+  priceE.sort(function (a, b) { return a.v - b.v; });
+  const keptP = trimOutliersE(priceE);
+  if (keptP.length < 3) return { none: 'gate_rejected' };
+  const bp = bandOf(keptP.map(function (e) { return e.v; }), 1);
+  const estP = finishEst(bp[0], bp[1], keptP.length, 'price');
+  if (!estP) return { none: 'gate_rejected' };
+  estP.compMls = keptP.map(function (e) { return e.mls; }).filter(Boolean);
+  return withAlias(estP, keptP);
 }
 
 /* ================= property & neighbourhood report (2026-11-01) =================
@@ -1167,21 +1306,33 @@ function publicSettings(s, base) {
 // and a stale one must die on its own (F-09 H1) rather than flush out
 // weeks later. Keyed records also stamp queuedAt (ms) for that check.
 // Unkeyed callers keep the historic contract: returns the new id.
+const MAIL_TTL_BY_KIND = { verify: 86400, viewing: 14 * 86400, alert: 129600, reminder: 129600, reminder_unconfirmed: 129600 };
+const MAIL_TTL_DEFAULT = 30 * 86400;
 async function queueMail(env, item, opts) {
   opts = opts || {};
   if (opts.key) {
-    const mkey = 'mailq:' + opts.key;
-    let exists = null;
-    try { exists = await env.LEADS.get(mkey); } catch (e) { exists = null; }
+    // Pack E (R-03 L2): the stored id/key must not embed the readable
+    // key — alert/reminder keys contain the visitor's email (PII in
+    // key names, 512-byte key risk, id-validation breakage). The
+    // record lives under a hashed id; the readable key survives ONLY
+    // inside the record body (rec.key) for display + dedupe audits.
+    const hid = 'k-' + (await sha256hex(opts.key)).slice(0, 40);
+    const mkey = 'mailq:' + hid;
+    // Pack E (R-03 L1): a failed existence read must NOT be treated
+    // as "doesn't exist" — that could overwrite a record the sender
+    // already marked sent. The error propagates to the caller.
+    const exists = await env.LEADS.get(mkey);
     if (exists) return null;
-    const rec = Object.assign({}, item, { id: opts.key, created_at: new Date().toISOString(), queuedAt: Date.now(), sent: false });
+    const rec = Object.assign({}, item, { id: hid, key: opts.key, created_at: new Date().toISOString(), queuedAt: Date.now(), sent: false });
     await env.LEADS.put(mkey, JSON.stringify(rec), opts.ttl ? { expirationTtl: opts.ttl } : undefined);
-    await idxAdd(env, 'mailq', opts.key);
-    return opts.key;
+    await idxAdd(env, 'mailq', hid);
+    return hid;
   }
   const id = Date.now().toString(36) + '-' + randHex(6);
-  const rec = Object.assign({}, item, { id: id, created_at: new Date().toISOString(), sent: false });
-  await env.LEADS.put('mailq:' + id, JSON.stringify(rec));
+  // Pack E (R-03 L3): unkeyed mail also stamps queuedAt and expires —
+  // per-kind TTLs, so a held record can never flush out months later.
+  const rec = Object.assign({}, item, { id: id, created_at: new Date().toISOString(), queuedAt: Date.now(), sent: false });
+  await env.LEADS.put('mailq:' + id, JSON.stringify(rec), { expirationTtl: MAIL_TTL_BY_KIND[item && item.kind] || MAIL_TTL_DEFAULT });
   await idxAdd(env, 'mailq', id);
   return id;
 }
@@ -1225,19 +1376,49 @@ async function userSearches(env, email) {
 // getUwm seeds a missing key ONCE from the legacy on-record fields so
 // pre-Pack-A searches keep their history.
 const UWM_TTL = 90 * 86400; // 90 days
-async function getUwm(env, email, search) {
+async function getUwm(env, email, search, seedMatches) {
+  // Pack E (R-03 N1): a search without an id must never read or write
+  // the shared 'uwm:<email>:undefined' key — return the legacy shape
+  // unpersisted; the automation skips id-less searches outright.
+  if (!search || !search.id) {
+    return { notified: (search && Array.isArray(search.notified)) ? search.notified.slice(0, 1000) : [], updatedAt: null, alertsQueued: (search && search.alertsQueued) || 0, lastAlertAt: (search && search.lastAlertAt) || null };
+  }
   const key = 'uwm:' + email + ':' + search.id;
-  let wm = null;
-  try { wm = await env.LEADS.get(key, { type: 'json' }); } catch (e) { wm = null; }
-  if (wm && Array.isArray(wm.notified)) return wm;
+  // Read errors PROPAGATE (Pack E, R-03 N1 — the top fix of R-03): the
+  // old catch-to-null turned a transient KV failure into a reseed from
+  // the legacy on-record fields OVER the real watermark, re-alerting
+  // everything mailed since. The caller's per-user catch now skips
+  // the user and writes nothing; the next run retries cleanly.
+  const wm = await env.LEADS.get(key, { type: 'json' });
+  if (wm && Array.isArray(wm.notified)) {
+    // TTL touch: setUwm only runs when a run actually queues mail, so
+    // a quiet search's 90-day TTL used to lapse and reseed the same
+    // way. Refresh the key (same content, fresh TTL) once it is over
+    // 30 days old; a touch failure is harmless and never blocks.
+    const age = wm.updatedAt ? (Date.now() - (Date.parse(wm.updatedAt) || 0)) : Infinity;
+    if (!(age <= 30 * 86400000)) {
+      wm.updatedAt = new Date().toISOString();
+      try { await env.LEADS.put(key, JSON.stringify(wm), { expirationTtl: UWM_TTL }); } catch (e) {}
+    }
+    return wm;
+  }
+  // Truly absent: seed from the CURRENT match set unioned with the
+  // legacy on-record fields, and flag the return so the caller queues
+  // NO alert this run — first sight of a search must not flood the
+  // owner with everything that already matches.
+  const union = new Set(Array.isArray(search.notified) ? search.notified : []);
+  if (Array.isArray(seedMatches)) for (const mm of seedMatches) union.add(mm);
+  const seedCap = Math.max(1000, (Array.isArray(seedMatches) ? seedMatches.length : 0) + 200); // same floor as the run merge cap (R-03 L5)
   const seeded = {
-    notified: (Array.isArray(search.notified) ? search.notified.slice(0, 1000) : []),
+    notified: Array.from(union).slice(-seedCap),
     updatedAt: new Date().toISOString(),
     alertsQueued: search.alertsQueued || 0,
     lastAlertAt: search.lastAlertAt || null
   };
   try { await env.LEADS.put(key, JSON.stringify(seeded), { expirationTtl: UWM_TTL }); } catch (e) {}
-  return seeded;
+  const ret = Object.assign({}, seeded);
+  ret.__seeded = true; // transient caller flag — never persisted (the put above stored `seeded`)
+  return ret;
 }
 async function setUwm(env, email, searchId, wm) {
   try { await env.LEADS.put('uwm:' + email + ':' + searchId, JSON.stringify(wm), { expirationTtl: UWM_TTL }); } catch (e) {}
@@ -1374,25 +1555,23 @@ async function emailVerified(env, email) {
 }
 // Ban check for the valuation route (Pack A, F-03 M2). Email first —
 // isBanned normalises (normEmail) internally, so +tag/dot variants
-// cannot dodge. A PHONE-ONLY submission has no email to check, and
-// the ban list is email-keyed, so the phone is matched (last 10
-// digits) against registered users' phones and any matching account's
-// ban state decides. The scan is bounded (200 user records) and runs
-// only for phone-only submissions. Fail-open on KV errors: a ban
-// lookup hiccup must not 500 the route or eat legitimate leads.
+// cannot dodge. Pack E (R-02 M2): the phone half is ONE read of the
+// banphone:<last10> key the admin ban handler writes at ban time (and
+// deletes at unban; idxReconcile backfills pre-Pack-E bans) — the old
+// sequential scan of up to 200 user records burned the subrequest
+// budget (together with the 25 comp reads it could starve the lead
+// put itself), silently stopped covering anyone past user #200, and
+// was skipped entirely when an email was present. The phone check now
+// runs whether or not an email was given. Fail-open on KV errors: a
+// ban lookup hiccup must not 500 the route or eat legitimate leads.
 async function valuationBanned(env, email, phone) {
   try { if (email && (await isBanned(env, email))) return true; } catch (e) {}
-  if (!email && phone) {
+  if (phone) {
     try {
-      const last10 = String(phone).replace(/\D/g, '').slice(-10);
+      const last10 = phoneLast10(phone);
       if (last10.length >= 10) {
-        const ids = await idxGet(env, 'users', 'user:', 500);
-        for (const uid of ids.slice(0, 200)) {
-          const u = await env.LEADS.get('user:' + uid, { type: 'json' });
-          if (!u) continue;
-          const uph = String((u.profile && u.profile.phone) || u.phone || '').replace(/\D/g, '').slice(-10);
-          if (uph && uph === last10 && (await isBanned(env, uid))) return true;
-        }
+        const bp = await env.LEADS.get('banphone:' + last10);
+        if (bp !== null) return true;
       }
     } catch (e) {}
   }
@@ -1672,7 +1851,7 @@ async function kvList(env, opts) { await countListOp(env); return env.LEADS.list
 // configs (cfg:), availability, viewings, calls/SMS, mail queue, radar.
 const BACKUP_START_DAY = '2026-12-01';
 const BACKUP_KEEP = 30;
-const BACKUP_SKIP_PREFIX = ['backup:full:', 'backup:log', 'backup:last', 'tok:', 'usess:', 'usage:lists:', 'pano:', 'trash:', 'gstate:', 'gcode:', 'maint:lock'];
+const BACKUP_SKIP_PREFIX = ['backup:full:', 'backup:log', 'backup:last', 'tok:', 'usess:', 'usage:lists:', 'pano:', 'trash:', 'gstate:', 'gcode:', 'maint:lock', 'mpool:', 'mpoolx:']; // Pack E (RDR-01 L7): pool + tombstone exclusion was incidental (every pool write carries a TTL, and TTL keys are skipped) — now deliberate: third-party post data does not belong in the site backup
 async function runFullBackup(env, source) {
   const day = vancouverDay();
   if (day < BACKUP_START_DAY) return { skipped: 'before_start', day: day };
@@ -1782,18 +1961,71 @@ async function idxReconcile(env) {
     await env.LEADS.put('idxreconcile:at', String(Date.now()));
     for (const def of IDX_RECONCILE_DEFS) {
       try {
-        const keys = await listAllKeys(env, def[1], 5000);
-        if (!keys.length) continue;
-        const live = keys.map(function (k) { return String(k.name || k).slice(def[1].length); }).filter(Boolean);
-        if (!live.length) continue;
+        const res = await listAllKeysC(env, def[1], 5000);
+        const live = res.keys.map(function (k) { return String(k.name || k).slice(def[1].length); }).filter(Boolean);
         const raw = await env.LEADS.get('idx:' + def[0], { type: 'json' });
         const cur = Array.isArray(raw) ? raw.slice() : [];
+        // Pack E (R-03 N5): for mailq, a COMPLETE listing REPLACES
+        // the index — keyed records expire (~36h) but the union-only
+        // reconcile kept their dead ids forever and every index
+        // reader paid a get per corpse. An incomplete listing (cap
+        // hit) falls back to union: replacing from a partial list
+        // would hide live records.
+        if (def[0] === 'mailq' && res.complete) {
+          const liveSet = new Set(live);
+          const same = cur.length === live.length && cur.every(function (id) { return liveSet.has(id); });
+          if (!same) { try { await env.LEADS.put('idx:mailq', JSON.stringify(live)); } catch (e) {} }
+          continue;
+        }
+        if (!live.length) continue;
         const seen = new Set(cur);
         let added = 0;
         for (const id of live) { if (!seen.has(id)) { seen.add(id); cur.push(id); added++; } }
         if (added || !Array.isArray(raw)) { try { await env.LEADS.put('idx:' + def[0], JSON.stringify(cur)); } catch (e) {} }
       } catch (e) {}
     }
+    // Pack E (R-03 N4): vidx is a single newest-first RMW doc that no
+    // index reconcile used to cover — a booking lost to a concurrent
+    // write never got a reminder or a worklist row. Missing ids are
+    // PREPENDED (newest first, by record created_at): appending
+    // would push them past the slice(0,300) the reminders read.
+    try {
+      const vkeys = await listAllKeys(env, 'viewing:', 1000);
+      if (vkeys.length) {
+        const curV = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+        const have = new Set(Array.isArray(curV) ? curV : []);
+        const missing = [];
+        for (const k of vkeys) {
+          const vid = String(k.name || k).slice('viewing:'.length);
+          if (vid && !have.has(vid)) {
+            const v = await env.LEADS.get('viewing:' + vid, { type: 'json' }).catch(function () { return null; });
+            missing.push({ id: vid, at: (v && v.created_at) || '' });
+          }
+        }
+        if (missing.length) {
+          missing.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
+          const merged = missing.map(function (m) { return m.id; }).concat(Array.isArray(curV) ? curV : []).slice(0, 1000);
+          await env.LEADS.put('vidx', JSON.stringify(merged));
+        }
+      }
+    } catch (e) {}
+    // Pack E (R-02 M2): one-time-per-day backfill of banphone: keys
+    // for bans created before the ban handler learned to write them.
+    try {
+      const banIds = await idxGet(env, 'bans', 'ban:');
+      if (banIds.length) {
+        const banSet = new Set(banIds);
+        const userIds = await idxGet(env, 'users', 'user:', 500);
+        for (const uid of userIds.slice(0, 500)) {
+          if (!banSet.has(normEmail(uid))) continue;
+          const u = await env.LEADS.get('user:' + uid, { type: 'json' }).catch(function () { return null; });
+          const ph = phoneLast10((u && u.profile && u.profile.phone) || (u && u.phone) || '');
+          if (ph.length >= 10 && (await env.LEADS.get('banphone:' + ph)) === null) {
+            try { await env.LEADS.put('banphone:' + ph, normEmail(uid)); } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
     return true;
   } catch (e) { return false; }
 }
@@ -1806,6 +2038,20 @@ async function listAllKeys(env, prefix, cap) {
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
   return keys;
+}
+// Completeness-aware variant: `complete` is true only when the listing
+// actually drained (list_complete) before the cap — a capped result
+// must never be treated as the full keyspace (R-03 N5).
+async function listAllKeysC(env, prefix, cap) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await kvList(env, { prefix: prefix, limit: 1000, cursor: cursor });
+    for (const k of page.keys) { keys.push(k); if (cap && keys.length >= cap) return { keys: keys, complete: false }; }
+    if (page.list_complete) return { keys: keys, complete: true };
+    cursor = page.cursor;
+  } while (cursor);
+  return { keys: keys, complete: true };
 }
 async function buildContacts(env) {
   return adminCachedGen(env, 'contacts', function () { return buildContactsFresh(env); });
@@ -1871,6 +2117,17 @@ function parseBudget(text) {
   return 0;
 }
 function todayVancouver() { try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch (e) { return new Date().toISOString().slice(0, 10); } }
+// Pack E (R-03 L8): current Vancouver wall-clock moment as a comparable
+// 'YYYY-MM-DDTHH:MM' string — viewing date+time pairs in the same
+// format compare lexicographically against it.
+function vanNowParts() {
+  try {
+    const nowD = new Date();
+    const date = nowD.toLocaleDateString('en-CA', { timeZone: 'America/Vancouver' });
+    const time = nowD.toLocaleTimeString('en-CA', { timeZone: 'America/Vancouver', hourCycle: 'h23', hour: '2-digit', minute: '2-digit' });
+    return { date: date, time: time, str: date + 'T' + time };
+  } catch (e) { const iso = new Date().toISOString(); return { date: iso.slice(0, 10), time: iso.slice(11, 16), str: iso.slice(0, 16) }; }
+}
 // Calendar math on a 'YYYY-MM-DD' string (Pack A, F-04 L1): the old
 // Date.now()+86400000 "tomorrow" lands on the wrong Vancouver date
 // around DST transitions (the 25-hour fall-back day especially). The
@@ -2283,6 +2540,24 @@ async function turnstileOk(env, token, ip) {
 // POST /api/admin/followups/run. Mail is only ever QUEUED — sending
 // stays held until the domain/mailer activation, exactly like the
 // other mailq kinds.
+// Pack E (R-03 N2): a KV-op counting view of env for the automation
+// runners. Every LEADS get/put/delete/list decrements a shared budget;
+// the runners check kvLeft() cooperatively and stop CLEANLY (partial)
+// instead of running into the invocation subrequest wall mid-user —
+// where the old code counted the throw as an error, skipped ahead,
+// and still advanced the cursor past users never processed.
+function countKvEnv(env, budget) {
+  let left = budget;
+  const dec = function () { if (left > 0) left--; };
+  const wrapped = {
+    get: function () { dec(); return env.LEADS.get.apply(env.LEADS, arguments); },
+    put: function () { dec(); return env.LEADS.put.apply(env.LEADS, arguments); },
+    delete: function () { dec(); return env.LEADS.delete.apply(env.LEADS, arguments); },
+    list: function () { dec(); return env.LEADS.list.apply(env.LEADS, arguments); }
+  };
+  return Object.assign({}, env, { LEADS: wrapped, __kvLeft: function () { return left; } });
+}
+function kvLeft(env) { return (env && typeof env.__kvLeft === 'function') ? env.__kvLeft() : Infinity; }
 async function runSearchAlerts(env) {
   const out = { users: 0, searches: 0, queued: 0, newMatches: 0, errors: 0, partial: false };
   const all = await idxGet(env, 'users', 'user:', 5000);
@@ -2297,71 +2572,95 @@ async function runSearchAlerts(env) {
   const ordered = all.slice(start).concat(all.slice(0, start));
   const batch = ordered.slice(0, 200);
   out.partial = all.length > batch.length;
-  for (const email of batch) {
-    out.users++;
+  // Pack E (R-03 N2): the cursor advances only past users ACTUALLY
+  // processed — a budget stop or a mid-user failure leaves the cursor
+  // behind that user, so the next run resumes there instead of the
+  // same batch tail starving the rest of the list forever.
+  let lastProcessed = null;
+  const processUser = async function (email) {
     // Per-user isolation (F-04 H3): one user's corrupt data or a KV
     // hiccup is counted and skipped — it never aborts the run.
-    try {
-      const searches = await userSearches(env, email);
-      if (!Array.isArray(searches) || !searches.length) continue;
-      const active = searches.filter(function (s) { return s && s.notify; });
-      if (!active.length) continue;
-      // Verified/banned is evaluated ONCE per user (F-04 M3). If the
-      // check itself fails, the user is skipped whole: the watermark
-      // must never advance past matches nobody could be mailed about.
-      let canMail;
-      try { canMail = (await emailVerified(env, email)) && !(await isBanned(env, email)); }
-      catch (e) { out.errors++; continue; }
-      let uname = '', ulang = 'en';
-      if (canMail) {
-        try { const uu = await env.LEADS.get('user:' + email, { type: 'json' }); if (uu) { uname = uu.name || ''; ulang = validLang(uu.lang); } } catch (e) {}
+    // Returns true when the user was fully processed (including
+    // "nothing to do"), false when the cursor must not pass them.
+    const searches = await userSearches(env, email);
+    if (!Array.isArray(searches) || !searches.length) return true;
+    const active = searches.filter(function (s) { return s && s.notify; });
+    if (!active.length) return true;
+    // Pack E (R-03 L6): verified/banned is evaluated LAZILY — on the
+    // first search that actually has fresh matches — not eagerly for
+    // every searching user (most have nothing new most runs). If the
+    // check itself fails, the user is skipped whole: the watermark
+    // must never advance past matches nobody could be mailed about.
+    let canMail = null, uname = '', ulang = 'en';
+    for (const s of active) {
+      if (!s.id) continue; // Pack E (R-03 N1): never key a watermark 'uwm:<email>:undefined'
+      out.searches++;
+      const matches = matchSearch(s.criteria || {});
+      const wm = await getUwm(env, email, s, matches); // a read error throws → caught by the caller → user skipped, nothing written (N1)
+      if (wm.__seeded) continue; // first sight: seeded from current matches — NO alert this run (N1)
+      const seen = new Set(wm.notified);
+      const fresh = matches.filter(function (mm) { return !seen.has(mm); });
+      if (!fresh.length) continue;
+      out.newMatches += fresh.length;
+      if (canMail === null) {
+        try {
+          canMail = (await emailVerified(env, email)) && !(await isBanned(env, email));
+          if (canMail) { const uu = await env.LEADS.get('user:' + email, { type: 'json' }); if (uu) { uname = uu.name || ''; ulang = validLang(uu.lang); } }
+        } catch (e) { out.errors++; return false; }
       }
-      for (const s of active) {
-        out.searches++;
-        const matches = matchSearch(s.criteria || {});
-        const wm = await getUwm(env, email, s);
-        const seen = new Set(wm.notified);
-        const fresh = matches.filter(function (mm) { return !seen.has(mm); });
-        if (!fresh.length) continue;
-        out.newMatches += fresh.length;
-        if (!canMail) continue; // unverified/banned: the watermark does
-        // NOT advance (it moves only by mailed ids, below). The matches
-        // stay "new", and the first run after the address verifies
-        // mails ONE digest — top 20 + totalFresh — not a flood.
-        const mailedIds = [], listings = [];
-        for (const mm of fresh.slice(0, 20)) {
-          const l = catalogByMls(mm); // null-guarded (F-04 H3): a match
-          // that vanished mid-run is skipped, never dereferenced
-          if (l) { mailedIds.push(mm); listings.push({ mls: l.mls, street: l.street, city: l.city, price: l.price }); }
-        }
-        if (!listings.length) continue;
-        const hash = await sha256hex(fresh.slice().sort().join(','));
-        const mid = await queueMail(env, { kind: 'alert', to: email, lang: ulang, name: uname, searchId: s.id, searchName: s.name, totalFresh: fresh.length, listings: listings },
-          { key: 'alert:' + email + ':' + s.id + ':' + hash, ttl: 129600 });
-        // The watermark advances by EXACTLY the mailed ids (F-04 M1):
-        // the un-mailed remainder of a >20 fresh set stays fresh for
-        // the next run. It advances even when mid is null — the mail
-        // already exists under its deterministic key (an earlier run
-        // queued it, then failed before writing the watermark).
-        let dirty = false;
-        if (mid) { out.queued++; wm.alertsQueued = (wm.alertsQueued || 0) + 1; wm.lastAlertAt = new Date().toISOString(); dirty = true; }
-        const merged = wm.notified.slice();
-        for (const mm of mailedIds) if (!seen.has(mm)) { merged.push(mm); seen.add(mm); }
-        if (merged.length !== wm.notified.length) { wm.notified = merged.slice(-1000); dirty = true; }
-        if (dirty) { wm.updatedAt = new Date().toISOString(); await setUwm(env, email, s.id, wm); }
+      if (!canMail) continue; // unverified/banned: the watermark does
+      // NOT advance (it moves only by mailed ids, below). The matches
+      // stay "new", and the first run after the address verifies
+      // mails ONE digest — top 20 + totalFresh — not a flood.
+      // Pack E (R-03 L5): the mailed 20 are the NEWEST matches
+      // (listing `listed` date desc), not catalog order.
+      const freshSorted = fresh.slice().sort(function (a, b) {
+        const la = catalogByMls(a), lb = catalogByMls(b);
+        return String((lb && lb.listed) || '').localeCompare(String((la && la.listed) || '')) || String(a).localeCompare(String(b));
+      });
+      const mailedIds = [], listings = [];
+      for (const mm of freshSorted) {
+        if (mailedIds.length >= 20) break;
+        const l = catalogByMls(mm); // null-guarded (F-04 H3): a match
+        // that vanished mid-run is skipped, never dereferenced
+        if (l) { mailedIds.push(mm); listings.push({ mls: l.mls, street: l.street, city: l.city, price: l.price }); }
       }
-    } catch (e) { out.errors++; }
+      if (!listings.length) continue;
+      const hash = await sha256hex(fresh.slice().sort().join(','));
+      const mid = await queueMail(env, { kind: 'alert', to: email, lang: ulang, name: uname, searchId: s.id, searchName: s.name, totalFresh: fresh.length, listings: listings },
+        { key: 'alert:' + email + ':' + s.id + ':' + hash, ttl: 129600 });
+      // The watermark advances by EXACTLY the mailed ids (F-04 M1):
+      // the un-mailed remainder of a >20 fresh set stays fresh for
+      // the next run. It advances even when mid is null — the mail
+      // already exists under its deterministic key (an earlier run
+      // queued it, then failed before writing the watermark).
+      let dirty = false;
+      if (mid) { out.queued++; wm.alertsQueued = (wm.alertsQueued || 0) + 1; wm.lastAlertAt = new Date().toISOString(); dirty = true; }
+      const merged = wm.notified.slice();
+      for (const mm of mailedIds) if (!seen.has(mm)) { merged.push(mm); seen.add(mm); }
+      if (merged.length !== wm.notified.length) { wm.notified = merged.slice(-Math.max(1000, matches.length + 200)); dirty = true; } // merge cap (R-03 L5)
+      if (dirty) { wm.updatedAt = new Date().toISOString(); await setUwm(env, email, s.id, wm); }
+    }
+    return true;
+  };
+  for (const email of batch) {
+    if (kvLeft(env) <= 0) { out.partial = true; break; } // budget spent: stop cleanly, cursor stays behind (N2)
+    out.users++;
+    let doneUser = false;
+    try { doneUser = await processUser(email); } catch (e) { out.errors++; }
+    if (doneUser) lastProcessed = email;
   }
-  if (batch.length) { try { await env.LEADS.put('alerts:cursor', batch[batch.length - 1]); } catch (e) {} }
+  if (lastProcessed) { try { await env.LEADS.put('alerts:cursor', lastProcessed); } catch (e) {} }
   return out;
 }
 async function runViewingReminders(env) {
-  const out = { checked: 0, queued: 0, errors: 0 };
+  const out = { checked: 0, queued: 0, errors: 0, partial: false };
   // DST-safe tomorrow (F-04 L1): calendar math on the Vancouver YMD
   // string, never +86400000 on a timestamp.
   const tomorrow = addDaysYmd(todayVancouver(), 1);
   const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
   for (const id of vidx.slice(0, 300)) {
+    if (kvLeft(env) <= 0) { out.partial = true; break; } // Pack E (R-03 N2): shared run budget spent — stop cleanly
     try {
       const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
       if (!v) continue;
@@ -2417,8 +2716,15 @@ async function runAutomations(env, source) {
     if (!fresh) {
       result.error = 'catalog_stale';
     } else {
-      try { result.alerts = await runSearchAlerts(env); } catch (e) { result.alerts = { error: 'failed' }; }
-      try { result.reminders = await runViewingReminders(env); } catch (e) { result.reminders = { error: 'failed' }; }
+      // Pack E (R-03 N2): alerts + reminders share one ~40-op KV
+      // budget per run — the free plan's per-invocation subrequest
+      // budget is also shared with the backup, the perf fold and the
+      // reconcile, and an unbudgeted run used to blow through it and
+      // misreport the wreckage as per-user errors.
+      const benv = countKvEnv(env, 40);
+      try { result.alerts = await runSearchAlerts(benv); } catch (e) { result.alerts = { error: 'failed' }; }
+      try { result.reminders = await runViewingReminders(benv); } catch (e) { result.reminders = { error: 'failed' }; }
+      if ((result.alerts && result.alerts.partial) || (result.reminders && result.reminders.partial)) result.partial = true;
     }
     try { await env.LEADS.put('automation:last', JSON.stringify({ at: new Date().toISOString(), source: result.source, alerts: result.alerts, reminders: result.reminders, error: result.error || null })); } catch (e) {}
     // Portal upgrade (system 8): provision the Web Push VAPID pair on
@@ -2465,9 +2771,11 @@ async function buildFollowups(env) {
   const now = Date.now();
   const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
   const todayViewings = [], awaiting = [];
+  let skipped = 0; // Pack E (R-03 N3): per-record isolation — one corrupt record must not 500 the whole worklist; the count surfaces in the portal
   const pastViewingByEmail = {}; // normEmail -> earliest past (non-cancelled) viewing date
   for (const id of vidx.slice(0, 200)) {
-    const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
+    let v = null;
+    try { v = await env.LEADS.get('viewing:' + id, { type: 'json' }); } catch (e) { skipped++; continue; }
     if (!v) continue;
     const h = v.listingId ? catalogByMls(v.listingId) : null;
     const item = { id: v.id, date: v.date, time: v.time, name: v.name, email: v.email, status: v.status, listing: h ? (h.street + ', ' + h.city) : (v.listingId || '') };
@@ -2480,29 +2788,40 @@ async function buildFollowups(env) {
   }
   todayViewings.sort(function (a, b) { return String(a.time).localeCompare(String(b.time)); });
   awaiting.sort(function (a, b) { return String(a.date + ' ' + a.time).localeCompare(String(b.date + ' ' + b.time)); });
-  const newAll = [], staleAll = [], postAll = [];
+  const newAll = [], staleAll = [], postAll = [], coldAll = [];
   let newCount = 0, staleCount = 0;
   for (const lid of await idxGet(env, 'leads', 'lead:')) {
-    const l = await env.LEADS.get('lead:' + lid, { type: 'json' });
+    let l = null;
+    try { l = await env.LEADS.get('lead:' + lid, { type: 'json' }); } catch (e) { skipped++; continue; } // Pack E (R-03 N3)
     if (!l) continue;
     const ts = Date.parse(l.created_at);
     const ageUnknown = !(ts > 0); // NaN (or epoch) parse: age is unknowable, never "0h"
     const item = { id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '', intent: l.intent || '', source: l.source || '', created_at: l.created_at || '', ageHours: ageUnknown ? null : Math.max(0, Math.floor((now - ts) / 3600000)), stageAt: l.stageAt || null };
     if (ageUnknown) item.ageUnknown = true;
     if (l.aiDraft && l.aiDraft.text) item.aiDraft = { text: l.aiDraft.text, lang: l.aiDraft.lang || '', at: l.aiDraft.at || '', via: l.aiDraft.via || '' }; // portal brain: cached follow-up draft rides along
-    if (l.stage === 'new') {
+    // Pack E (R-03 N3): a missing/unknown stage defaults to 'new' — such
+    // leads used to appear in NO list at all (invisible work).
+    const stage = STAGES.indexOf(l.stage) !== -1 ? l.stage : 'new';
+    if (stage === 'new') {
       if (ageUnknown || item.ageHours >= 48) { staleCount++; staleAll.push(item); }
       else { newCount++; newAll.push(item); }
-    } else if (l.stage === 'viewing') {
+    } else if (stage === 'viewing') {
       const vd = pastViewingByEmail[normEmail(l.email || '')];
       if (vd) postAll.push(Object.assign({}, item, { viewingDate: vd }));
+    } else if (stage === 'contacted') {
+      // Pack E (R-03 N3): going cold — contacted 7+ days ago (stageAt is
+      // stamped by the leads PATCH on every stage change) with no
+      // further movement; resurfaces here before it dies quietly.
+      const sms = Date.parse(l.stageAt || '');
+      if (isFinite(sms) && (now - sms) >= 7 * 86400000) coldAll.push(item);
     }
   }
   // collect -> sort -> slice, so the capped lists really are the oldest
   newAll.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
   staleAll.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
   postAll.sort(function (a, b) { return String(a.viewingDate).localeCompare(String(b.viewingDate)); });
-  return { today: todayStr, todayViewings: todayViewings, awaitingConfirm: awaiting.slice(0, 25), awaitingConfirmCount: awaiting.length, newLeads: newAll.slice(0, 25), newCount: newCount, staleLeads: staleAll.slice(0, 25), staleCount: staleCount, postViewing: postAll.slice(0, 25), postViewingCount: postAll.length };
+  coldAll.sort(function (a, b) { return String(a.stageAt || '').localeCompare(String(b.stageAt || '')); });
+  return { today: todayStr, todayViewings: todayViewings, awaitingConfirm: awaiting.slice(0, 25), awaitingConfirmCount: awaiting.length, newLeads: newAll.slice(0, 25), newCount: newCount, staleLeads: staleAll.slice(0, 25), staleCount: staleCount, postViewing: postAll.slice(0, 25), postViewingCount: postAll.length, goingCold: coldAll.slice(0, 25), goingColdCount: coldAll.length, skipped: skipped };
 }
 
 /* ================= portal upgrade (2026-11-01) =================
@@ -3799,16 +4118,21 @@ async function handleRequest(request, env, ctx) {
     if (origin && !ALLOWED_ORIGINS.includes(origin)) {
       return new Response(JSON.stringify({ ok: false, error: 'forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
+    // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
+    // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
+    // past ~12 items before the route ever ran. One shared helper so
+    // the Content-Length check and the chunked-body check cannot drift.
+    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : 32768)); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
-      const capLimit = path === '/api/admin/files' ? 4718592 : ((path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768);
+      const capLimit = bodyCapFor(path);
       if (cl > capLimit) return json({ ok: false, error: 'too_large' }, 413, origin); // a missing Content-Length is NOT rejected: several legitimate clients don't expose one
     }
     if ((request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') && !request.headers.get('Content-Length')) {
       // Cycle 26 (Claude M2): chunked bodies used to bypass the cap entirely
       // and request.json() buffered them whole. Count the clone's bytes up
       // front and reject past the same cap; the original body stays unread.
-      const cap2 = path === '/api/admin/files' ? 4718592 : ((path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768);
+      const cap2 = bodyCapFor(path);
       try {
         const reader = request.clone().body.getReader();
         let n = 0;
@@ -3816,7 +4140,7 @@ async function handleRequest(request, env, ctx) {
           const r = await reader.read();
           if (r.done) break;
           n += r.value.byteLength;
-          if (n > cap2) { try { await reader.cancel(); } catch (e) {} return json({ ok: false, error: 'too_large' }, 413, origin); }
+          if (n > cap2) { try { const cp = reader.cancel(); if (cp && cp.catch) cp.catch(function () {}); } catch (e) {} return json({ ok: false, error: 'too_large' }, 413, origin); } // never awaited: in Node/undici a cancelled clone stream may never settle, which deadlocked the test harness on oversized bodies (found by the Pack E coverage pin)
         }
       } catch (e) {}
     }
@@ -4021,10 +4345,13 @@ async function handleRequest(request, env, ctx) {
         // strips <> and control characters first, which made the old
         // post-csV check dead code.
         if (/[\r\n<>]|https?:|www\./i.test(String(d.name || ''))) return json({ ok: false, error: 'validation' }, 400, origin);
-        const name = csV(d.name, 120);
+        // Pack E (R-02 L5): name/address/city must BE strings — csV's
+        // String() coercion turned a submitted {} into the literal
+        // text "[object Object]", which then passed the !name check.
+        const name = typeof d.name === 'string' ? csV(d.name, 120) : '';
         const email = String(d.email || '').trim().toLowerCase().slice(0, 160);
         const phone = String(d.phone || '').trim().slice(0, 40);
-        const address = csV(d.address, 160), city = csV(d.city, 60);
+        const address = typeof d.address === 'string' ? csV(d.address, 160) : '', city = typeof d.city === 'string' ? csV(d.city, 60) : '';
         const type = String(d.type || '').toLowerCase();
         // Every cheap validation runs BEFORE the captcha (F-03 L3):
         // Turnstile tokens are single-use, so a request that is going
@@ -4064,22 +4391,46 @@ async function handleRequest(request, env, ctx) {
         // and the request degrades to the manual shape — while the
         // lead below is stored exactly as before: a stale catalog
         // must never cost a seller lead or invent a price.
-        let est = null;
+        let est = null, estReason = null, estAlias = null;
         let hvFresh = catalogIsFresh();
+        // Pack E (R-02 L6): a NON-forced refresh gets the first chance
+        // (it joins any in-flight load instead of starting a rival
+        // one); force only if the catalog still does not read fresh.
+        // The old straight-to-force call bypassed the in-flight guard
+        // in the 90–120s seam and let concurrent requests each start
+        // a full catalog refresh.
+        if (!hvFresh) { try { await refreshCustomCatalog(env, false); hvFresh = catalogIsFresh(); } catch (e) { hvFresh = false; } }
         if (!hvFresh) { try { await refreshCustomCatalog(env, true); hvFresh = catalogIsFresh(); } catch (e) { hvFresh = false; } }
-        if (hvFresh) { try { est = await valuationEstimate(env, { city: city, type: type, sqft: sqft }); } catch (e) { est = null; } }
+        if (hvFresh) {
+          try {
+            const r = await valuationEstimate(env, { city: city, type: type, sqft: sqft });
+            if (r && r.none) estReason = r.none; else if (r) est = r;
+          } catch (e) { est = null; estReason = 'read_failed'; }
+        }
+        if (!est && !estReason) estReason = hvFresh ? 'gate_rejected' : 'catalog_stale';
         const compMls = (est && Array.isArray(est.compMls)) ? est.compMls : [];
-        if (est) delete est.compMls; // audit data for the lead record; never part of the response
-        if (await valuationBanned(env, email, phone)) return json({ ok: true, estimate: null, manual: true }, 200, origin); // banned: same shape, store nothing
+        if (est) { estAlias = est.alias || null; delete est.compMls; delete est.alias; } // audit data for the lead record; never part of the response
+        // Pack E (R-02 M1): the ban oracle is closed — a banned
+        // visitor receives the computed estimate EXACTLY as a normal
+        // visitor (identical body), so the response no longer reveals
+        // ban status. Nothing is stored, queued or counted for them.
+        if (await valuationBanned(env, email, phone)) return json({ ok: true, estimate: est, manual: !est }, 200, origin);
         const money = function (n) { return '$' + Number(n).toLocaleString('en-CA'); };
         const estText = est
-          ? ('Estimated range ' + money(est.low) + ' – ' + money(est.high) + ' (from ' + est.comps + ' comparable active listings, ' + (est.basis === 'ppsf' ? 'price-per-sqft band' : 'listing-price band') + ').')
-          : 'No comparable active listings — manual assessment needed.';
+          ? ('Estimated range ' + money(est.low) + ' – ' + money(est.high) + ' (from ' + est.comps + ' comparable active listings, ' + (est.basis === 'ppsf' ? 'price-per-sqft band' : 'listing-price band') + ')' + (estAlias ? ' (' + estAlias + ' comparables)' : '') + '.')
+          : (estReason === 'catalog_stale' ? 'Estimate skipped — the listing catalog could not be proven fresh; manual assessment needed.'
+            : estReason === 'read_failed' ? 'Estimate unavailable — a comparables read failed; manual assessment needed.'
+            : estReason === 'no_sqft_comps' ? 'No size-bearing comparable listings — manual assessment needed.'
+            : 'No comparable active listings — manual assessment needed.');
         // Double-submit dedupe (F-03 M6), best-effort: the same
         // contact + address inside 10 minutes is the same request —
         // it is answered identically (fresh estimate included) but
         // stores no second lead.
-        const dupKey = 'hvdup:' + (await sha256hex((normEmail(email) || phone.replace(/\D/g, '')) + '|' + address.toLowerCase() + '|' + city.toLowerCase()));
+        // Pack E (R-02 M3): the dedupe hash also covers the property
+        // facts — a CORRECTED resubmission inside 10 minutes (new
+        // sqft/beds/type) is a new request with its own lead, not a
+        // duplicate of the wrong one; only exact repeats suppress.
+        const dupKey = 'hvdup:' + (await sha256hex((normEmail(email) || phone.replace(/\D/g, '')) + '|' + address.toLowerCase() + '|' + city.toLowerCase() + '|' + type + '|' + sqft + '|' + bd.value + '|' + bt.value));
         let dup = false;
         try { dup = !!(await env.LEADS.get(dupKey)); } catch (e) { dup = false; }
         if (!dup) {
@@ -4090,7 +4441,7 @@ async function handleRequest(request, env, ctx) {
             email: email, phone: phone,
             message: 'Home valuation request: ' + address + ', ' + city + ' — ' + type + ', ' + (bd.value === null ? 'beds not given' : bd.value + ' bed') + ', ' + (bt.value === null ? 'baths not given' : bt.value + ' bath') + ', ' + (sqft ? sqft + ' sq ft. ' : 'size not given. ') + estText,
             stage: 'new', notes: '', source: 'home-valuation',
-            valuation: { address: address, city: city, type: type, beds: bd.value, baths: bt.value, sqft: sqft, rawSqft: (d.sqft === undefined ? null : d.sqft), compMls: compMls, estimate: est, at: new Date().toISOString() }
+            valuation: { address: address, city: city, type: type, beds: bd.value, baths: bt.value, sqft: sqft, rawSqft: (typeof d.sqft === 'string' ? d.sqft.slice(0, 40) : (typeof d.sqft === 'number' ? d.sqft : null)), compMls: compMls, estimate: est, reason: est ? null : estReason, at: new Date().toISOString() }
           };
           // The lead is stored FIRST (F-03 H3); every side effect
           // after the put is best-effort in its own try/catch, so an
@@ -4139,6 +4490,12 @@ async function handleRequest(request, env, ctx) {
             if (ev === 'listing_view' && d.listingId) {
               const lid = String(d.listingId).slice(0, 40);
               bumpC(doc.li, lid, 100);
+              // Pack E (R-01 N2): /api/track is exempt from the
+              // pre-route catalog refresh, and a beacon is often an
+              // isolate's FIRST request — load the catalog here on a
+              // cold isolate so portal-managed listings resolve in
+              // perfBump instead of counting as dropped/provisional.
+              if (customCatalogAt === 0) { try { await refreshCustomCatalog(env, false); } catch (e) {} }
               await perfBump(env, ctx, 'view', lid); // cumulative per-listing counter for the portal performance view
             }
           }
@@ -4439,7 +4796,12 @@ async function handleRequest(request, env, ctx) {
               { key: akey, ttl: 129600 });
           }
         } catch (e) {}
-        return json({ ok: true, search: rec, matches: matches }, 200, origin);
+        // Pack E (R-03 L7): project the create response like the PATCH
+        // does — the stored record's internal fields (notified set,
+        // watermark-adjacent state) are not the visitor's business.
+        // pushActivity above is self-guarded (its own try/catch), so a
+        // saved search can never 500 on the activity write.
+        return json({ ok: true, search: { id: rec.id, name: rec.name, criteria: rec.criteria, notify: rec.notify, created_at: rec.created_at, notified: rec.notified }, matches: matches }, 200, origin);
       }
       const usm = path.match(/^\/api\/user\/searches\/([A-Za-z0-9_-]+)$/);
       if (usm && request.method === 'DELETE') {
@@ -4473,7 +4835,12 @@ async function handleRequest(request, env, ctx) {
           // rather than applied half-way.
           try { await refreshCustomCatalog(env, true); } catch (e) {}
           if (!catalogIsFresh()) return json({ ok: false, error: 'unavailable' }, 503, origin);
-          const wm = await getUwm(env, email, rec);
+          // Pack E (R-03 N1): getUwm read errors now PROPAGATE — on the
+          // toggle path that becomes the same 503 refusal as an
+          // unprovable catalog, never a silent reseed over the real
+          // watermark and never a bare 500.
+          let wm = null;
+          try { wm = await getUwm(env, email, rec); } catch (e) { return json({ ok: false, error: 'unavailable' }, 503, origin); }
           wm.notified = matchSearch(rec.criteria || {}).slice(0, 1000);
           wm.updatedAt = new Date().toISOString();
           await setUwm(env, email, rec.id, wm);
@@ -4537,9 +4904,17 @@ async function handleRequest(request, env, ctx) {
         }
         const vrecs = await Promise.all(vids.slice(0, 50).map(function (id) { return env.LEADS.get('viewing:' + id, { type: 'json' }); }));
         const mine = [];
-        const todayStr = todayVancouver();
+        const vn = vanNowParts();
         vrecs.forEach(function (v) {
-          if (v && v.email === email) { const home = v.listingId ? catalogByMls(v.listingId) : null; mine.push(Object.assign({}, v, { listing: home ? { mls: home.mls, street: home.street, city: home.city, price: home.price } : null, canChange: (v.status === 'new' || v.status === 'confirmed') && String(v.date || '') >= todayStr })); }
+          if (v && v.email === email) {
+            const home = v.listingId ? catalogByMls(v.listingId) : null;
+            // Pack E (R-03 L8): explicit field projection — the old
+            // spread forwarded EVERY record field (incl. internal
+            // notes/counters) to the visitor. And canChange compares
+            // date AND time in Vancouver time: the date-only check
+            // reported true for hours after the slot had passed.
+            mine.push({ id: v.id, listingId: v.listingId || null, date: v.date || '', time: v.time || '', status: v.status || '', name: v.name || '', phone: v.phone || '', lang: v.lang || 'en', listing: home ? { mls: home.mls, street: home.street, city: home.city, price: home.price } : null, canChange: (v.status === 'new' || v.status === 'confirmed') && (String(v.date || '') + 'T' + String(v.time || '00:00')) >= vn.str });
+          }
         });
         mine.sort(function (a, b) { return String(b.date + ' ' + b.time).localeCompare(String(a.date + ' ' + a.time)); });
         return json({ ok: true, viewings: mine }, 200, origin);
@@ -4557,6 +4932,12 @@ async function handleRequest(request, env, ctx) {
         d = d || {};
         const geid = rec.gcalEventId || ('v' + String(rec.id || '').slice(3));
         if (rec.status !== 'new' && rec.status !== 'confirmed') return json({ ok: false, error: 'state' }, 409, origin); // done/cancelled viewings are final (cycle 27, Claude L12)
+        // Pack E (R-03 L8 + local-verification 2f): the date half of
+        // the canChange rule is now enforced server-side against the
+        // EXISTING record — a viewing whose slot has already passed
+        // (still 'new'/'confirmed') can no longer be cancelled or
+        // rescheduled through the API behind the UI's back.
+        if ((String(rec.date || '') + 'T' + String(rec.time || '00:00')) < vanNowParts().str) return json({ ok: false, error: 'past' }, 409, origin);
         if (uvm[2] === 'cancel') {
           rec.status = 'cancelled';
           await env.LEADS.put('viewing:' + uvm[1], JSON.stringify(rec));
@@ -4884,7 +5265,7 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.leads)) return json({ ok: false, error: 'validation' }, 400, origin); // a malformed batch must fail loudly, not report ok with 0 added (cycle 28, Claude M4)
         const items = d.leads.slice(0, 60);
-        let added = 0, skipped = 0;
+        let added = 0, skipped = 0, rejected = 0;
         const seenBatch = new Set();
         for (const it of items) {
           if (!it || typeof it !== 'object') { skipped++; continue; }
@@ -4895,6 +5276,33 @@ async function handleRequest(request, env, ctx) {
           seenBatch.add(urlKey);
           if (await env.LEADS.get(urlKey)) { skipped++; continue; }
           const kind = MKINDS.includes(String(it.kind || '').toLowerCase()) ? String(it.kind).toLowerCase() : 'buyer';
+          // Pack E (RDR-01 M6): a PAIR lead must be verifiable against
+          // the pool — demandId + supplyId (pool record ids), both
+          // records present with the right sides, lastSeen ≤ ~10 days,
+          // and basic compatibility (region, price vs budget)
+          // re-checked SERVER-side. A buggy or injected agent can no
+          // longer pair items never pooled, same-side items, or stale
+          // entries. Rejections are counted, never stored.
+          let pairIds = null;
+          if (kind === 'pair') {
+            const did = String(it.demandId || ''), sid = String(it.supplyId || '');
+            let okPair = /^[0-9a-f]{64}$/.test(did) && /^[0-9a-f]{64}$/.test(sid) && did !== sid;
+            let drec = null, srec = null;
+            if (okPair) {
+              try {
+                drec = await env.LEADS.get('mpool:' + did, { type: 'json' });
+                srec = await env.LEADS.get('mpool:' + sid, { type: 'json' });
+              } catch (e) { okPair = false; }
+            }
+            if (okPair) {
+              const fresh10 = function (r) { const t = Date.parse((r && r.lastSeen) || ''); return isFinite(t) && (Date.now() - t) <= 10 * 86400000; };
+              if (!drec || !srec || drec.side !== 'demand' || srec.side !== 'supply' || !fresh10(drec) || !fresh10(srec)) okPair = false;
+              else if (drec.region && srec.region && normPlace(drec.region) !== normPlace(srec.region)) okPair = false;
+              else if (typeof srec.priceNum === 'number' && typeof drec.priceNum === 'number' && srec.priceNum > drec.priceNum) okPair = false; // supply price above the demand budget
+            }
+            if (!okPair) { skipped++; rejected++; continue; }
+            pairIds = { demandId: did, supplyId: sid };
+          }
           const conf = Math.max(0, Math.min(100, parseInt(it.confidence, 10) || 0));
           const cleanMatch = function (m) {
             if (!m || typeof m !== 'object') return null;
@@ -4942,13 +5350,15 @@ async function handleRequest(request, env, ctx) {
               depositPaid: cleanText(it.presale.depositPaid, 60), assignmentFee: cleanText(it.presale.assignmentFee, 60)
             } : null,
             flags: Array.isArray(it.flags) ? it.flags.map(function (f) { return cleanText(f, 120); }).filter(Boolean).slice(0, 6) : [],
+            demandId: pairIds ? pairIds.demandId : null, // Pack E (RDR-01 M6): verified pool links ride on the pair lead (portal derives server counters from them)
+            supplyId: pairIds ? pairIds.supplyId : null,
             status: 'new', notes: ''
           };
           await env.LEADS.put('mlead:' + id, JSON.stringify(lead), { expiration: nowS + 60 * 86400 });
           await env.LEADS.put(urlKey, id, { expiration: nowS + 61 * 86400 });
           added++;
         }
-        return json({ ok: true, added: added, skipped: skipped, dropped: Math.max(0, d.leads.length - 60) }, 200, origin);
+        return json({ ok: true, added: added, skipped: skipped, rejected: rejected, dropped: Math.max(0, d.leads.length - 60) }, 200, origin);
       }
 
       if (path === '/api/market-leads' && request.method === 'GET') {
@@ -4958,6 +5368,18 @@ async function handleRequest(request, env, ctx) {
             mkeys.map(k => env.LEADS.get(k.name, { type: 'json' }))
           )).filter(Boolean);
           out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+          // Pack E (RDR-01 M7): pair leads carry SERVER-derived pool
+          // counters (from the verified supply record) so the portal
+          // can show them separately from the agent-estimated
+          // motivation score.
+          for (const l of out) {
+            if (l && l.kind === 'pair' && l.supplyId) {
+              try {
+                const srec = await env.LEADS.get('mpool:' + l.supplyId, { type: 'json' });
+                if (srec) l.poolCounters = { priceCuts: srec.priceCuts || 0, relistCount: srec.relistCount || 0, seenDays: srec.seenCount || 0, lastSeen: srec.lastSeen || null };
+              } catch (e) {}
+            }
+          }
           return out;
         });
         return json({ ok: true, leads: mleads }, 200, origin);
@@ -5000,80 +5422,208 @@ async function handleRequest(request, env, ctx) {
       // old supply, old demand x new supply). Re-ingesting the same
       // identityKey updates lastSeen/price instead of duplicating.
       if (path === '/api/market-pool' && request.method === 'POST') {
+        // Pack E (RDR-01 M8): the OFF switch is enforced server-side —
+        // scoped ingest writes get 409 while the radar is off; a full
+        // admin session may still write (manual cleanup/testing).
+        if (!(await authed(request, env)) && !(await radarEnabled(env))) return json({ ok: false, error: 'radar_disabled' }, 409, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.items)) return json({ ok: false, error: 'validation' }, 400, origin);
         const items = d.items.slice(0, 60);
-        let added = 0, updated = 0, skipped = 0;
-        const nowIso = new Date().toISOString();
-        for (const it of items) {
-          if (!it || typeof it !== 'object') { skipped++; continue; }
-          const ikey = cleanText(it.identityKey, 300);
-          const side = String(it.side || '').toLowerCase();
-          const url = safeUrl(it.url, 600);
-          if (!ikey || (side !== 'demand' && side !== 'supply') || !url) { skipped++; continue; }
-          const key = 'mpool:' + (await sha256hex(ikey));
-          const prev = await env.LEADS.get(key, { type: 'json' });
-          const rawPriceNum = (typeof it.priceNum === 'number' && isFinite(it.priceNum) && it.priceNum > 0) ? Math.round(it.priceNum) : null;
-          const priceNum = rawPriceNum !== null ? rawPriceNum : (prev && typeof prev.priceNum === 'number' ? prev.priceNum : null);
-          // Per-item history (v4 ext): the price trail appends ONLY on
-          // an actual price change and is capped at the last 10 points;
-          // priceCuts is denormalized from it for the motivation rubric.
-          let hist = (prev && Array.isArray(prev.priceHistory)) ? prev.priceHistory.filter(function (h) { return h && typeof h.price === 'number'; }).slice(-10) : [];
-          if (priceNum !== null && (!hist.length || hist[hist.length - 1].price !== priceNum)) hist.push({ at: nowIso, price: priceNum });
-          hist = hist.slice(-10);
-          let priceCuts = 0;
-          for (let hi = 1; hi < hist.length; hi++) { if (hist[hi].price < hist[hi - 1].price) priceCuts++; }
-          // Relist detection: the live record expires after 30 days,
-          // so a small tombstone (mpoolx:, 180-day TTL) remembers the
-          // identity; an ingest with no live record but a tombstone is
-          // a relist of a previously pooled property.
-          const xkey = 'mpoolx:' + key.slice(6);
-          let relistCount = (prev && prev.relistCount) || 0;
-          let relisted = !!((prev && prev.relisted));
-          if (!prev) {
-            const tomb = await env.LEADS.get(xkey, { type: 'json' });
-            if (tomb) { relistCount = (tomb.relistCount || 0) + 1; relisted = true; }
-          }
-          const kind = ['demand', 'supply', 'assignment'].indexOf(String(it.kind || '').toLowerCase()) !== -1 ? String(it.kind).toLowerCase() : side;
-          const motivation = (typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : (prev && typeof prev.motivation === 'number' ? prev.motivation : null);
-          const motivationSignals = Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 60); }).filter(Boolean).slice(0, 5) : ((prev && prev.motivationSignals) || []);
-          const rec = {
-            id: key.slice(6), identityKey: ikey, side: side, kind: kind,
-            title: cleanText(it.title, 200),
-            area: cleanText(it.area, 80),
-            region: cleanText(it.region, 40),
-            source: cleanText(it.source, 40),
-            category: cleanText(it.category, 40),
-            url: url,
-            price: cleanText(it.price, 60),
-            priceNum: priceNum,
-            priceHistory: hist,
-            priceCuts: priceCuts,
-            relistCount: relistCount,
-            relisted: relisted,
-            motivation: motivation,
-            motivationSignals: motivationSignals,
-            beds: cleanText(it.beds, 20),
-            type: cleanText(it.type, 30),
-            phone: cleanText(it.phone, 40),
-            summary: cleanText(it.summary, 1200),
-            posted_at: cleanText(it.posted_at, 60),
-            firstSeen: (prev && prev.firstSeen) || nowIso,
-            lastSeen: nowIso,
-            seenCount: ((prev && prev.seenCount) || 0) + 1
-          };
-          await env.LEADS.put(key, JSON.stringify(rec), { expirationTtl: 2592000 }); // 30 days
-          try { await env.LEADS.put(xkey, JSON.stringify({ relistCount: relistCount, lastSeen: nowIso }), { expirationTtl: 15552000 }); } catch (e) {} // 180-day tombstone
-          if (prev) updated++; else added++;
+        let added = 0, updated = 0, skipped = 0, unchanged = 0, relistedN = 0, processed = 0;
+        let ops = 0; // Pack E (RDR-01 H2): ~40-op request budget; `processed` is the caller's resume index
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const todayDay = nowIso.slice(0, 10);
+        for (let ix = 0; ix < items.length; ix++) {
+          if (ops >= 40) break;
+          processed = ix + 1;
+          const it = items[ix];
+          try {
+            if (!it || typeof it !== 'object') { skipped++; continue; }
+            const ikey = normIkey(it.identityKey); // Pack E (RDR-01 M2): normalise BEFORE hashing
+            const side = String(it.side || '').toLowerCase();
+            const url = safeUrl(it.url, 600);
+            if (!ikey || (side !== 'demand' && side !== 'supply') || !url) { skipped++; continue; }
+            let kind = ['demand', 'supply', 'assignment'].indexOf(String(it.kind || '').toLowerCase()) !== -1 ? String(it.kind).toLowerCase() : side;
+            if (kind !== side && !(kind === 'assignment' && side === 'supply')) { skipped++; continue; } // kind↔side validation (M2): assignment is supply-only, demand kind is demand-side only
+            const key = 'mpool:' + (await sha256hex(side + '|' + ikey)); // M2: the hash carries the side — demand and supply posts sharing an identity no longer clobber each other (pool never ran live: no migration)
+            const xkey = 'mpoolx:' + key.slice(6);
+            ops++;
+            const prev = await env.LEADS.get(key, { type: 'json' });
+            // Pack E (RDR-01 M3): an empty field in a thinner sighting
+            // KEEPS the previous value — a list-page sighting after a
+            // detail-page one must not wipe phone/summary/beds.
+            const pick = function (nv, pv) { return nv !== '' ? nv : (pv || ''); };
+            const title = pick(cleanText(it.title, 200), prev && prev.title);
+            const area = pick(cleanText(it.area, 80), prev && prev.area);
+            const region = pick(cleanText(it.region, 40), prev && prev.region);
+            const source = pick(cleanText(it.source, 40), prev && prev.source);
+            const category = pick(cleanText(it.category, 40), prev && prev.category);
+            const priceStr = pick(cleanText(it.price, 60), prev && prev.price);
+            const beds = pick(cleanText(it.beds, 20), prev && prev.beds);
+            const ptype = pick(cleanText(it.type, 30), prev && prev.type);
+            const summary = pick(cleanText(it.summary, 1200), prev && prev.summary);
+            const postedStr = pick(cleanText(it.posted_at, 60), prev && prev.posted_at);
+            const phoneIn = cleanText(it.phone, 40);
+            const phone = phoneIn ? normPoolPhone(phoneIn) : ((prev && prev.phone) || ''); // L4: digits/+ only
+            const motivation = (typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : (prev && typeof prev.motivation === 'number' ? prev.motivation : null);
+            const motivationSignals = Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 60); }).filter(Boolean).slice(0, 5) : ((prev && prev.motivationSignals) || []);
+            // Pack E (RDR-01 M5): price plausibility gate — a candidate
+            // outside 10k–1e9, or outside 0.4×–2.5× of the last price,
+            // is a scrape typo: keep the previous price, flag 'jump',
+            // and neither trail it nor count it as a cut.
+            const rawPriceNum = (typeof it.priceNum === 'number' && isFinite(it.priceNum) && it.priceNum > 0) ? Math.round(it.priceNum) : null;
+            let priceNum = (prev && typeof prev.priceNum === 'number') ? prev.priceNum : null;
+            let priceFlag = (prev && prev.priceFlag) || null;
+            if (rawPriceNum !== null) {
+              if (rawPriceNum < 10000 || rawPriceNum > 1000000000 || (priceNum !== null && (rawPriceNum < priceNum * 0.4 || rawPriceNum > priceNum * 2.5))) priceFlag = 'jump';
+              else { priceNum = rawPriceNum; priceFlag = null; }
+            }
+            // Price trail: appends ONLY on an actual (accepted) price
+            // change, capped at 10 points for display; priceCuts is a
+            // LIFETIME monotonic counter (M5) — never recomputed from
+            // the capped window, and demand-side budget moves never
+            // count as cuts.
+            let hist = (prev && Array.isArray(prev.priceHistory)) ? prev.priceHistory.filter(function (h) { return h && typeof h.price === 'number'; }).slice(-10) : [];
+            let priceCuts = (prev && typeof prev.priceCuts === 'number') ? prev.priceCuts : 0;
+            if (priceNum !== null && (!hist.length || hist[hist.length - 1].price !== priceNum)) {
+              if (hist.length && priceNum < hist[hist.length - 1].price && side !== 'demand') priceCuts++;
+              hist.push({ at: nowIso, price: priceNum });
+              hist = hist.slice(-10);
+            }
+            // Pack E (RDR-01 M1): relist detection follows the POST,
+            // not the scan cadence — the post's own posted_at vs the
+            // tombstone's lastSeen (or, for the delete+repost-inside-
+            // 30-days case, vs the live record's posted_at).
+            let relistCount = (prev && prev.relistCount) || 0;
+            let relisted = !!((prev && prev.relisted));
+            let relistBump = false;
+            let tomb = null, tombRead = false;
+            const pMs = postedMs(postedStr);
+            if (prev) {
+              const prevMs = postedMs(prev.posted_at);
+              if (pMs !== null && prevMs !== null && pMs > prevMs) { relistCount++; relisted = true; relistBump = true; }
+            } else {
+              ops++; tombRead = true;
+              tomb = await env.LEADS.get(xkey, { type: 'json' });
+              if (tomb) {
+                const tombSeen = Date.parse(tomb.lastSeen || '');
+                if (pMs !== null && isFinite(tombSeen) && pMs > tombSeen) {
+                  relistCount = (tomb.relistCount || 0) + 1; relisted = true; relistBump = true;
+                  priceCuts = (tomb.priceCuts || 0);
+                  // A post-gap cut still registers (M1): the tombstone
+                  // carries the last price, so the trail survives the
+                  // live record's expiry.
+                  if (side !== 'demand' && priceNum !== null && typeof tomb.lastPrice === 'number') {
+                    if (!hist.length) hist = [{ at: tomb.lastSeen || nowIso, price: tomb.lastPrice }];
+                    if (priceNum < tomb.lastPrice) priceCuts++;
+                    if (hist[hist.length - 1].price !== priceNum) hist.push({ at: nowIso, price: priceNum });
+                    hist = hist.slice(-10);
+                  }
+                } else {
+                  relistCount = tomb.relistCount || 0; // same post re-sighted after TTL expiry — NOT a relist
+                  priceCuts = Math.max(priceCuts, tomb.priceCuts || 0);
+                }
+              }
+            }
+            if (relistBump) relistedN++;
+            // Pack E (RDR-01 H2): seenCount = DAYS seen, not sightings.
+            const prevDay = (prev && prev.lastSeen) ? String(prev.lastSeen).slice(0, 10) : '';
+            const seenCount = prev ? ((prev.seenCount || 1) + (prevDay !== todayDay ? 1 : 0)) : 1;
+            // H2: an unchanged sighting <24h old writes NOTHING.
+            const changed = !prev || priceNum !== prev.priceNum || priceFlag !== ((prev && prev.priceFlag) || null) ||
+              title !== (prev.title || '') || area !== (prev.area || '') || region !== (prev.region || '') || summary !== (prev.summary || '') ||
+              phone !== (prev.phone || '') || beds !== (prev.beds || '') || ptype !== (prev.type || '') || postedStr !== (prev.posted_at || '') ||
+              motivation !== (prev.motivation !== undefined ? prev.motivation : null) || kind !== prev.kind || url !== prev.url || relistBump ||
+              JSON.stringify(motivationSignals) !== JSON.stringify(prev.motivationSignals || []);
+            const prevSeenMs = prev ? Date.parse(prev.lastSeen || '') : NaN;
+            if (prev && !changed && isFinite(prevSeenMs) && (nowMs - prevSeenMs) < 86400000) { unchanged++; continue; }
+            const rec = {
+              id: key.slice(6), identityKey: ikey, side: side, kind: kind,
+              title: title, area: area, region: region, source: source, category: category,
+              url: url, price: priceStr, priceNum: priceNum, priceFlag: priceFlag,
+              priceHistory: hist, priceCuts: priceCuts,
+              relistCount: relistCount, relisted: relisted,
+              motivation: motivation, motivationSignals: motivationSignals,
+              beds: beds, type: ptype, phone: phone, summary: summary, posted_at: postedStr,
+              firstSeen: (prev && prev.firstSeen) || nowIso,
+              lastSeen: nowIso,
+              seenCount: seenCount
+            };
+            ops++;
+            // Pack E (RDR-01 H1): write-time KV metadata powers the
+            // paged GET — matching never needs a get per record again.
+            await env.LEADS.put(key, JSON.stringify(rec), { expirationTtl: 2592000, metadata: { s: side, k: kind, ls: nowIso, m: motivation, r: region, p: priceNum } }); // 30 days
+            // Tombstone (180d): written at creation, on a relist bump,
+            // then at most every 7 days (H2) — carries lastPrice +
+            // priceCuts so the trail survives expiry (M1).
+            let wantTomb = !prev || relistBump;
+            if (!wantTomb && prev.firstSeen && (nowMs - (Date.parse(prev.firstSeen) || 0)) > 7 * 86400000) {
+              if (!tombRead) { ops++; try { tomb = await env.LEADS.get(xkey, { type: 'json' }); } catch (e) { tomb = null; } tombRead = true; }
+              const ta = tomb ? Date.parse(tomb.tombAt || '') : NaN;
+              if (!tomb || !isFinite(ta) || (nowMs - ta) > 7 * 86400000) wantTomb = true;
+            }
+            if (wantTomb) { ops++; try { await env.LEADS.put(xkey, JSON.stringify({ relistCount: relistCount, lastSeen: nowIso, lastPrice: priceNum, priceCuts: priceCuts, tombAt: nowIso }), { expirationTtl: 15552000 }); } catch (e) {} }
+            if (prev) updated++; else added++;
+          } catch (e) { skipped++; } // Pack E (RDR-01 H2/L3): per-item isolation — one bad item never 500s the batch after partial writes
         }
-        return json({ ok: true, added: added, updated: updated, skipped: skipped, dropped: Math.max(0, d.items.length - 60) }, 200, origin);
+        return json({ ok: true, added: added, updated: updated, skipped: skipped, unchanged: unchanged, relisted: relistedN, processed: processed, partial: processed < items.length, dropped: Math.max(0, d.items.length - 60) }, 200, origin);
       }
       if (path === '/api/market-pool' && request.method === 'GET') {
-        const pkeys = await listAllKeys(env, 'mpool:', 2000);
-        const out = (await Promise.all(pkeys.map(k => env.LEADS.get(k.name, { type: 'json' })))).filter(Boolean);
-        out.sort(function (a, b) { return String(b.lastSeen || '').localeCompare(String(a.lastSeen || '')); });
-        return json({ ok: true, items: out }, 200, origin);
+        // Pack E (RDR-01 H1): paged METADATA listing — the old handler
+        // listed ≤2000 keys and did a get per key (subrequest budget
+        // gone past a few dozen records; past 2000 it silently
+        // returned an arbitrary subset with ok:true). Full docs only
+        // via ?ids= (≤40), identityKey stripped everywhere, phone only
+        // in the by-id fetch (M8). Default window: lastSeen ≤ 10 days
+        // (M6).
+        const idsParam = String(url.searchParams.get('ids') || '').trim();
+        if (idsParam) {
+          const ids = idsParam.split(',').map(function (s) { return s.trim(); }).filter(function (s) { return /^[0-9a-f]{64}$/.test(s); }).slice(0, 40);
+          const out = [];
+          for (const id of ids) {
+            const r = await env.LEADS.get('mpool:' + id, { type: 'json' });
+            if (r) { const c = Object.assign({}, r); delete c.identityKey; out.push(c); }
+          }
+          return json({ ok: true, items: out }, 200, origin);
+        }
+        const limit = Math.max(1, Math.min(200, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+        const sinceMs = Date.now() - 10 * 86400000;
+        const out = [];
+        let cursor = url.searchParams.get('cursor') || undefined;
+        let truncated = false;
+        for (;;) {
+          const page = await kvList(env, { prefix: 'mpool:', limit: limit, cursor: cursor });
+          for (const k of page.keys) {
+            const md = (k.metadata && typeof k.metadata === 'object') ? k.metadata : null;
+            let item = null;
+            if (md) item = { id: k.name.slice(6), side: md.s || '', kind: md.k || '', lastSeen: md.ls || '', motivation: (typeof md.m === 'number' ? md.m : null), region: md.r || '', priceNum: (typeof md.p === 'number' ? md.p : null) };
+            else {
+              // Pre-Pack-E record without metadata: derive from the
+              // doc for this page only (bounded by the page size).
+              const r = await env.LEADS.get(k.name, { type: 'json' });
+              if (!r) continue;
+              item = { id: k.name.slice(6), side: r.side || '', kind: r.kind || '', lastSeen: r.lastSeen || '', motivation: (typeof r.motivation === 'number' ? r.motivation : null), region: r.region || '', priceNum: (typeof r.priceNum === 'number' ? r.priceNum : null) };
+            }
+            const lt = Date.parse(item.lastSeen || '');
+            if (isFinite(lt) && lt < sinceMs) continue;
+            out.push(item);
+          }
+          if (page.list_complete) { cursor = undefined; break; }
+          cursor = page.cursor;
+          if (out.length >= limit) { truncated = true; break; }
+        }
+        return json({ ok: true, items: out.slice(0, limit), cursor: truncated ? (cursor || null) : null, truncated: truncated }, 200, origin);
+      }
+      if (path === '/api/market-pool' && request.method === 'DELETE') {
+        // Pack E (RDR-01 M8): admin removal path — record + tombstone.
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const delId = String(url.searchParams.get('id') || '');
+        if (!/^[0-9a-f]{64}$/.test(delId)) return json({ ok: false, error: 'validation' }, 400, origin);
+        await env.LEADS.delete('mpool:' + delId);
+        await env.LEADS.delete('mpoolx:' + delId);
+        return json({ ok: true }, 200, origin);
       }
 
       // ---- market radar v4: coverage ledger (ONE KV doc; the scan
@@ -5088,30 +5638,54 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, cells: doc.cells || {}, updatedAt: doc.updatedAt || null }, 200, origin);
       }
       if (path === '/api/radar-coverage' && request.method === 'POST') {
+        // Pack E (RDR-01 M8): same OFF-switch gate as the pool writes.
+        if (!(await authed(request, env)) && !(await radarEnabled(env))) return json({ ok: false, error: 'radar_disabled' }, 409, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.cells)) return json({ ok: false, error: 'validation' }, 400, origin);
         const doc = (await env.LEADS.get('radar:coverage', { type: 'json' })) || { cells: {} };
         if (!doc.cells || typeof doc.cells !== 'object' || Array.isArray(doc.cells)) doc.cells = {};
         const nowIso = new Date().toISOString();
-        let merged = 0;
+        const nowMs = Date.now();
+        let merged = 0, skippedCells = 0, droppedCells = 0, flagged = 0;
         for (const c of d.cells.slice(0, 400)) {
-          if (!c || typeof c !== 'object') continue;
+          if (!c || typeof c !== 'object') { skippedCells++; continue; }
           const part = function (v, n) { return cleanText(v, n).replace(/\|/g, '/'); };
           const source = part(c.source, 40), region = part(c.region, 40), category = part(c.category, 40);
-          if (!source || !region || !category) continue;
+          if (!source || !region || !category) { skippedCells++; continue; }
           const ck = source + '|' + region + '|' + category;
+          const isNew = !doc.cells[ck];
+          // Pack E (RDR-01 M9): the ledger is capped at 500 cells —
+          // overflow is dropped AND counted in the response, never
+          // silently lost.
+          if (isNew && Object.keys(doc.cells).length >= 500) { droppedCells++; continue; }
           const prev = doc.cells[ck] || { lastOkAt: null, watermark: null, reported: null, fetched: null, debt: false, tier: 'delta' };
           const cell = Object.assign({}, prev);
           cell.tier = (c.tier === 'deep' || c.tier === 'delta') ? c.tier : (prev.tier || 'delta');
-          if (typeof c.reported === 'number' && isFinite(c.reported) && c.reported >= 0) cell.reported = Math.round(c.reported);
-          if (typeof c.fetched === 'number' && isFinite(c.fetched) && c.fetched >= 0) cell.fetched = Math.round(c.fetched);
+          const repIn = (typeof c.reported === 'number' && isFinite(c.reported) && c.reported >= 0) ? Math.min(100000, Math.round(c.reported)) : null; // values capped (M9)
+          const fetIn = (typeof c.fetched === 'number' && isFinite(c.fetched) && c.fetched >= 0) ? Math.min(100000, Math.round(c.fetched)) : null;
+          if (repIn !== null) cell.reported = repIn;
+          if (fetIn !== null) cell.fetched = fetIn;
           if (c.ok === true) {
             cell.lastOkAt = nowIso;
-            cell.debt = false;
-            if (typeof c.watermark === 'string' && c.watermark) cell.watermark = cleanText(c.watermark, 80);
+            // Pack E (RDR-01 M9): a short fetch IN THIS REPORT
+            // (fetched < reported) is NOT coverage — the cell stays
+            // in debt, with a reason. A report carrying no counts
+            // makes no short-fetch claim either way.
+            if (repIn !== null && fetIn !== null && fetIn < repIn) { cell.debt = true; cell.debtReason = 'short_fetch'; }
+            else { cell.debt = false; delete cell.debtReason; }
+            if (typeof c.watermark === 'string' && c.watermark) {
+              // Watermark must parse (a date ≤ now+5min, or a safe
+              // token) — a far-future watermark would make the agent
+              // silently skip everything newer (a coverage hole).
+              const wmClean = cleanText(c.watermark, 80);
+              const wmT = Date.parse(wmClean);
+              const wmOk = isFinite(wmT) ? (wmT <= nowMs + 5 * 60000) : /^[A-Za-z0-9:._-]{1,80}$/.test(wmClean);
+              if (wmOk) { cell.watermark = wmClean; delete cell.watermarkRejected; }
+              else { cell.watermarkRejected = true; flagged++; }
+            }
           } else {
-            cell.debt = true; // watermark + lastOkAt untouched: the cell still owes coverage
+            cell.debt = true; cell.debtReason = 'reported_failed'; // watermark + lastOkAt untouched: the cell still owes coverage
           }
           cell.updatedAt = nowIso;
           doc.cells[ck] = cell;
@@ -5119,7 +5693,7 @@ async function handleRequest(request, env, ctx) {
         }
         doc.updatedAt = nowIso;
         await env.LEADS.put('radar:coverage', JSON.stringify(doc));
-        return json({ ok: true, merged: merged, cells: Object.keys(doc.cells).length }, 200, origin);
+        return json({ ok: true, merged: merged, skipped: skippedCells, droppedCells: droppedCells, flagged: flagged, cells: Object.keys(doc.cells).length }, 200, origin);
       }
 
       const mm = path.match(/^\/api\/market-leads\/([A-Za-z0-9-]+)$/);
@@ -5179,14 +5753,34 @@ async function handleRequest(request, env, ctx) {
       if (path === '/api/admin/radar-coverage' && request.method === 'GET') {
         const doc = (await env.LEADS.get('radar:coverage', { type: 'json' })) || { cells: {}, updatedAt: null };
         const nowMs = Date.now();
+        // Pack E (RDR-01 M10): cells untouched for 60 days are pruned
+        // from the ledger (persisted here, counted in the response).
+        let pruned = 0;
+        for (const ck0 of Object.keys(doc.cells || {})) {
+          const c0 = doc.cells[ck0] || {};
+          const up = Date.parse(c0.updatedAt || c0.lastOkAt || '');
+          if (isFinite(up) && (nowMs - up) > 60 * 86400000) { delete doc.cells[ck0]; pruned++; }
+        }
+        if (pruned) { try { await env.LEADS.put('radar:coverage', JSON.stringify(doc)); } catch (e) {} }
         const cells = Object.keys(doc.cells || {}).map(function (ck) {
           const c = doc.cells[ck] || {};
           const parts = ck.split('|');
-          const ageH = c.lastOkAt ? Math.max(0, Math.round((nowMs - (Date.parse(c.lastOkAt) || nowMs)) / 360000) / 10) : null;
-          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, updatedAt: c.updatedAt || null };
+          // Pack E (RDR-01 L5): an unparseable lastOkAt yields
+          // ageHours null ("unknown"), never a confident 0.0.
+          const okMs = c.lastOkAt ? Date.parse(c.lastOkAt) : NaN;
+          const ageH = isFinite(okMs) ? Math.max(0, Math.round((nowMs - okMs) / 360000) / 10) : null;
+          // Pack E (RDR-01 M10): staleness is computed HERE — a cell
+          // nobody reports keeps debt:false forever in the ledger, so
+          // the view derives stale (ageHours null, or past the tier
+          // threshold: delta 36h / deep 240h) and folds it into
+          // debtCount.
+          const stale = ageH === null || ageH > (c.tier === 'deep' ? 240 : 36);
+          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null };
         }).sort(function (a, b) { return ((b.debt ? 1 : 0) - (a.debt ? 1 : 0)) || String(a.key).localeCompare(String(b.key)); });
-        const pkeys = await listAllKeys(env, 'mpool:', 2000);
-        return json({ ok: true, cells: cells, debtCount: cells.filter(function (c) { return c.debt; }).length, poolCount: pkeys.length, updatedAt: doc.updatedAt || null }, 200, origin);
+        // RDR-01 L2 (cheap version): the pool count is isolate-cached
+        // instead of a 2000-key list on every portal load.
+        const poolCount = await adminCached('mpool:count', async function () { return (await listAllKeys(env, 'mpool:', 2000)).length; });
+        return json({ ok: true, cells: cells, debtCount: cells.filter(function (c) { return c.debt || c.stale; }).length, staleCount: cells.filter(function (c) { return c.stale && !c.debt; }).length, pruned: pruned, poolCount: poolCount, updatedAt: doc.updatedAt || null }, 200, origin);
       }
 
       // ---- admin: listing performance counters (feature build 2026-10-29) ----
@@ -5198,12 +5792,14 @@ async function handleRequest(request, env, ctx) {
           const h = catalogByMls(mls);
           return { mls: mls, label: h ? (h.street + ', ' + h.city) : '(unknown listing)', views: e.v || 0, saves: e.s || 0, bookings: e.b || 0, leads: e.l || 0 }; // a non-catalog id is labelled, never dressed up as a real address (Pack A, F-05 H4)
         }).sort(function (a, b) { return ((b.views + b.saves + b.bookings + b.leads) - (a.views + a.saves + a.bookings + a.leads)) || String(a.mls).localeCompare(String(b.mls)); });
-        return json({ ok: true, startedAt: doc.startedAt || null, listings: rows, sources: doc.sources || {}, dropped: doc.dropped || 0 }, 200, origin);
+        let lastFoldAt = null;
+        try { lastFoldAt = await env.LEADS.get('perf:lastfold'); } catch (e) { lastFoldAt = null; }
+        return json({ ok: true, startedAt: doc.startedAt || null, listings: rows, sources: doc.sources || {}, dropped: doc.dropped || 0, stale: !!doc.stale, lastFoldAt: lastFoldAt }, 200, origin); // Pack E (R-01 N3/N4): fold health + partial-read staleness reach the portal
       }
 
       // ---- admin: today's follow-up worklist + search-alert status + run-now ----
       if (path === '/api/admin/followups' && request.method === 'GET') {
-        const data = await adminCachedGen(env, 'followups', function () { return buildFollowups(env); });
+        const data = await adminCachedGen(env, 'followups:' + todayVancouver(), function () { return buildFollowups(env); }); // Pack E (local-verification 2e): the worklist is date-driven — the cache key carries the Vancouver date so a midnight rollover never serves yesterday's list from a long-lived isolate
         return json(Object.assign({ ok: true }, data), 200, origin);
       }
       if (path === '/api/admin/alerts' && request.method === 'GET') {
@@ -5741,6 +6337,13 @@ async function handleRequest(request, env, ctx) {
         if (d.action === 'ban') {
           await env.LEADS.put('ban:' + normEmail(target), JSON.stringify({ email: target, reason: String(d.reason || '').slice(0, 200), at: new Date().toISOString() }));
           await idxAdd(env, 'bans', normEmail(target));
+          // Pack E (R-02 M2): index the account's phone (last 10) so
+          // the valuation route's phone-ban check is a single read.
+          try {
+            const bu = await env.LEADS.get('user:' + target, { type: 'json' });
+            const bph = phoneLast10((bu && bu.profile && bu.profile.phone) || (bu && bu.phone) || '');
+            if (bph.length >= 10) await env.LEADS.put('banphone:' + bph, normEmail(target));
+          } catch (e) {}
           banCache.set(normEmail(target), { t: Date.now(), banned: true });
           await purgeUserSessions(env, target);
           await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'user_ban', target: target, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
@@ -5749,6 +6352,17 @@ async function handleRequest(request, env, ctx) {
         if (d.action === 'unban') {
           await env.LEADS.delete('ban:' + normEmail(target));
           await idxRemove(env, 'bans', normEmail(target));
+          // Pack E (R-02 M2): drop the phone index entry — but only
+          // when it points at THIS account (a shared phone keeps the
+          // other account's ban reachable).
+          try {
+            const bu2 = await env.LEADS.get('user:' + target, { type: 'json' });
+            const bph2 = phoneLast10((bu2 && bu2.profile && bu2.profile.phone) || (bu2 && bu2.phone) || '');
+            if (bph2.length >= 10) {
+              const cur = await env.LEADS.get('banphone:' + bph2);
+              if (cur === normEmail(target)) await env.LEADS.delete('banphone:' + bph2);
+            }
+          } catch (e) {}
           banCache.set(normEmail(target), { t: Date.now(), banned: false });
           await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'user_unban', target: target, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
           return json({ ok: true }, 200, origin);
@@ -6571,20 +7185,40 @@ export default {
     } catch (e) {}
     return resp;
   },
-  async scheduled(event, env, ctx) { ctx.waitUntil(runFullBackup(env, 'cron').catch(async function (e) { try { console.error(e); const bl = (await env.LEADS.get('backup:log', { type: 'json' })) || []; bl.unshift({ at: new Date().toISOString(), day: vancouverDay(), ok: false, via: 'cron-catch', error: String((e && e.message) || e).slice(0, 160) }); await env.LEADS.put('backup:log', JSON.stringify(bl.slice(0, 40))); } catch (e2) {} }));
-    // Perf counters (F-01 redesign): flush THIS isolate's trailing
-    // delta first, then fold every outstanding delta key into
-    // perf:totals — scheduled() is the sole writer of perf:totals, so
-    // the fold's read-modify-write has no rival writer.
-    ctx.waitUntil((async function () { try { await flushPerf(env); await perfFold(env); } catch (e) { console.error(e); } })());
-    // Daily automations (feature build 2026-10-29; Pack A runner):
-    // queue saved-search alerts + viewing reminders through the shared
-    // runner — lock, proven-fresh catalog, sequential isolation,
-    // automation:last heartbeat. Queue-only: nothing is ever sent.
-    ctx.waitUntil((async function () { try { await runAutomations(env, 'cron'); } catch (e) { console.error(e); } })());
-    // Daily index reconcile (Pack D): union any ids a lost idxAdd
-    // update dropped back into their indexes — at most once a day
-    // (the guard key lives inside idxReconcile).
-    ctx.waitUntil((async function () { try { await idxReconcile(env); } catch (e) { console.error(e); } })());
-  } // a rejected backup must still leave a failure entry the freshness alarm can see (cycle 30, Claude M7)
+  // Pack E (R-03 N2/L4): ONE sequential chain instead of four
+  // concurrent waitUntil blocks — the jobs share the invocation's
+  // subrequest budget, and the reconcile running CONCURRENTLY with
+  // runAutomations could overwrite a just-added mailq index entry.
+  // Heavy jobs (backup, reconcile) run only on the fixed-minute tick:
+  // when event.cron's minute field is a plain number, they fire when
+  // the UTC minute matches it; when the expression has no plain
+  // minute (or the event carries none, e.g. tests), they run every
+  // tick — the pre-Pack-E behaviour, safe by default. Automations and
+  // the perf fold run on every tick. (Accepted + noted from R-03 L4:
+  // idxReconcile's 23h guard is still claimed before its work.)
+  async scheduled(event, env, ctx) {
+    const cronStr = (event && typeof event.cron === 'string') ? event.cron : '';
+    const minuteField = cronStr ? cronStr.trim().split(/\s+/)[0] : '';
+    const fixedMinute = /^\d+$/.test(minuteField) ? parseInt(minuteField, 10) : null;
+    const heavyOk = fixedMinute === null || new Date().getUTCMinutes() === fixedMinute;
+    ctx.waitUntil((async function () {
+      if (heavyOk) {
+        await runFullBackup(env, 'cron').catch(async function (e) { try { console.error(e); const bl = (await env.LEADS.get('backup:log', { type: 'json' })) || []; bl.unshift({ at: new Date().toISOString(), day: vancouverDay(), ok: false, via: 'cron-catch', error: String((e && e.message) || e).slice(0, 160) }); await env.LEADS.put('backup:log', JSON.stringify(bl.slice(0, 40))); } catch (e2) {} }); // a rejected backup must still leave a failure entry the freshness alarm can see (cycle 30, Claude M7)
+      }
+      // Perf counters (F-01 redesign): flush THIS isolate's trailing
+      // delta first, then fold every outstanding delta key into
+      // perf:totals — scheduled() is the sole writer of perf:totals, so
+      // the fold's read-modify-write has no rival writer.
+      try { await flushPerf(env); await perfFold(env); } catch (e) { console.error(e); }
+      // Automations (feature build 2026-10-29; Pack A runner): queue
+      // saved-search alerts + viewing reminders through the shared
+      // runner — lock, proven-fresh catalog, sequential isolation,
+      // automation:last heartbeat. Queue-only: nothing is ever sent.
+      try { await runAutomations(env, 'cron'); } catch (e) { console.error(e); }
+      // Daily index reconcile (Pack D): union any ids a lost idxAdd
+      // update dropped back into their indexes — at most once a day
+      // (the guard key lives inside idxReconcile).
+      if (heavyOk) { try { await idxReconcile(env); } catch (e) { console.error(e); } }
+    })());
+  }
 };
