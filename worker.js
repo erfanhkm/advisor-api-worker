@@ -4909,10 +4909,22 @@ async function handleRequest(request, env, ctx) {
           links: PR_LINKS
         }, 200, origin);
       }
-      if (path === '/api/report/property' && request.method === 'GET') {
+      if (path === '/api/report/property' && (request.method === 'GET' || request.method === 'POST')) {
         if (limited('prp:' + ip, 20, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const address = String(url.searchParams.get('address') || '').slice(0, 140).trim();
-        const cityIn = String(url.searchParams.get('city') || '').slice(0, 60).trim();
+        // POST carries {address, city} as JSON so the visitor's address
+        // stays out of URLs, logs and browser history (PR-02 M8); GET
+        // with query params remains supported for compatibility.
+        let address = '', cityIn = '';
+        if (request.method === 'POST') {
+          let d = null;
+          try { d = await request.json(); } catch (e) {}
+          d = d || {};
+          address = String(d.address || '').slice(0, 140).trim();
+          cityIn = String(d.city || '').slice(0, 60).trim();
+        } else {
+          address = String(url.searchParams.get('address') || '').slice(0, 140).trim();
+          cityIn = String(url.searchParams.get('city') || '').slice(0, 60).trim();
+        }
         if (address.length < 4) return json({ ok: false, error: 'validation', field: 'address' }, 400, origin);
         const slug = address.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
         const links = { bca: PR_LINKS.bca, parcel: PR_LINKS.parcel, ltsa: PR_LINKS.ltsa, walkscore: 'https://www.walkscore.com/score/' + slug + (cityIn ? '-' + cityIn.toLowerCase().replace(/[^a-z0-9]+/g, '-') : '') };
