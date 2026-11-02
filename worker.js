@@ -2574,6 +2574,11 @@ async function runAutomations(env, source) {
     // the first automation run after deploy — agent-operated activation,
     // idempotent, one KV read once the keys exist.
     try { await puEnsurePushKeys(env); } catch (e) {}
+    // Portal upgrade (system 2): mirror lead scores onto lscore:<id>.
+    try { await puPersistScores(env); } catch (e) {}
+    // Portal upgrade (system 5): custom automation rules, evaluated
+    // after the built-ins under the same lock, strict op budget inside.
+    try { result.rules = await puEvaluateRules(env, result); } catch (e) { result.rules = { error: 'failed' }; }
     // Bump the admin-cache generation (Pack D, F-03S L1): mutating
     // HTTP requests bump admin:gen in the fetch wrapper, but the cron
     // path has no wrapper — without this, leads/viewings the runner
@@ -2806,6 +2811,531 @@ async function puPushStatus(env) {
   };
 }
 
+/* ---- systems 1+2: attention feed + lead scoring + Today ---- */
+async function puAttentionAdd(env, kind, text, ref) {
+  try {
+    const cur = (await env.LEADS.get('attention', { type: 'json' })) || [];
+    cur.unshift({ at: new Date().toISOString(), kind: String(kind || 'note').slice(0, 30), text: String(text || '').slice(0, 300), ref: String(ref || '').slice(0, 120) });
+    await env.LEADS.put('attention', JSON.stringify(cur.slice(0, 50)));
+  } catch (e) {}
+}
+async function puAttentionList(env) {
+  try { return (await env.LEADS.get('attention', { type: 'json' })) || []; } catch (e) { return []; }
+}
+function puBand(score) { return score >= 70 ? 'hot' : score >= 40 ? 'warm' : 'cold'; }
+/* Transparent rule-based lead score, 0–100. Every point is explained by
+   a reason code so the portal can show WHY a lead is hot — no black box,
+   no invented signals: inputs are the lead record, its saved searches
+   and its viewings only. */
+function puScoreLead(l, ctx) {
+  let score = 0;
+  const reasons = [];
+  const add = function (code, pts) { if (pts) { score += pts; reasons.push({ code: code, pts: pts }); } };
+  const ts = Date.parse(l.created_at);
+  const ageH = isFinite(ts) ? Math.max(0, (ctx.now - ts) / 3600000) : null;
+  if (ageH !== null) {
+    if (ageH <= 24) add('fresh_24h', 15);
+    else if (ageH <= 72) add('fresh_72h', 10);
+    else if (ageH <= 168) add('fresh_7d', 5);
+  }
+  if (l.phone) add('has_phone', 10);
+  if (l.email) add('has_email', 5);
+  if (l.source === 'home-valuation') add('source_valuation', 20);
+  else if (l.source === 'viewing') add('source_viewing', 15);
+  else if (l.source === 'call') add('source_call', 15);
+  else if (l.source === 'site-form') add('source_form', 10);
+  if (ctx.searchCount >= 3) add('searches_3plus', 15);
+  else if (ctx.searchCount >= 1) add('searches_active', 10);
+  if (ctx.futureViewing) add('viewing_booked', 20);
+  if (ctx.pastViewing) add('viewing_attended', 10);
+  if (l.stage === 'contacted') add('stage_contacted', 5);
+  else if (l.stage === 'viewing') add('stage_viewing', 10);
+  else if (l.stage === 'offer') add('stage_offer', 15);
+  const stageTs = l.stageAt ? Date.parse(l.stageAt) : NaN;
+  const stageAgeH = isFinite(stageTs) ? Math.max(0, (ctx.now - stageTs) / 3600000) : ageH;
+  if (l.stage === 'new' && ageH !== null && ageH > 48) add('silent_new_48h', -15);
+  if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) add('silent_contacted_7d', -10);
+  if (l.stage === 'closed') score = Math.max(score, 85);
+  if (l.stage === 'dropped') score = Math.min(score, 10);
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  let next;
+  if (l.stage === 'closed') next = { kind: 'done', text: 'Closed — ask for a referral or review' };
+  else if (l.stage === 'dropped') next = { kind: 'none', text: 'Dropped — no action' };
+  else if (ctx.futureViewing) next = { kind: 'prepare', text: 'Prepare the showing handbook for the upcoming viewing' };
+  else if (l.source === 'home-valuation' && l.stage === 'new') next = { kind: 'call', text: 'Call today — walk through the valuation and offer an in-person review' };
+  else if (l.stage === 'new' && ageH !== null && ageH > 48) next = { kind: 'call', text: 'Overdue first contact — call now (' + Math.floor(ageH / 24) + 'd waiting)' };
+  else if (l.stage === 'new') next = { kind: 'call', text: 'First contact today — call or message within 24h' };
+  else if (ctx.pastViewing && l.stage === 'viewing') next = { kind: 'feedback', text: 'Ask for feedback on the viewing and agree the next step' };
+  else if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) next = { kind: 'reengage', text: 'Re-engage — silent for 7+ days' };
+  else if (!l.phone) next = { kind: 'message', text: 'Ask for a phone number to speed up follow-up' };
+  else if (l.stage === 'offer') next = { kind: 'offer', text: 'Support the offer — keep daily contact' };
+  else if (ctx.searchCount >= 1 && !ctx.futureViewing && !ctx.pastViewing) next = { kind: 'invite', text: 'Invite them to view a matching home' };
+  else next = { kind: 'nurture', text: 'Keep in touch — send a market update' };
+  return { score: score, band: puBand(score), reasons: reasons, next: next, at: new Date(ctx.now).toISOString() };
+}
+/* One pass over the leads index + vidx (≤200) + one user record and one
+   search list per unique lead email (≤300). Cached via adminCachedGen —
+   this is THE scoring aggregation; every surface (Today, pipeline,
+   draft) reads from it instead of rescanning. */
+async function puLeadScores(env) {
+  return adminCachedGen(env, 'leadscores', async function () {
+    const now = Date.now();
+    const today = todayVancouver();
+    const viewByEmail = Object.create(null);
+    const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+    for (const id of vidx.slice(0, 200)) {
+      const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
+      if (!v || !v.email || v.status === 'cancelled') continue;
+      const ne = normEmail(v.email);
+      const e = viewByEmail[ne] || (viewByEmail[ne] = { future: false, past: false });
+      if (v.date >= today) e.future = true; else e.past = true;
+    }
+    const leads = [];
+    for (const lid of await idxGet(env, 'leads', 'lead:')) {
+      const l = await env.LEADS.get('lead:' + lid, { type: 'json' });
+      if (l) leads.push(l);
+    }
+    const searchCount = Object.create(null);
+    const langByEmail = Object.create(null);
+    const seen = Object.create(null);
+    const emails = [];
+    for (const l of leads) {
+      const ne = normEmail(l.email || '');
+      if (ne && !seen[ne]) { seen[ne] = 1; emails.push(ne); }
+    }
+    for (const ne of emails.slice(0, 300)) {
+      try { const s = await userSearches(env, ne); searchCount[ne] = Array.isArray(s) ? s.length : 0; } catch (e) { searchCount[ne] = 0; }
+      try { const u = await env.LEADS.get('user:' + ne, { type: 'json' }); if (u && u.lang) langByEmail[ne] = validLang(u.lang); } catch (e) {}
+    }
+    const map = Object.create(null);
+    for (const l of leads) {
+      const ne = normEmail(l.email || '');
+      const vc = viewByEmail[ne] || { future: false, past: false };
+      map[l.id] = puScoreLead(l, { now: now, searchCount: searchCount[ne] || 0, futureViewing: vc.future, pastViewing: vc.past });
+    }
+    return { at: new Date(now).toISOString(), map: map, leads: leads, langByEmail: langByEmail };
+  });
+}
+/* Mirror scores onto lscore:<leadId> (diff-only, capped) from the
+   automation run, so a stored per-lead record exists for consumers
+   that don't want the whole map. Admin GET paths never write. */
+async function puPersistScores(env) {
+  const sm = await puLeadScores(env);
+  let written = 0;
+  for (const l of sm.leads) {
+    if (written >= 60) break;
+    const s = sm.map[l.id];
+    if (!s) continue;
+    let cur = null;
+    try { cur = await env.LEADS.get('lscore:' + l.id, { type: 'json' }); } catch (e) {}
+    if (!cur || cur.score !== s.score || cur.band !== s.band || cur.next.kind !== (s.next && s.next.kind)) {
+      try { await env.LEADS.put('lscore:' + l.id, JSON.stringify(s)); written++; } catch (e) {}
+    }
+  }
+  return written;
+}
+async function puToday(env) {
+  const today = todayVancouver();
+  const out = { today: today, tomorrow: addDaysYmd(today, 1), sources: {} };
+  const seg = async function (name, fn) {
+    try { out[name] = await fn(); out.sources[name] = 'ok'; }
+    catch (e) { out[name] = null; out.sources[name] = 'error'; }
+  };
+  await seg('viewings', async function () {
+    const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+    const t = [], tm = [], awaiting = [];
+    for (const id of vidx.slice(0, 200)) {
+      const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
+      if (!v) continue;
+      const h = v.listingId ? catalogByMls(v.listingId) : null;
+      const item = { id: v.id, date: v.date, time: v.time, name: v.name || '', email: v.email || '', status: v.status, listing: h ? (h.street + ', ' + h.city) : (v.listingId || '') };
+      if ((v.status === 'new' || v.status === 'confirmed') && v.date === today) t.push(item);
+      if ((v.status === 'new' || v.status === 'confirmed') && v.date === out.tomorrow) tm.push(item);
+      if (v.status === 'new' && v.date >= today) awaiting.push(item);
+    }
+    const byDT = function (a, b) { return String(a.date + ' ' + a.time).localeCompare(String(b.date + ' ' + b.time)); };
+    t.sort(byDT); tm.sort(byDT); awaiting.sort(byDT);
+    return { today: t, tomorrow: tm, awaiting: awaiting.slice(0, 10), awaitingCount: awaiting.length };
+  });
+  await seg('followups', async function () {
+    const f = await buildFollowups(env);
+    return { newCount: f.newCount, staleCount: f.staleCount, postViewingCount: f.postViewingCount, stale: f.staleLeads.slice(0, 5), post: f.postViewing.slice(0, 5) };
+  });
+  await seg('hotLeads', async function () {
+    const sm = await puLeadScores(env);
+    const counts = { hot: 0, warm: 0, cold: 0 };
+    const rows = [];
+    for (const l of sm.leads) {
+      const s = sm.map[l.id];
+      if (!s) continue;
+      counts[s.band]++;
+      if (s.band === 'hot' && l.stage !== 'closed' && l.stage !== 'dropped') rows.push({ id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, source: l.source || '', score: s.score, next: s.next });
+    }
+    rows.sort(function (a, b) { return b.score - a.score; });
+    return { counts: counts, hot: rows.slice(0, 6) };
+  });
+  await seg('alerts', async function () {
+    const last = (await env.LEADS.get('automation:last', { type: 'json' })) || null;
+    let unsentAlerts = 0;
+    const mids = await idxGet(env, 'mailq', 'mailq:');
+    for (const mid of mids.slice(-200)) {
+      const mm = await env.LEADS.get('mailq:' + mid, { type: 'json' });
+      if (mm && !mm.sent && mm.kind === 'alert') unsentAlerts++;
+    }
+    return { lastRun: last, unsentAlerts: unsentAlerts };
+  });
+  await seg('marketPulse', async function () {
+    const ds = await mpReadStats(env);
+    const months = (ds && ds.months) || [];
+    const cur = months[0] || null, prev = months[1] || null;
+    const delta = function (block, field) {
+      if (!cur || !prev || !cur[block] || !prev[block] || typeof cur[block][field] !== 'number' || typeof prev[block][field] !== 'number') return null;
+      return Math.round((cur[block][field] - prev[block][field]) * 100) / 100;
+    };
+    return { month: cur ? cur.month : null, cur: cur, deltas: (cur && prev) ? { gvrBenchmark: delta('gvr', 'benchmark'), fvrebBenchmark: delta('fvreb', 'benchmark'), bcSales: delta('bc', 'sales'), canadaBenchmark: delta('canada', 'benchmark') } : null };
+  });
+  await seg('radar', async function () {
+    const st = (await env.LEADS.get('radar:settings', { type: 'json' })) || { enabled: false };
+    const keys = await listAllKeys(env, 'mlead:', 2000);
+    let pairs = 0, hot = 0;
+    for (const k of keys.slice(-300)) {
+      const r = await env.LEADS.get(k.name, { type: 'json' });
+      if (r && (r.kind === 'pair' || (Array.isArray(r.matches) && r.matches.length))) {
+        pairs++;
+        if ((r.matchScore || 0) >= 80 && (r.motivation || 0) >= 60) hot++;
+      }
+    }
+    return { enabled: !!st.enabled, pairs: pairs, hotPairs: hot, sampled: Math.min(keys.length, 300), total: keys.length };
+  });
+  await seg('newsletter', async function () {
+    let total = 0;
+    const byLang = {}; // dynamic keys — no fixed language list (ES-ready)
+    for (const nid of await idxGet(env, 'nlsubs', 'nlsub:')) {
+      const raw = await env.LEADS.get('nlsub:' + nid);
+      if (!raw) continue;
+      try { const s = JSON.parse(raw); total++; const lg = s.lang || 'en'; byLang[lg] = (byLang[lg] || 0) + 1; } catch (e) {}
+    }
+    return { total: total, byLang: byLang };
+  });
+  await seg('tasks', async function () {
+    const all = (await allTasks(env)).filter(function (t) { return !t.done && t.due <= out.tomorrow; });
+    all.sort(function (a, b) { return String(a.due).localeCompare(String(b.due)); });
+    return { due: all.slice(0, 10), count: all.length, overdue: all.filter(function (t) { return t.due < today; }).length };
+  });
+  await seg('attention', async function () { return { items: (await puAttentionList(env)).slice(0, 15) }; });
+  out.generatedAt = new Date().toISOString();
+  return out;
+}
+
+/* ---- system 3 data: kanban pipeline over lead stages ---- */
+async function puPipeline(env) {
+  const sm = await puLeadScores(env);
+  const now = Date.now();
+  const columns = {}; const counts = {};
+  STAGES.forEach(function (s) { columns[s] = []; counts[s] = 0; });
+  for (const l of sm.leads) {
+    if (!columns[l.stage]) continue;
+    const s = sm.map[l.id];
+    const stageMs = l.stageAt ? Date.parse(l.stageAt) : NaN;
+    columns[l.stage].push({
+      id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '',
+      intent: l.intent || '', city: l.city || '', source: l.source || '',
+      lang: (l.lang || (sm.langByEmail && sm.langByEmail[normEmail(l.email || '')]) || ''),
+      created_at: l.created_at || '', stageAt: l.stageAt || null,
+      score: s ? s.score : null, band: s ? s.band : null, next: s ? s.next : null,
+      goingCold: !!(l.stage === 'contacted' && isFinite(stageMs) && (now - stageMs) >= 7 * 86400000)
+    });
+    counts[l.stage]++;
+  }
+  STAGES.forEach(function (st) {
+    columns[st].sort(function (a, b) { return (b.score || 0) - (a.score || 0) || String(b.created_at).localeCompare(String(a.created_at)); });
+    columns[st] = columns[st].slice(0, 120);
+  });
+  return { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at };
+}
+
+/* ---- system 4 data: aggregate demand (never exact lead addresses) ---- */
+const PU_CITY_COORDS = {
+  'vancouver': [49.2827, -123.1207], 'burnaby': [49.2488, -122.9805], 'surrey': [49.1913, -122.8490],
+  'richmond': [49.1666, -123.1336], 'coquitlam': [49.2838, -122.7932], 'langley': [49.1044, -122.6604],
+  'delta': [49.0846, -123.0584], 'north vancouver': [49.3200, -123.0724], 'west vancouver': [49.3286, -123.1598],
+  'new westminster': [49.2057, -122.9110], 'port coquitlam': [49.2624, -122.7811], 'port moody': [49.2846, -122.8316],
+  'maple ridge': [49.2193, -122.5989], 'white rock': [49.0253, -122.8026], 'abbotsford': [49.0504, -122.3045],
+  'mission': [49.1337, -122.3119], 'pitt meadows': [49.2334, -122.6894], 'squamish': [49.7016, -123.1558]
+};
+async function puDemand(env) {
+  const out = { sources: {}, generatedAt: new Date().toISOString() };
+  // demand from valuation leads (city-level + FSA extracted from the
+  // postal code the seller typed — aggregate only, address never leaves)
+  const valByCity = {}, valByFsa = {};
+  let valTotal = 0;
+  for (const lid of await idxGet(env, 'leads', 'lead:')) {
+    const l = await env.LEADS.get('lead:' + lid, { type: 'json' });
+    if (!l || l.source !== 'home-valuation') continue;
+    valTotal++;
+    const city = String(l.city || (l.valuation && l.valuation.city) || '').trim();
+    if (city) valByCity[city] = (valByCity[city] || 0) + 1;
+    const src = String((l.valuation && l.valuation.address) || '') + ' ' + String(l.postal || '');
+    const m = src.match(/\b([A-Za-z]\d[A-Za-z])\s?\d[A-Za-z]\d\b/);
+    if (m) { const f = m[1].toUpperCase(); valByFsa[f] = (valByFsa[f] || 0) + 1; }
+  }
+  out.valuations = { total: valTotal, byCity: valByCity, byFsa: valByFsa };
+  out.sources.valuations = 'ok';
+  // saved-search demand (bounded user sample, coverage labelled)
+  try {
+    const uids = await idxGet(env, 'users', 'user:', 5000);
+    const sample = uids.slice(0, 300);
+    const byCity = {}, byType = {};
+    let searches = 0;
+    for (const em of sample) {
+      const ss = await userSearches(env, em);
+      if (!Array.isArray(ss)) continue;
+      for (const s of ss) {
+        searches++;
+        const c = (s.criteria && s.criteria.city) || '';
+        if (c) byCity[c] = (byCity[c] || 0) + 1;
+        const t = (s.criteria && s.criteria.type) || '';
+        if (t) byType[t] = (byType[t] || 0) + 1;
+      }
+    }
+    out.searchDemand = { searches: searches, byCity: byCity, byType: byType, usersScanned: sample.length, usersTotal: uids.length };
+    out.sources.searchDemand = 'ok';
+  } catch (e) { out.searchDemand = null; out.sources.searchDemand = 'error'; }
+  // radar pool density (metadata-level sample; pool is empty while OFF)
+  try {
+    const keys = await kvList(env, 'mpool:', 200);
+    const byRegion = {}, bySide = { demand: 0, supply: 0 };
+    let sampled = 0;
+    for (const k of keys.slice(0, 60)) {
+      const r = await env.LEADS.get(k.name, { type: 'json' });
+      if (!r) continue;
+      sampled++;
+      const reg = r.region || r.area || '';
+      if (reg) byRegion[reg] = (byRegion[reg] || 0) + 1;
+      if (r.side === 'demand' || r.side === 'supply') bySide[r.side]++;
+    }
+    out.pool = { total: keys.length, sampled: sampled, byRegion: byRegion, bySide: bySide };
+    out.sources.pool = 'ok';
+  } catch (e) { out.pool = null; out.sources.pool = 'error'; }
+  // supply: active catalog by city
+  const supply = {};
+  for (const h of mergedCatalog()) {
+    if (h.status !== 'active') continue;
+    const c = supply[h.city] || (supply[h.city] = { count: 0, prices: [] });
+    c.count++;
+    if (h.price) c.prices.push(h.price);
+  }
+  const supplyRows = Object.keys(supply).map(function (city) {
+    const p = supply[city].prices.slice().sort(function (a, b) { return a - b; });
+    return { city: city, count: supply[city].count, median: p.length ? p[Math.floor(p.length / 2)] : null, coords: PU_CITY_COORDS[city.toLowerCase()] || null };
+  }).sort(function (a, b) { return b.count - a.count; });
+  out.supply = supplyRows;
+  // census overlay for Metro Vancouver FSAs (V3–V7) from the embedded
+  // property-report dataset; index order documented at PR_CENSUS_FSA.
+  const census = {};
+  for (const fsa of Object.keys(PR_CENSUS_FSA)) {
+    if (!/^V[3-7]/.test(fsa)) continue;
+    const r = PR_CENSUS_FSA[fsa];
+    census[fsa] = { pop: r[0], dwellings: r[1], pctAge0to14: r[2], pctAge65plus: r[3], medianAge: r[4], pctSingleDetached: r[5], avgHouseholdSize: r[6], medianIncome: r[7], pctOwner: r[8], pctRenter: r[9], pctEnglishAtHome: r[10], pctNonOfficialAtHome: r[11] };
+  }
+  out.census = census;
+  out.cityCoords = PU_CITY_COORDS;
+  return out;
+}
+
+/* ---- system 5: automation rules builder ----
+   Rule model in cfg:rules (own endpoints; the generic config POST
+   would replace the whole value, so rules never travel through it).
+   The engine is STATE-based: triggers are predicates over current
+   records, deduplicated by rulefire:<ruleId>:<target> keys, evaluated
+   inside runAutomations AFTER the built-ins under the same lock with
+   a strict op budget + per-run firing cap. 'lead_cold' is a documented
+   superset trigger (state-evaluated from stage + stageAt) — the
+   brief's cold-lead preset cannot be expressed with event triggers.
+   Actions never send mail: queue_draft only queues HELD mail. */
+const PU_RULE_TRIGGERS = ['lead_created', 'valuation_submitted', 'viewing_booked', 'viewing_cancelled', 'stage_changed', 'search_match', 'lead_cold'];
+const PU_RULE_ACTIONS = ['create_followup', 'queue_draft', 'flag_hot', 'portal_note'];
+function puRulePresets() {
+  return [
+    { id: 'preset_new_lead_followup', name: 'New lead → follow-up task', enabled: true, trigger: 'lead_created', conditions: {}, actions: [{ type: 'create_followup', text: 'Follow up with the new lead', dueDays: 1 }] },
+    { id: 'preset_cold_flag', name: 'Lead cold 7 days → flag + note', enabled: false, trigger: 'lead_cold', conditions: { days: 7 }, actions: [{ type: 'flag_hot' }, { type: 'portal_note', text: 'Lead went cold (7+ days in Contacted)' }] },
+    { id: 'preset_valuation_note', name: 'Valuation submitted → portal note', enabled: false, trigger: 'valuation_submitted', conditions: {}, actions: [{ type: 'portal_note', text: 'New home-valuation request' }] }
+  ];
+}
+function puCleanRule(r) {
+  if (!r || typeof r !== 'object') return null;
+  if (PU_RULE_TRIGGERS.indexOf(r.trigger) === -1) return null;
+  const actions = [];
+  for (const a of (Array.isArray(r.actions) ? r.actions : []).slice(0, 3)) {
+    if (!a || PU_RULE_ACTIONS.indexOf(a.type) === -1) continue;
+    const act = { type: a.type };
+    if (a.text) act.text = String(a.text).slice(0, 200);
+    if (a.dueDays !== undefined) act.dueDays = Math.max(0, Math.min(30, parseInt(a.dueDays, 10) || 0));
+    actions.push(act);
+  }
+  if (!actions.length) return null;
+  const cond = {};
+  const c = (r.conditions && typeof r.conditions === 'object') ? r.conditions : {};
+  if (c.days !== undefined) cond.days = Math.max(1, Math.min(90, parseInt(c.days, 10) || 7));
+  if (c.stage && STAGES.indexOf(c.stage) !== -1) cond.stage = c.stage;
+  if (c.source && LEAD_SOURCES.indexOf(c.source) !== -1) cond.source = c.source;
+  return {
+    id: String(r.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || ('rule_' + randHex(6)),
+    name: String(r.name || 'Untitled rule').slice(0, 80),
+    enabled: r.enabled !== false,
+    trigger: r.trigger, conditions: cond, actions: actions
+  };
+}
+async function puRulesGet(env) {
+  try {
+    const r = await env.LEADS.get('cfg:rules', { type: 'json' });
+    if (r && Array.isArray(r.rules)) return { rules: r.rules, seeded: false };
+  } catch (e) {}
+  return { rules: puRulePresets(), seeded: true };
+}
+async function puRuleLog(env, entry) {
+  try {
+    const log = (await env.LEADS.get('rulelog', { type: 'json' })) || [];
+    log.unshift(entry);
+    await env.LEADS.put('rulelog', JSON.stringify(log.slice(0, 200)));
+  } catch (e) {}
+}
+async function puEvaluateRules(env, autoCtx) {
+  const out = { fired: 0, skipped: 0, errors: 0, partial: false, ops: 0 };
+  let cfg = null;
+  try { cfg = await puRulesGet(env); } catch (e) { return { error: 'rules_unreadable' }; }
+  const rules = (cfg.rules || []).filter(function (r) { return r.enabled; });
+  if (!rules.length) return out;
+  const now = Date.now();
+  const today = todayVancouver();
+  let ops = 0;
+  const BUDGET = 80, MAXFIRE = 25;
+  const sm = await puLeadScores(env); ops += 12;
+  const leadByEmail = {};
+  for (const l of sm.leads) { const ne = normEmail(l.email || ''); if (ne && !leadByEmail[ne]) leadByEmail[ne] = l; }
+  const viewings = [];
+  const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+  for (const id of vidx.slice(0, 200)) { const v = await env.LEADS.get('viewing:' + id, { type: 'json' }); if (v) viewings.push(v); ops++; }
+  async function wasFired(ruleId, target) { ops++; try { return !!(await env.LEADS.get('rulefire:' + ruleId + ':' + target)); } catch (e) { return false; } }
+  async function markFired(ruleId, target, ttl) { ops++; try { await env.LEADS.put('rulefire:' + ruleId + ':' + target, new Date().toISOString(), { expirationTtl: ttl || 172800 }); } catch (e) {} }
+  async function runActions(rule, lead, viewing) {
+    const done = [];
+    for (const a of rule.actions) {
+      try {
+        if (a.type === 'portal_note') {
+          await puAttentionAdd(env, 'rule', (a.text || rule.name) + (lead ? ' — ' + (lead.name || lead.email || '') : '') + (viewing ? ' — ' + viewing.date + ' ' + viewing.time : ''), lead ? lead.id : (viewing ? viewing.id : ''));
+          done.push(a.type);
+        } else if (!lead) { out.skipped++; continue; }
+        else if (a.type === 'create_followup') {
+          const tid = Date.now().toString(36) + '-' + randHex(6);
+          await env.LEADS.put('task:' + tid, JSON.stringify({ id: tid, email: lead.email || '', text: (a.text || 'Follow up') + ' — ' + (lead.name || lead.email || ''), due: addDaysYmd(today, a.dueDays || 1), done: false, created_at: new Date().toISOString(), rule: rule.id }));
+          await idxAdd(env, 'tasks', tid);
+          done.push(a.type);
+        } else if (a.type === 'queue_draft') {
+          if (lead.email && !(await isBanned(env, lead.email))) {
+            const lang = validLang(lead.lang || (sm.langByEmail && sm.langByEmail[normEmail(lead.email)]) || 'en');
+            await queueMail(env, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lead.id }, { key: 'rule:' + rule.id + ':' + lead.id + ':' + today });
+            done.push(a.type);
+          } else out.skipped++;
+        } else if (a.type === 'flag_hot') {
+          const nk = normEmail(lead.email || '');
+          if (nk) { try { const meta = await getCMeta(env, nk); meta.hotFlag = true; meta.hotReason = rule.name; await saveCMeta(env, nk, meta); } catch (e) {} }
+          await puAttentionAdd(env, 'rule', '🔥 ' + rule.name + ' — ' + (lead.name || lead.email || ''), lead.id);
+          done.push(a.type);
+        }
+      } catch (e) { out.errors++; }
+    }
+    return done;
+  }
+  const ageH = function (iso) { const t = Date.parse(iso); return isFinite(t) ? (now - t) / 3600000 : Infinity; };
+  for (const rule of rules) {
+    if (out.fired >= MAXFIRE || ops > BUDGET) { out.partial = true; break; }
+    const cond = rule.conditions || {};
+    if (rule.trigger === 'search_match') {
+      const nm = (autoCtx && autoCtx.alerts && autoCtx.alerts.newMatches) || 0;
+      if (nm > 0) {
+        const target = 'run:' + today;
+        if (!(await wasFired(rule.id, target))) {
+          const done = await runActions(rule, null, null);
+          if (done.length) { await markFired(rule.id, target, 172800); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: done }); out.fired++; }
+        }
+      }
+      continue;
+    }
+    if (rule.trigger === 'viewing_booked' || rule.trigger === 'viewing_cancelled') {
+      const wantCancelled = rule.trigger === 'viewing_cancelled';
+      for (const v of viewings) {
+        if (out.fired >= MAXFIRE || ops > BUDGET) break;
+        if (wantCancelled ? v.status !== 'cancelled' : v.status === 'cancelled') continue;
+        if (ageH(v.created_at) > (wantCancelled ? 168 : 48)) continue;
+        const target = 'viewing:' + v.id;
+        if (await wasFired(rule.id, target)) continue;
+        const lead = leadByEmail[normEmail(v.email || '')] || (v.email ? { id: '', name: v.name || '', email: v.email, stage: '', source: 'viewing' } : null);
+        const done = await runActions(rule, lead, v);
+        if (done.length) { await markFired(rule.id, target, 172800); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: done }); out.fired++; }
+      }
+      continue;
+    }
+    for (const l of sm.leads) {
+      if (out.fired >= MAXFIRE || ops > BUDGET) break;
+      let hit = false, target = l.id, ttl = 172800;
+      if (rule.trigger === 'lead_created') hit = ageH(l.created_at) <= 48 && (!cond.source || l.source === cond.source);
+      else if (rule.trigger === 'valuation_submitted') hit = l.source === 'home-valuation' && ageH(l.created_at) <= 168;
+      else if (rule.trigger === 'stage_changed') { hit = !!l.stageAt && ageH(l.stageAt) <= 48 && (!cond.stage || l.stage === cond.stage); target = l.id + ':' + (l.stageAt || ''); }
+      else if (rule.trigger === 'lead_cold') { const d = cond.days || 7; hit = l.stage === 'contacted' && !!l.stageAt && isFinite(Date.parse(l.stageAt)) && (now - Date.parse(l.stageAt)) >= d * 86400000; target = l.id + ':' + (l.stageAt || ''); ttl = 604800; }
+      if (!hit) continue;
+      if (await wasFired(rule.id, target)) continue;
+      const done = await runActions(rule, l, null);
+      if (done.length) { await markFired(rule.id, target, ttl); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: l.id, actions: done }); out.fired++; }
+    }
+  }
+  out.ops = ops;
+  return out;
+}
+
+/* ---- system 6a: uploaded files (owner documents per listing) ---- */
+const PU_FILE_MAX = 3 * 1024 * 1024;
+async function puFileMetas(env, mls) {
+  const out = [];
+  for (const fid of await idxGet(env, 'files', 'file:')) {
+    const raw = await env.LEADS.get('file:' + fid);
+    if (!raw) continue;
+    try {
+      const r = JSON.parse(raw);
+      if (mls && r.mls !== mls) continue;
+      out.push({ id: r.id, name: r.name, type: r.type, size: r.size, mls: r.mls || '', at: r.at });
+    } catch (e) {}
+  }
+  return out.slice(0, 200);
+}
+/* Rich listing record for reports + handbooks: the portal-managed
+   full record wins, then the full seed record, then the thin matching
+   catalog. (mergedCatalog() is deliberately slim — matching fields
+   only — so it cannot supply postal/photos/descriptions.) */
+function puRichListing(mls) {
+  const c = customListings.find(function (r) { return r.mls === mls; });
+  if (c) return c;
+  const s = SEED_LISTINGS.find(function (r) { return r.mls === mls; });
+  if (s) return s;
+  return catalogByMls(mls);
+}
+/* Neighbourhood block shared by the report + handbook data endpoints:
+   census by FSA (embedded PR dataset) + schools in the listing's city
+   (embedded PR_SCHOOLS). Aggregate/official data only. */
+function puNeighbourhood(listing) {
+  if (!listing) return null;
+  const fsa = String(listing.postal || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3);
+  const row = (fsa && PR_CENSUS_FSA[fsa]) || null;
+  const census = row ? { fsa: fsa, pop: row[0], dwellings: row[1], pctAge0to14: row[2], pctAge65plus: row[3], medianAge: row[4], pctSingleDetached: row[5], avgHouseholdSize: row[6], medianIncome: row[7], pctOwner: row[8], pctRenter: row[9], pctEnglishAtHome: row[10], pctNonOfficialAtHome: row[11] } : null;
+  const city = String(listing.city || '').toLowerCase();
+  const schools = [];
+  for (const s of PR_SCHOOLS) {
+    if (String(s[1]).toLowerCase() === city) schools.push({ name: s[0], level: s[4], kind: s[5] });
+    if (schools.length >= 6) break;
+  }
+  return { fsa: fsa || null, census: census, schools: schools };
+}
+
 /* ================= market pulse (2026-11-01) =================
    Data hub behind the site's Market Pulse page. Two sources, both honest:
    - Board statistics (CREA / BCREA / GVR / FVREB) have no free live API:
@@ -2940,14 +3470,14 @@ async function handleRequest(request, env, ctx) {
     }
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
-      const capLimit = (path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768;
+      const capLimit = path === '/api/admin/files' ? 4718592 : ((path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768);
       if (cl > capLimit) return json({ ok: false, error: 'too_large' }, 413, origin); // a missing Content-Length is NOT rejected: several legitimate clients don't expose one
     }
     if ((request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') && !request.headers.get('Content-Length')) {
       // Cycle 26 (Claude M2): chunked bodies used to bypass the cap entirely
       // and request.json() buffered them whole. Count the clone's bytes up
       // front and reject past the same cap; the original body stays unread.
-      const cap2 = (path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768;
+      const cap2 = path === '/api/admin/files' ? 4718592 : ((path.indexOf('/api/admin/listings') === 0 || path === '/api/admin/settings') ? 3145728 : 32768);
       try {
         const reader = request.clone().body.getReader();
         let n = 0;
@@ -4921,6 +5451,184 @@ async function handleRequest(request, env, ctx) {
         return { today: todayStr, upcomingViewings: upcoming, viewingsToday: allV.filter(function (v) { return v.date === todayStr && (v.status === 'new' || v.status === 'confirmed'); }).length, newLeads24h: newLeads24h, followUps: followUps.slice(0, 5).map(function (c) { return { email: c.email, name: c.name, hours: c.followUp.hours, kind: c.followUp.kind, score: c.score }; }), followUpCount: followUps.length, hotCount: contacts2.filter(function (c) { return c.tier === 'hot'; }).length, usersTotal: ulist2.keys.length, mailUnsent: mailUnsent, tasksDue: tasksDue, tasksDueCount: tasksDueAll.length };
         });
         return json(Object.assign({ ok: true }, data), 200, origin);
+      }
+
+      // ---- admin: portal upgrade — Today / pipeline / demand / scores (systems 1–4) ----
+      if (path === '/api/admin/today' && request.method === 'GET') {
+        const t = await adminCachedGen(env, 'today', async function () { return puToday(env); });
+        return json({ ok: true, today: t }, 200, origin);
+      }
+      if (path === '/api/admin/pipeline' && request.method === 'GET') {
+        const p = await adminCachedGen(env, 'pipeline', async function () { return puPipeline(env); });
+        return json({ ok: true, pipeline: p }, 200, origin);
+      }
+      if (path === '/api/admin/demand' && request.method === 'GET') {
+        const dm = await adminCachedGen(env, 'demand', async function () { return puDemand(env); });
+        return json({ ok: true, demand: dm }, 200, origin);
+      }
+      if (path === '/api/admin/lead-scores' && request.method === 'GET') {
+        const sm = await puLeadScores(env);
+        return json({ ok: true, at: sm.at, scores: sm.map }, 200, origin);
+      }
+      if (path.indexOf('/api/admin/leads/') === 0 && request.method === 'POST' && /\/draft$/.test(path)) {
+        // System 2: one-click follow-up draft in the lead's language,
+        // queued as HELD mail (kind 'followup' — rendered by the mailer
+        // from the existing template family). Never sent from here.
+        const lid2 = decodeURIComponent(path.slice('/api/admin/leads/'.length, -'/draft'.length)).slice(0, 64);
+        const lead = await env.LEADS.get('lead:' + lid2, { type: 'json' });
+        if (!lead) return json({ ok: false, error: 'not_found' }, 404, origin);
+        if (!lead.email) return json({ ok: false, error: 'no_email' }, 400, origin);
+        if (await isBanned(env, lead.email)) return json({ ok: false, error: 'suppressed' }, 403, origin);
+        let lang = lead.lang || '';
+        if (!lang) {
+          try { const u = await env.LEADS.get('user:' + lead.email, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {}
+        }
+        lang = validLang(lang);
+        const sm = await puLeadScores(env);
+        const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lid2 }, { key: 'draft:' + lid2 + ':' + todayVancouver() });
+        return json({ ok: true, queued: !!mid, id: mid, lang: lang, score: sm.map[lid2] || null }, 200, origin);
+      }
+
+      // ---- admin: portal upgrade — files, search, report data (systems 6, 7, 9) ----
+      if (path === '/api/admin/files' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const name = String(d.name || 'file').replace(/[\u0000-\u001f<>:"/\\|?*]/g, ' ').trim().slice(0, 120) || 'file';
+        const type = String(d.type || 'application/octet-stream').slice(0, 80);
+        const mls = String(d.mls || '').slice(0, 40);
+        const b64 = String(d.dataBase64 || '');
+        if (!b64 || !/^[A-Za-z0-9+/=\s]+$/.test(b64)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const approxBytes = Math.floor(b64.replace(/\s/g, '').length * 3 / 4);
+        if (approxBytes > PU_FILE_MAX) return json({ ok: false, error: 'too_large' }, 413, origin);
+        let bytes = null;
+        try { const bin = atob(b64.replace(/\s/g, '')); bytes = bin.length; } catch (e) { return json({ ok: false, error: 'validation' }, 400, origin); }
+        if (bytes > PU_FILE_MAX) return json({ ok: false, error: 'too_large' }, 413, origin);
+        const fid = Date.now().toString(36) + '-' + randHex(6);
+        const rec = { id: fid, name: name, type: type, size: bytes, mls: mls, at: new Date().toISOString(), data: b64.replace(/\s/g, '') };
+        await env.LEADS.put('file:' + fid, JSON.stringify(rec));
+        await idxAdd(env, 'files', fid);
+        return json({ ok: true, file: { id: fid, name: name, type: type, size: bytes, mls: mls, at: rec.at } }, 200, origin);
+      }
+      if (path === '/api/admin/files' && request.method === 'GET') {
+        return json({ ok: true, files: await puFileMetas(env, String(url.searchParams.get('mls') || '')) }, 200, origin);
+      }
+      if (path.indexOf('/api/admin/files/') === 0 && request.method === 'GET') {
+        const fid = decodeURIComponent(path.slice('/api/admin/files/'.length)).slice(0, 64);
+        const raw = await env.LEADS.get('file:' + fid);
+        if (!raw) return json({ ok: false, error: 'not_found' }, 404, origin);
+        let rec = null;
+        try { rec = JSON.parse(raw); } catch (e) {}
+        if (!rec || !rec.data) return json({ ok: false, error: 'not_found' }, 404, origin);
+        let bin;
+        try { const bs = atob(rec.data); bin = new Uint8Array(bs.length); for (let i = 0; i < bs.length; i++) bin[i] = bs.charCodeAt(i); }
+        catch (e) { return json({ ok: false, error: 'not_found' }, 404, origin); }
+        return new Response(bin, { headers: { 'Content-Type': rec.type || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + String(rec.name || 'file').replace(/"/g, '') + '"', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
+      }
+      if (path.indexOf('/api/admin/files/') === 0 && request.method === 'DELETE') {
+        const fid = decodeURIComponent(path.slice('/api/admin/files/'.length)).slice(0, 64);
+        try { await env.LEADS.delete('file:' + fid); await idxRemove(env, 'files', fid); } catch (e) {}
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/admin/search' && request.method === 'GET') {
+        // Command-palette fallback for datasets the portal hasn't
+        // loaded yet; everything here is a bounded contains-match.
+        const q = String(url.searchParams.get('q') || '').trim().toLowerCase().slice(0, 80);
+        if (q.length < 2) return json({ ok: true, q: q, leads: [], listings: [], viewings: [], pairs: [] }, 200, origin);
+        const has = function () { for (let i = 0; i < arguments.length; i++) { if (String(arguments[i] || '').toLowerCase().indexOf(q) !== -1) return true; } return false; };
+        const sm = await puLeadScores(env);
+        const leads = sm.leads.filter(function (l) { return has(l.name, l.email, l.city, l.phone); }).slice(0, 8).map(function (l) { const s = sm.map[l.id]; return { id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, score: s ? s.score : null }; });
+        const listings = mergedCatalog().filter(function (h) { return has(h.street, h.city, h.mls); }).slice(0, 8).map(function (h) { return { mls: h.mls, street: h.street, city: h.city, price: h.price, status: h.status }; });
+        const viewings = [];
+        const vidx2 = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+        for (const id of vidx2.slice(0, 200)) {
+          const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
+          if (v && has(v.name, v.email, v.listingId)) viewings.push({ id: v.id, name: v.name || '', email: v.email || '', date: v.date, time: v.time, listingId: v.listingId, status: v.status });
+          if (viewings.length >= 6) break;
+        }
+        const pairs = [];
+        const mkeys = await listAllKeys(env, 'mlead:', 2000);
+        for (const k of mkeys.slice(-300)) {
+          const r = await env.LEADS.get(k.name, { type: 'json' });
+          if (r && has(r.title, r.area)) pairs.push({ id: r.id, title: r.title || '', area: r.area || '', kind: r.kind || '' });
+          if (pairs.length >= 6) break;
+        }
+        return json({ ok: true, q: q, leads: leads, listings: listings, viewings: viewings, pairs: pairs }, 200, origin);
+      }
+      if (path === '/api/admin/reports/listing-performance' && request.method === 'GET') {
+        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const h = puRichListing(mls);
+        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const totals = await perfRead(env);
+        const perf = (totals.listings && totals.listings[mls]) || { v: 0, s: 0, b: 0, l: 0 };
+        const ds = await mpReadStats(env);
+        return json({ ok: true, listing: h, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, since: totals.startedAt || null, sources: totals.sources || {} }, market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
+      }
+      if (path === '/api/admin/reports/property' && request.method === 'GET') {
+        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const h = puRichListing(mls);
+        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const ds = await mpReadStats(env);
+        return json({ ok: true, listing: h, neighbourhood: puNeighbourhood(h), market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
+      }
+      if (path === '/api/admin/handbook-data' && request.method === 'GET') {
+        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const h = puRichListing(mls);
+        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const leadId = String(url.searchParams.get('leadId') || '').slice(0, 64);
+        let client = null, viewing = null;
+        if (leadId) {
+          const l = await env.LEADS.get('lead:' + leadId, { type: 'json' });
+          if (l) {
+            let lang = l.lang || '';
+            if (!lang && l.email) { try { const u = await env.LEADS.get('user:' + l.email, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {} }
+            client = { id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '', lang: validLang(lang) };
+            if (l.email) {
+              const vidx3 = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+              for (const vid of vidx3.slice(0, 200)) {
+                const v = await env.LEADS.get('viewing:' + vid, { type: 'json' });
+                if (v && normEmail(v.email || '') === normEmail(l.email) && v.listingId === mls && v.status !== 'cancelled') { viewing = { date: v.date, time: v.time, status: v.status }; break; }
+              }
+            }
+          }
+        }
+        const settings = await getSiteSettings(env);
+        const ds = await mpReadStats(env);
+        const monthsArr = (ds && ds.months) || [];
+        const month = monthsArr[0] || null;
+        const rateMonth = monthsArr.find(function (m) { return m && m.rates && typeof m.rates.bestFixed5 === 'number'; }) || null;
+        let mortgage = null;
+        const rate = rateMonth ? rateMonth.rates.bestFixed5 : null;
+        if (rate && h.price) {
+          const principal = Math.round(h.price * 0.8);
+          const r = rate / 100 / 12, n = 300;
+          const pmt = Math.round(principal * r / (1 - Math.pow(1 + r, -n)));
+          mortgage = { price: h.price, downPayment: h.price - principal, principal: principal, ratePct: rate, years: 25, monthly: pmt, rateMonth: rateMonth.month || '', rateSource: (rateMonth.rates.source || 'market dataset') + ' · ' + (rateMonth.rates.sourceDate || ''), estimate: true };
+        }
+        const photos = [];
+        if (h.photo) photos.push(h.photo);
+        if (Array.isArray(h.photos)) for (const p of h.photos) if (photos.indexOf(p) === -1) photos.push(p);
+        return json({ ok: true, listing: h, photos: photos, client: client, viewing: viewing, brand: { name: settings.brand || '', email: settings.email || '', phone: settings.phone || '' }, neighbourhood: puNeighbourhood(h), mortgage: mortgage, files: await puFileMetas(env, mls) }, 200, origin);
+      }
+
+      // ---- admin: portal upgrade — automation rules (system 5) ----
+      if (path === '/api/admin/rules' && request.method === 'GET') {
+        const cfg = await puRulesGet(env);
+        return json({ ok: true, rules: cfg.rules, seeded: cfg.seeded, triggers: PU_RULE_TRIGGERS, actions: PU_RULE_ACTIONS }, 200, origin);
+      }
+      if (path === '/api/admin/rules' && request.method === 'PUT') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        if (!d || !Array.isArray(d.rules)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const clean = [];
+        for (const r of d.rules.slice(0, 50)) { const c = puCleanRule(r); if (c) clean.push(c); }
+        await env.LEADS.put('cfg:rules', JSON.stringify({ rules: clean, updatedAt: new Date().toISOString() }));
+        return json({ ok: true, rules: clean }, 200, origin);
+      }
+      if (path === '/api/admin/rules/log' && request.method === 'GET') {
+        let log = [];
+        try { log = (await env.LEADS.get('rulelog', { type: 'json' })) || []; } catch (e) {}
+        return json({ ok: true, log: log.slice(0, 100) }, 200, origin);
       }
 
       // ---- admin: portal PWA Web Push (portal upgrade system 8) ----
