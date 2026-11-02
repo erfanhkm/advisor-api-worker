@@ -2736,6 +2736,10 @@ async function runAutomations(env, source) {
     // Portal upgrade (system 5): custom automation rules, evaluated
     // after the built-ins under the same lock, strict op budget inside.
     try { result.rules = await puEvaluateRules(env, result); } catch (e) { result.rules = { error: 'failed' }; }
+    // Portal Brain 2: predictions recompute once a day; calibration on
+    // the 1st of the month. Both date-guarded inside this same lock.
+    try { const pd = await env.LEADS.get('pred:summary', { type: 'json' }); if (!pd || String(pd.at || '').slice(0, 10) !== todayVancouver()) result.predictions = await brainComputePredictions(env); } catch (e) { result.predictions = { error: 'failed' }; }
+    try { const ck = 'brain:calib:' + todayVancouver().slice(0, 7); if (todayVancouver().slice(8, 10) === '01' && !(await env.LEADS.get(ck))) { await env.LEADS.put(ck, '1', { expirationTtl: 40 * 86400 }); await brainCalibration(env); } } catch (e) {}
     // Portal brain (2026-11-01): personalised follow-up drafts for due
     // items, capped per run, inside the same lock + budget discipline.
     try { result.brainDrafts = await brainFollowupDrafts(env); } catch (e) { result.brainDrafts = { error: 'failed' }; }
@@ -2798,7 +2802,7 @@ async function buildFollowups(env) {
     const ageUnknown = !(ts > 0); // NaN (or epoch) parse: age is unknowable, never "0h"
     const item = { id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '', intent: l.intent || '', source: l.source || '', created_at: l.created_at || '', ageHours: ageUnknown ? null : Math.max(0, Math.floor((now - ts) / 3600000)), stageAt: l.stageAt || null };
     if (ageUnknown) item.ageUnknown = true;
-    if (l.aiDraft && l.aiDraft.text) item.aiDraft = { text: l.aiDraft.text, lang: l.aiDraft.lang || '', at: l.aiDraft.at || '', via: l.aiDraft.via || '' }; // portal brain: cached follow-up draft rides along
+    if (l.aiDraft && l.aiDraft.text) item.aiDraft = { text: l.aiDraft.text, lang: l.aiDraft.lang || '', at: l.aiDraft.at || '', via: l.aiDraft.via || '', critic: l.aiDraft.critic || null, mailId: l.aiDraft.mailId || '' }; // portal brain: cached follow-up draft rides along (+ Brain 2 critic badge)
     // Pack E (R-03 N3): a missing/unknown stage defaults to 'new' — such
     // leads used to appear in NO list at all (invisible work).
     const stage = STAGES.indexOf(l.stage) !== -1 ? l.stage : 'new';
@@ -3141,6 +3145,7 @@ async function puToday(env) {
     t.sort(byDT); tm.sort(byDT); awaiting.sort(byDT);
     return { today: t, tomorrow: tm, awaiting: awaiting.slice(0, 10), awaitingCount: awaiting.length };
   });
+  await seg('predictions', async function () { return await env.LEADS.get('pred:summary', { type: 'json' }); }); // Portal Brain 2
   await seg('followups', async function () {
     const f = await buildFollowups(env);
     return { newCount: f.newCount, staleCount: f.staleCount, postViewingCount: f.postViewingCount, stale: f.staleLeads.slice(0, 5), post: f.postViewing.slice(0, 5) };
@@ -3367,6 +3372,7 @@ function puCleanRule(r) {
     id: String(r.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || ('rule_' + randHex(6)),
     name: String(r.name || 'Untitled rule').slice(0, 80),
     enabled: r.enabled !== false,
+    autoSend: r.autoSend === true, // Portal Brain 2: gate (b) of the agent email chain — default OFF, only Erfan flips it
     trigger: r.trigger, conditions: cond, actions: actions
   };
 }
@@ -3561,7 +3567,7 @@ function puNeighbourhood(listing) {
 const BRAIN_DEFAULT_CAP = 300;
 const BRAIN_LANG_NAMES = { en: 'English', fa: 'Persian (Farsi)', hi: 'Hindi', zh: 'Simplified Chinese', es: 'Spanish' };
 const BRAIN_GROUND = 'Use ONLY the facts in the data provided. Never invent prices, dates, addresses, listings, statistics or names. If the data does not contain something, say so plainly instead of guessing.';
-const BRAIN_ACTIONS = ['draft_message', 'create_followup', 'generate_handbook', 'generate_report', 'explain_score'];
+const BRAIN_ACTIONS = ['draft_message', 'create_followup', 'generate_handbook', 'generate_report', 'explain_score', 'research', 'update_listing_copy_draft', 'create_viewing_brief', 'prepare_email'];
 
 async function brainCfg(env) {
   let b = null, brief = null;
@@ -3572,7 +3578,12 @@ async function brainCfg(env) {
   return {
     secret: b.secret || (brief && brief.secret) || null,
     dailyCap: (isFinite(cap) && cap > 0) ? Math.min(5000, cap) : BRAIN_DEFAULT_CAP,
-    providers: (b.providers && typeof b.providers === 'object' && !Array.isArray(b.providers)) ? b.providers : null
+    providers: (b.providers && typeof b.providers === 'object' && !Array.isArray(b.providers)) ? b.providers : null,
+    // Portal Brain 2: the business sender identity for the agent email
+    // chain. Absent (today) = the chain always stops at gate (a) and
+    // the email stays a HELD draft. Set ONLY via cfg:brain by Erfan.
+    sender: (b.sender && typeof b.sender === 'object' && typeof b.sender.from === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(b.sender.from)) ? { from: b.sender.from.slice(0, 120), name: String(b.sender.name || '').slice(0, 80) } : null,
+    styleK: Math.max(0, Math.min(5, parseInt(b.styleK, 10) || 3))
   };
 }
 function brainPaidHints(cfg) {
@@ -3638,6 +3649,7 @@ async function brainCall(env, opts) {
   if (used >= cfg.dailyCap) { await brainLog(env, { task: task, ok: false, error: 'brain_cap' }); return { ok: false, error: 'brain_cap', capped: true }; }
   const payload = { task: task, system: opts.system || '', maxTokens: opts.maxTokens || 800 };
   if (opts.messages) payload.messages = opts.messages; else payload.prompt = opts.prompt || '';
+  if (opts.research && typeof opts.research.query === 'string' && opts.research.query.trim()) payload.research = { query: opts.research.query.slice(0, 200) };
   const hints = brainPaidHints(cfg);
   if (hints) payload.paid = hints;
   const res = await aiFetch(env, '/internal/brain', payload, cfg.secret);
@@ -3649,13 +3661,14 @@ async function brainCall(env, opts) {
   }
   try { await env.LEADS.put('brain:usage:' + todayVancouver(), String(used + 1), { expirationTtl: 172800 }); } catch (e) {}
   await brainLog(env, { task: task, via: j.via || '', ok: true, ch: res.ch || '' });
-  return { ok: true, text: String(j.text), via: j.via || '' };
+  return { ok: true, text: String(j.text), via: j.via || '', sources: Array.isArray(j.sources) ? j.sources : null, researchNote: typeof j.researchNote === 'string' ? j.researchNote : '' };
 }
 function brainJson(text) {
   try { const a = String(text).indexOf('{'), b = String(text).lastIndexOf('}'); if (a !== -1 && b > a) return JSON.parse(String(text).slice(a, b + 1)); } catch (e) {}
   return null;
 }
 function brainStr(v, max) { return typeof v === 'string' ? v.trim().slice(0, max) : (typeof v === 'number' ? String(v).slice(0, max) : ''); }
+function chatRefOf(d) { const s = String((d && d.chatRef) || ''); return /^[A-Za-z0-9_-]{8,64}$/.test(s) ? s : ''; } // Portal Brain 2: validated site-chat session ref from an intake payload ('' = none)
 function brainLangs() {
   const base = ['en', 'fa', 'hi', 'zh'];
   if (validLang('es') === 'es') base.push('es'); // Spanish joins automatically if the worker language set grows
@@ -3669,6 +3682,8 @@ function brainLeadCtx(l) {
     stage: brainStr(l.stage, 20), city: brainStr(l.city, 60), budget: brainStr(l.budget, 60),
     message: brainStr(l.message, 400), created_at: brainStr(l.created_at, 30)
   };
+  if (l.brainSummary) out.memory = brainStr(l.brainSummary, 600); // Portal Brain 2 rolling per-lead summary
+  if (l.chatSummary) out.viaSiteChat = brainStr(l.chatSummary, 400); // came via site chat: <summary>
   if (l.listingId) out.listing = l.listingId;
   if (l.valuation) out.valuation = { city: brainStr(l.valuation.city, 60), type: brainStr(l.valuation.type, 30), beds: l.valuation.beds, baths: l.valuation.baths, sqft: l.valuation.sqft, estimate: l.valuation.estimate ? { low: l.valuation.estimate.low, high: l.valuation.estimate.high } : null };
   if (l.ai) out.ai = { intent: l.ai.intent, urgency: l.ai.urgency, areas: l.ai.areas, timeline: l.ai.timeline };
@@ -3684,11 +3699,13 @@ async function brainLeadLang(env, lead) {
    queued as HELD mail or stored as a draft — never sent from here. */
 async function brainDraftText(env, lead, purpose, langOverride) {
   const lang = (langOverride && BRAIN_LANG_NAMES[langOverride]) ? langOverride : await brainLeadLang(env, lead);
-  const sys = 'You write short follow-up messages for a real-estate advisor named Erfan in British Columbia, Canada. Write the message in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Warm, professional, 60-110 words, first person as Erfan, no placeholders, no signature block beyond "Erfan". ' + BRAIN_GROUND;
-  const r = await brainCall(env, { task: 'draft', system: sys, prompt: 'Purpose: ' + purpose + '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)), maxTokens: 600 });
-  if (!r.ok) return null;
-  const text = String(r.text || '').trim().slice(0, 1800);
-  return text ? { text: text, via: r.via, lang: lang } : null;
+  const style = await brainStyleBlock(env); // Portal Brain 2: learned style + preferences
+  const sys = 'You write short follow-up messages for a real-estate advisor named Erfan in British Columbia, Canada. Write the message in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Warm, professional, 60-110 words, first person as Erfan, no placeholders, no signature block beyond "Erfan". ' + BRAIN_GROUND + style;
+  const ctxJson = JSON.stringify(brainLeadCtx(lead));
+  const w = await brainWithCritic(env, { task: 'draft', system: sys, prompt: 'Purpose: ' + purpose + '\nLead data (JSON):\n' + ctxJson, maxTokens: 600, ctxJson: ctxJson });
+  if (!w.ok) return null;
+  const text = String(w.text || '').trim().slice(0, 1800);
+  return text ? { text: text, via: w.via, lang: lang, critic: w.critic } : null;
 }
 /* Lead triage (feature 2): extraction -> lead.ai, plus a first-reply
    HELD draft. Runs only via ctx.waitUntil; never throws; an AI
@@ -3716,11 +3733,29 @@ async function brainTriageLead(env, leadId) {
       at: new Date().toISOString(), via: r.via || ''
     };
     await env.LEADS.put('lead:' + leadId, JSON.stringify(fresh));
+    // Portal Brain 2 — site-chat bridge: if this lead arrived from the
+    // site chat, fetch that session's transcript summary from ai-chat
+    // and keep it on the lead (lead detail + assistant context show
+    // "came via site chat: <summary>"). No ref or no transcript ->
+    // the field stays absent, never invented.
+    try {
+      if (fresh.chatRef && !fresh.chatSummary) {
+        const bcfg2 = await brainCfg(env);
+        if (bcfg2.secret) {
+          const sumRes = await aiFetch(env, '/internal/chat-summary', { sessionId: fresh.chatRef }, bcfg2.secret);
+          if (sumRes.j && sumRes.j.ok && sumRes.j.summary) {
+            const again = await env.LEADS.get('lead:' + leadId, { type: 'json' });
+            if (again && !again.chatSummary) { again.chatSummary = String(sumRes.j.summary).slice(0, 600); await env.LEADS.put('lead:' + leadId, JSON.stringify(again)); fresh.chatSummary = again.chatSummary; }
+          }
+        }
+      }
+    } catch (e) {}
     try {
       if (fresh.email && fresh.email.indexOf('@calls.local') === -1 && !(await isBanned(env, fresh.email))) {
         const ovr = (fresh.ai.lang && fresh.ai.langConf >= 0.5 && BRAIN_LANG_NAMES[fresh.ai.lang]) ? fresh.ai.lang : '';
         const d = await brainDraftText(env, fresh, 'First reply to a new enquiry: thank them, confirm what they are looking for, and offer the natural next step (a call or a viewing).', ovr);
-        if (d) await queueMail(env, { kind: 'followup', to: fresh.email, lang: d.lang, name: fresh.name || '', ref: leadId, aiText: d.text, aiVia: d.via }, { key: 'triage:' + leadId });
+        await brainMemoryRefresh(env, leadId, 'triage');
+        if (d) await queueMail(env, { kind: 'followup', to: fresh.email, lang: d.lang, name: fresh.name || '', ref: leadId, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'triage:' + leadId });
       }
     } catch (e) {}
   } catch (e) {}
@@ -3746,9 +3781,11 @@ async function brainFollowupDrafts(env) {
     const purpose = it.viewingDate ? ('Follow-up after their viewing on ' + it.viewingDate + ': ask for feedback and agree the next step.') : 'Follow-up with a lead who has not been contacted yet (or has gone quiet): re-open the conversation and offer a concrete next step.';
     const d = await brainDraftText(env, lead, purpose);
     if (!d) { out.skipped++; continue; }
-    lead.aiDraft = { text: d.text, lang: d.lang, via: d.via, at: new Date().toISOString(), date: today };
+    lead.aiDraft = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, at: new Date().toISOString(), date: today };
+    let midF = null;
+    try { midF = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
+    if (midF) lead.aiDraft.mailId = midF; // Portal Brain 2: lets the portal edit THIS held draft (style learning)
     await env.LEADS.put('lead:' + it.id, JSON.stringify(lead));
-    try { await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
     out.made++;
   }
   return out;
@@ -3778,10 +3815,19 @@ async function brainMarketBrief(env, opts) {
   }
   hotWarmAll.sort(function (a, b) { return b.score - a.score; });
   const data = { month: cur.month, current: cur, previous: prev, hotWarmLeads: hotWarmAll.slice(0, 8) };
-  const sys = 'You are the market watcher for a BC real-estate advisor. Write a SHORT brief in Persian (Farsi), 5-9 lines: what changed this month vs last month in the given board statistics (use the figures exactly as given), then which of the listed hot/warm leads are worth contacting now and why (match their city to the moved markets). ' + BRAIN_GROUND + ' Never add figures, areas or leads that are not in the data.';
-  const r = await brainCall(env, { task: 'market_brief', system: sys, prompt: 'Market data (JSON):\n' + JSON.stringify(data).slice(0, 9000), maxTokens: 900 });
+  const sys = 'You are the market watcher for a BC real-estate advisor. Write a SHORT brief in Persian (Farsi), 5-9 lines: what changed this month vs last month in the given board statistics (use the figures exactly as given), then which of the listed hot/warm leads are worth contacting now and why (match their city to the moved markets). When WEB RESEARCH results are attached, you may add ONE or TWO lines of current board/news context from them, cited inline as [1], [2] — never state a web claim that is not in the results. ' + BRAIN_GROUND + ' Never add figures, areas or leads that are not in the data.';
+  const r = await brainCall(env, { task: 'market_brief', system: sys, prompt: 'Market data (JSON):\n' + JSON.stringify(data).slice(0, 9000), maxTokens: 900, research: { query: 'BC real estate market news board statistics ' + cur.month } });
   if (!r.ok) return { ok: false, error: r.error };
-  const brief = { text: String(r.text).trim().slice(0, 3000), at: new Date().toISOString(), via: r.via || '', month: cur.month };
+  let briefText = String(r.text).trim();
+  const chkB = await brainCriticCheck(env, briefText, JSON.stringify(data).slice(0, 4000));
+  let criticB = { status: chkB.known ? (chkB.pass ? 'passed' : 'flagged') : 'flagged', issues: chkB.issues || [] };
+  if (chkB.known && !chkB.pass && chkB.issues.length) {
+    const r2 = await brainCall(env, { task: 'market_brief', system: sys, prompt: 'Market data (JSON):\n' + JSON.stringify(data).slice(0, 9000) + '\n\nREVISION REQUIRED. A second reviewer found these problems: ' + chkB.issues.join('; ') + '. Rewrite fixing every one.', maxTokens: 900, research: { query: 'BC real estate market news board statistics ' + cur.month } });
+    if (r2.ok && String(r2.text).trim()) { briefText = String(r2.text).trim(); const chk2 = await brainCriticCheck(env, briefText, JSON.stringify(data).slice(0, 4000)); criticB = { status: chk2.pass ? 'revised' : 'flagged', issues: chkB.issues }; }
+  }
+  if (r.sources && r.sources.length) briefText += '\n\nSources: ' + r.sources.map(function (s, i) { return '[' + (i + 1) + '] ' + s.title + ' — ' + s.url; }).join(' · ');
+  else if (r.researchNote) briefText += '\n\n(' + r.researchNote + ')';
+  const brief = { text: briefText.slice(0, 3400), at: new Date().toISOString(), via: r.via || '', month: cur.month, sources: r.sources || null, critic: criticB };
   await env.LEADS.put('brain:brief:latest', JSON.stringify(brief));
   await puAttentionAdd(env, 'market-brief', '🧠 Market brief for ' + cur.month + ' is ready in the Assistant tab', 'brain');
   return { ok: true, brief: brief };
@@ -3793,16 +3839,20 @@ async function brainCopyGenerate(env, mls) {
   const h = puRichListing(mls);
   if (!h) return { ok: false, error: 'not_found', status: 404 };
   const specs = { street: h.street || '', city: h.city || '', type: h.type || '', price: h.price || null, beds: h.beds, baths: h.baths, sqft: h.sqft || h.size || null, status: h.status || '', existingDescription: brainStr(h.desc || h.description || '', 600), photos: (Array.isArray(h.photos) ? h.photos.length : (h.photo ? 1 : 0)) };
+  const style = await brainStyleBlock(env);
   const langs = {};
+  const critics = {};
   let via = '';
   for (const lg of brainLangs()) {
-    const sys = 'You write marketing copy for a real-estate listing. Write ONE polished listing description (120-180 words) in ' + (BRAIN_LANG_NAMES[lg] || 'English') + ' from the specs given. ' + BRAIN_GROUND + ' Never invent amenities, features, schools or figures that are not in the specs.';
-    const r = await brainCall(env, { task: 'copy', system: sys, prompt: 'Listing specs (JSON):\n' + JSON.stringify(specs), maxTokens: 550 });
-    if (!r.ok) return { ok: false, error: r.error };
-    langs[lg] = String(r.text).trim().slice(0, 2400);
-    via = r.via || via;
+    const sys = 'You write marketing copy for a real-estate listing. Write ONE polished listing description (120-180 words) in ' + (BRAIN_LANG_NAMES[lg] || 'English') + ' from the specs given. ' + BRAIN_GROUND + ' Never invent amenities, features, schools or figures that are not in the specs.' + style;
+    const w = await brainWithCritic(env, { task: 'copy', system: sys, prompt: 'Listing specs (JSON):\n' + JSON.stringify(specs), maxTokens: 550, ctxJson: JSON.stringify(specs) });
+    if (!w.ok) return { ok: false, error: w.error };
+    langs[lg] = String(w.text).trim().slice(0, 2400);
+    critics[lg] = w.critic;
+    via = w.via || via;
   }
-  const rec = { mls: mls, langs: langs, at: new Date().toISOString(), via: via };
+  const worst = Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'flagged'; }) ? 'flagged' : (Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'revised'; }) ? 'revised' : 'passed');
+  const rec = { mls: mls, langs: langs, at: new Date().toISOString(), via: via, critic: { status: worst, perLang: critics } };
   await env.LEADS.put('aicopy:' + mls, JSON.stringify(rec));
   return { ok: true, copy: rec };
 }
@@ -3941,7 +3991,7 @@ async function brainExecIntent(env, intent) {
     const tone = ['warm', 'short', 'formal'].indexOf(String(params.tone || '')) !== -1 ? String(params.tone) : 'warm';
     const d = await brainDraftText(env, lead, 'Follow-up message requested from the portal assistant (tone: ' + tone + ').');
     if (!d) return { action: action, ok: false, error: 'ai_unavailable' };
-    const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: lead.id, aiText: d.text, aiVia: d.via }, { key: 'bdraft:' + lead.id + ':' + Date.now().toString(36) });
+    const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: lead.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'bdraft:' + lead.id + ':' + Date.now().toString(36) });
     await puAttentionAdd(env, 'brain-action', '🧠 Assistant drafted a held follow-up for ' + (lead.name || lead.email), lead.id);
     return { action: action, ok: true, leadId: lead.id, queued: !!mid, lang: d.lang };
   }
@@ -3970,20 +4020,353 @@ async function brainChat(env, body) {
     ? 'You are the portal assistant for Erfan, a real-estate advisor in British Columbia, Canada. Answer in Persian (Farsi) unless he writes in English. '
     : 'You are the portal assistant for Erfan, a real-estate advisor in British Columbia, Canada. Answer in English. ')
     + BRAIN_GROUND + ' You may use ONLY the desk context below — it is the whole of your knowledge about his business today. '
-    + 'ACTIONS: when Erfan clearly asks for one of these, end your reply with a fenced block exactly like ```intent {"action":"draft_message","params":{"leadId":"..."}}``` and nowhere else in the reply. Allowed actions: draft_message {leadId, tone?} (queues a HELD draft — never sends anything), create_followup {leadId, when (YYYY-MM-DD), note}, generate_handbook {mls, leadId?}, generate_report {mls}, explain_score {leadId}. Use only lead ids and MLS numbers that appear in the context. Never invent an id. If you are unsure, just answer without an intent block.';
+    + 'ACTIONS: when Erfan clearly asks for one of these, end your reply with a fenced block exactly like ```intent {"action":"draft_message","params":{"leadId":"..."}}``` and nowhere else in the reply. Allowed actions: draft_message {leadId, tone?} (queues a HELD draft — never sends anything), create_followup {leadId, when (YYYY-MM-DD), note}, generate_handbook {mls, leadId?}, generate_report {mls}, explain_score {leadId}, research {q} (web research with cited sources), update_listing_copy_draft {mls}, create_viewing_brief {viewingId} or {leadId, mls}, prepare_email {contactRef} (writes a full email and queues it HELD unless both send gates are open — it explains which gate held it). PLANS: when a request needs several steps, end with ONE fenced block ```plan [{"action":"...","params":{...}}, ...]``` instead (max 4 steps, run in order, stopping at the first failure). Use only lead ids and MLS numbers that appear in the context. Never invent an id. If you are unsure, just answer without an intent block.';
   const r = await brainCall(env, { task: 'chat', system: sys + '\n\nDESK CONTEXT:\n' + context, messages: hist, maxTokens: 1100 });
   if (!r.ok) return { ok: false, error: r.error };
   let reply = String(r.text || '');
   const executed = [];
-  const mIntent = reply.match(/```intent\s*([\s\S]*?)```/);
-  if (mIntent) {
-    reply = reply.replace(mIntent[0], '').trim();
-    let intent = null;
-    try { intent = JSON.parse(mIntent[1]); } catch (e) {}
-    if (intent) { try { executed.push(await brainExecIntent(env, intent)); } catch (e) { executed.push({ action: String(intent.action || ''), ok: false, error: 'failed' }); } }
-    else executed.push({ action: 'unknown', ok: false, error: 'rejected' });
+  // Portal Brain 2 — AGENT MODE: a ```plan [ ... ]``` block runs up to
+  // 4 validated steps in order; the trace is returned to the portal and
+  // every step is logged to the attention feed. Execution stops at the
+  // first invalid/failed step and says so.
+  const mPlan = reply.match(/```plan\s*([\s\S]*?)```/);
+  if (mPlan) {
+    reply = reply.replace(mPlan[0], '').trim();
+    let steps = null;
+    try { steps = JSON.parse(mPlan[1]); } catch (e) {}
+    if (!Array.isArray(steps) || !steps.length) { executed.push({ step: 1, action: 'unknown', ok: false, error: 'rejected' }); }
+    else {
+      const planSteps = steps.slice(0, 4);
+      for (let si = 0; si < planSteps.length; si++) {
+        const st = planSteps[si] || {};
+        let res = null;
+        try { res = await brainExecIntent2(env, st); } catch (e) { res = { action: String(st.action || ''), ok: false, error: 'failed' }; }
+        res = Object.assign({ step: si + 1 }, res);
+        executed.push(res);
+        try { await puAttentionAdd(env, 'brain-agent', '🧠 Agent step ' + (si + 1) + '/' + planSteps.length + ': ' + (res.action || '?') + ' → ' + (res.ok ? 'done' : 'FAILED (' + (res.error || 'error') + ')'), (res.leadId || res.contactRef || '')); } catch (e) {}
+        if (!res.ok) {
+          for (let sj = si + 1; sj < planSteps.length; sj++) executed.push({ step: sj + 1, action: String((planSteps[sj] || {}).action || ''), ok: false, error: 'skipped' });
+          break;
+        }
+      }
+    }
+  } else {
+    const mIntent = reply.match(/```intent\s*([\s\S]*?)```/);
+    if (mIntent) {
+      reply = reply.replace(mIntent[0], '').trim();
+      let intent = null;
+      try { intent = JSON.parse(mIntent[1]); } catch (e) {}
+      if (intent) { try { executed.push(Object.assign({ step: 1 }, await brainExecIntent2(env, intent))); } catch (e) { executed.push({ step: 1, action: String(intent.action || ''), ok: false, error: 'failed' }); } }
+      else executed.push({ step: 1, action: 'unknown', ok: false, error: 'rejected' });
+    }
   }
-  return { ok: true, reply: reply.slice(0, 4000), via: r.via || '', executed: executed };
+  return { ok: true, reply: reply.slice(0, 4000), via: r.via || '', executed: executed, trace: executed };
+}
+
+/* ================= PORTAL BRAIN 2 (2026-11-02) =================
+   Erfan's phase-2 order: web eyes (research), memory + style learning,
+   multi-step agent mode, the critic (second reviewer), predictions,
+   the feedback/calibration loop, the site-chat bridge, voice in and
+   video out. Guardrails unchanged: the model never sends mail by
+   itself (the two-gate chain in brainPrepareEmail is the only path,
+   and both gates default closed), predictions are rule-computed
+   estimates with stored factors, and everything the brain learns
+   lives in Erfan's own KV (brain:* keys). */
+
+/* ---- outcomes: the feedback loop's raw material ---- */
+async function brainOutcome(env, entry) {
+  try {
+    const list = (await env.LEADS.get('brain:outcomes', { type: 'json' })) || [];
+    list.unshift(Object.assign({ at: new Date().toISOString() }, entry));
+    await env.LEADS.put('brain:outcomes', JSON.stringify(list.slice(0, 500)));
+  } catch (e) {}
+}
+
+/* ---- style learning + advisor preferences ---- */
+async function brainStylePairs(env) {
+  try { const s = await env.LEADS.get('brain:style', { type: 'json' }); return Array.isArray(s) ? s : []; } catch (e) { return []; }
+}
+async function brainStyleAdd(env, pair) {
+  try {
+    const list = await brainStylePairs(env);
+    list.unshift({ original: String(pair.original || '').slice(0, 1800), final: String(pair.final || '').slice(0, 1800), kind: String(pair.kind || 'draft').slice(0, 30), at: new Date().toISOString() });
+    await env.LEADS.put('brain:style', JSON.stringify(list.slice(0, 20)));
+  } catch (e) {}
+  await brainOutcome(env, { type: 'draft_edited', ref: pair.ref || '', kind: pair.kind || 'draft' });
+}
+async function brainPrefs(env) {
+  try { const p = await env.LEADS.get('brain:prefs', { type: 'json' }); return (p && typeof p.text === 'string') ? p.text.slice(0, 1000) : ''; } catch (e) { return ''; }
+}
+async function brainStyleBlock(env) {
+  const cfg = await brainCfg(env);
+  const pairs = (await brainStylePairs(env)).slice(0, cfg.styleK);
+  const prefs = await brainPrefs(env);
+  let out = '';
+  if (prefs) out += '\nADVISOR PREFERENCES (follow these): ' + prefs;
+  if (pairs.length) out += '\nSTYLE EXAMPLES — the advisor edited earlier AI drafts into these final versions; match this voice:\n' + pairs.map(function (pr, i) { return 'Example ' + (i + 1) + ' — AI draft: ' + String(pr.original || '').slice(0, 400) + '\nAdvisor final: ' + String(pr.final || '').slice(0, 400); }).join('\n');
+  return out;
+}
+
+/* ---- per-lead rolling memory ---- */
+async function brainMemoryRefresh(env, leadId, why) {
+  try {
+    const lead = await env.LEADS.get('lead:' + leadId, { type: 'json' });
+    if (!lead) return;
+    const prev = await env.LEADS.get('brain:mem:lead:' + leadId, { type: 'json' });
+    const sys = 'You maintain a rolling memory summary for a real-estate advisor about ONE lead. Reply with ONLY the updated summary: 2-4 short sentences, facts only (what they want, budget/areas, timeline, last interaction, open threads). Merge the previous summary with the lead data; drop anything the data contradicts. ' + BRAIN_GROUND;
+    const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Previous summary: ' + ((prev && prev.summary) || '(none)') + '\nEvent: ' + String(why || 'update') + '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 3000), maxTokens: 300 });
+    if (!r.ok) return;
+    const summary = String(r.text || '').trim().slice(0, 600);
+    if (!summary) return;
+    await env.LEADS.put('brain:mem:lead:' + leadId, JSON.stringify({ leadId: leadId, name: lead.name || '', summary: summary, events: ((prev && prev.events) || 0) + 1, updatedAt: new Date().toISOString(), why: String(why || '').slice(0, 40) }));
+    const fresh = await env.LEADS.get('lead:' + leadId, { type: 'json' });
+    if (fresh) { fresh.brainSummary = summary; await env.LEADS.put('lead:' + leadId, JSON.stringify(fresh)); }
+  } catch (e) {}
+}
+
+/* ---- the critic (second reviewer): one revision loop, never blocks ---- */
+async function brainCriticCheck(env, text, ctxJson) {
+  const sys = 'You are a strict second reviewer (critic) for a real-estate advisor AI. Reply with ONLY a JSON object: {"pass":true} or {"pass":false,"issues":["..."]}. FAIL the text if: it states any figure (price, %, count, date, size) that does NOT appear in the CONTEXT JSON; it claims anything the context does not support; the language is wrong or badly mixed; the tone is pushy or misleading; it presents the advisor as licensed or a brokerage member. Be strict about figures and claims, lenient about style.';
+  const r = await brainCall(env, { task: 'critic', system: sys, prompt: 'CONTEXT (JSON):\n' + String(ctxJson || '').slice(0, 5000) + '\n\nTEXT TO CHECK:\n' + String(text || '').slice(0, 3000), maxTokens: 400 });
+  if (!r.ok) return { known: false, pass: false, issues: [] };
+  const p = brainJson(r.text);
+  if (!p || typeof p.pass !== 'boolean') return { known: false, pass: false, issues: [] };
+  return { known: true, pass: p.pass, issues: (Array.isArray(p.issues) ? p.issues : []).map(function (x) { return brainStr(x, 200); }).filter(Boolean).slice(0, 6) };
+}
+async function brainWithCritic(env, opts) {
+  const r1 = await brainCall(env, { task: opts.task, system: opts.system, prompt: opts.prompt, maxTokens: opts.maxTokens || 700, research: opts.research });
+  if (!r1.ok) return { ok: false, error: r1.error };
+  const text1 = String(r1.text || '').trim();
+  const chk = await brainCriticCheck(env, text1, opts.ctxJson);
+  if (chk.known && chk.pass) return { ok: true, text: text1, via: r1.via || '', sources: r1.sources, researchNote: r1.researchNote, critic: { status: 'passed', issues: [] } };
+  if (!chk.known) return { ok: true, text: text1, via: r1.via || '', sources: r1.sources, researchNote: r1.researchNote, critic: { status: 'flagged', issues: ['critic_unavailable'] } };
+  const r2 = await brainCall(env, { task: opts.task, system: opts.system, prompt: opts.prompt + '\n\nREVISION REQUIRED. A second reviewer found these problems: ' + chk.issues.join('; ') + '. Rewrite the text fixing every one; keep the same language, purpose and approximate length.', maxTokens: opts.maxTokens || 700 });
+  if (!r2.ok || !String(r2.text || '').trim()) return { ok: true, text: text1, via: r1.via || '', sources: r1.sources, researchNote: r1.researchNote, critic: { status: 'flagged', issues: chk.issues } };
+  const text2 = String(r2.text).trim();
+  const chk2 = await brainCriticCheck(env, text2, opts.ctxJson);
+  return { ok: true, text: text2, via: r2.via || r1.via || '', sources: r1.sources, researchNote: r1.researchNote, critic: { status: (chk2.known && chk2.pass) ? 'revised' : 'flagged', issues: chk.issues } };
+}
+
+/* ---- compliance pass (deterministic): BCFSA / not-licensed rules ---- */
+const BRAIN_NOT_LICENSED_LINE = 'Please note: I am not yet a licensed real estate professional in British Columbia, and this message is general information only, not real estate advice.';
+function brainCompliance(text) {
+  const issues = [];
+  let t = String(text || '');
+  if (/\bI am a (licensed )?(REALTOR|real estate agent|broker)\b/i.test(t) || /\blicensed REALTOR/i.test(t)) issues.push('presents the advisor as licensed');
+  if (/\bguarantee(d|s)?\b[^.]{0,40}\b(return|profit|appreciation|growth)\b/i.test(t) || /\byou will (make|earn|profit)\b/i.test(t) || /\brisk[- ]free\b/i.test(t)) issues.push('contains a guarantee / financial-promise claim');
+  if (!/not yet a licensed|not a licensed|not currently licensed/i.test(t)) { t += '\n\n' + BRAIN_NOT_LICENSED_LINE; issues.push('licensing disclosure appended'); }
+  return { text: t, issues: issues };
+}
+
+/* ---- prepare_email: the two-gate agent email chain ----
+   write (contact's language) -> critic -> compliance -> SEND only if
+   BOTH (a) a business sender identity is configured in cfg:brain AND
+   (b) the governing automation rule (first enabled queue_draft rule)
+   has autoSend=true. Otherwise the email is queued as a HELD draft and
+   the result names the gate that stopped it. "Released" means the
+   queued record is flagged approved for the mailer; nothing in this
+   worker transmits mail itself, and the Smart Table Resend identity
+   is never used here. */
+async function brainPrepareEmail(env, params) {
+  const ref = String((params && params.contactRef) || '').slice(0, 80);
+  let contact = null, kind = '';
+  if (ref) {
+    const l = await env.LEADS.get('lead:' + ref, { type: 'json' });
+    if (l && l.email) { contact = l; kind = 'lead'; }
+    if (!contact) { const m = await env.LEADS.get('mlead:' + ref, { type: 'json' }); if (m && m.email) { contact = m; kind = 'market'; } }
+    if (!contact && ref.indexOf('@') !== -1) {
+      const sm = await puLeadScores(env);
+      const found = sm.leads.find(function (x) { return normEmail(x.email || '') === normEmail(ref); });
+      if (found) { contact = found; kind = 'lead'; }
+    }
+  }
+  if (!contact) return { action: 'prepare_email', ok: false, error: 'not_found' };
+  if (await isBanned(env, contact.email)) return { action: 'prepare_email', ok: false, error: 'suppressed' };
+  const lang = (contact.ai && contact.ai.lang && BRAIN_LANG_NAMES[contact.ai.lang]) ? contact.ai.lang : ((contact.lang && BRAIN_LANG_NAMES[contact.lang]) ? contact.lang : 'en');
+  const ctxObj = kind === 'lead' ? brainLeadCtx(contact) : { name: brainStr(contact.name || contact.title, 80), area: brainStr(contact.area, 80), title: brainStr(contact.title, 120), message: brainStr(contact.message || contact.summary || '', 400) };
+  const style = await brainStyleBlock(env);
+  const sys = 'You write a complete email for a real-estate advisor named Erfan in British Columbia, Canada, to the contact in the data. Write in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Reply with ONLY a JSON object: {"subject":"...","body":"..."}. The body: warm, professional, 80-140 words, first person as Erfan, one clear next step, no placeholders. ' + BRAIN_GROUND + style;
+  const w = await brainWithCritic(env, { task: 'draft', system: sys, prompt: 'Contact data (JSON):\n' + JSON.stringify(ctxObj), maxTokens: 700, ctxJson: JSON.stringify(ctxObj) });
+  if (!w.ok) return { action: 'prepare_email', ok: false, error: w.error || 'ai_unavailable' };
+  const p = brainJson(w.text);
+  if (!p || !p.body) return { action: 'prepare_email', ok: false, error: 'ai_parse' };
+  const comp = brainCompliance(String(p.body).slice(0, 2400));
+  const subject = String(p.subject || '').slice(0, 160) || 'Following up';
+  const cfg = await brainCfg(env);
+  const rules = await puRulesGet(env);
+  const gov = (rules.rules || []).find(function (r) { return r.enabled !== false && (r.actions || []).some(function (a) { return a.type === 'queue_draft'; }); });
+  const autoSend = !!(gov && gov.autoSend === true);
+  const senderOk = !!cfg.sender;
+  const released = senderOk && autoSend;
+  const mid = await queueMail(env, { kind: 'followup', to: contact.email, lang: lang, name: contact.name || '', ref: contact.id || ref, subject: subject, aiText: comp.text, aiVia: w.via, critic: w.critic || null, agentEmail: { gates: { sender: senderOk, autoSend: autoSend, rule: gov ? gov.id : null }, compliance: comp.issues, released: released } }, { key: 'bmail:' + (contact.id || ref) + ':' + Date.now().toString(36) });
+  const gate = released ? null : (!senderOk ? 'sender_not_configured' : 'autosend_off');
+  await puAttentionAdd(env, 'brain-agent', released ? '🧠 Agent email to ' + (contact.name || contact.email) + ' passed both gates and was released to the mailer queue' : '🧠 Agent email to ' + (contact.name || contact.email) + ' is HELD (' + (gate === 'sender_not_configured' ? 'no business sender identity configured' : 'auto-send is off for the governing rule') + ')', contact.id || ref);
+  return { action: 'prepare_email', ok: true, contactRef: ref, kind: kind, queued: !!mid, held: !released, gate: gate, critic: w.critic || null, complianceIssues: comp.issues };
+}
+
+/* ---- expanded intent execution (Brain-2 actions + v1 delegation) ---- */
+async function brainExecIntent2(env, intent) {
+  const action = String((intent && intent.action) || '');
+  const params = (intent && intent.params && typeof intent.params === 'object') ? intent.params : {};
+  if (BRAIN_ACTIONS.indexOf(action) === -1) return { action: action || 'unknown', ok: false, error: 'rejected' };
+  if (action === 'research') {
+    const q = brainStr(params.q || params.query, 200);
+    if (!q) return { action: action, ok: false, error: 'validation' };
+    const r = await brainCall(env, { task: 'research', system: 'You answer the advisor research question using the attached WEB RESEARCH results. Cite web claims inline as [1], [2] matching the research numbering. Never state a web claim that is not in the results; if research is unavailable, say so plainly and answer only from what you know, labelled as unverified.', prompt: q, maxTokens: 900, research: { query: q } });
+    if (!r.ok) return { action: action, ok: false, error: r.error };
+    return { action: action, ok: true, answer: String(r.text).slice(0, 3000), sources: r.sources || [], researchNote: r.researchNote || '' };
+  }
+  if (action === 'update_listing_copy_draft') {
+    const mls = String(params.mls || '').slice(0, 40);
+    if (!mls || !puRichListing(mls)) return { action: action, ok: false, error: 'not_found' };
+    const out = await brainCopyGenerate(env, mls);
+    if (!out.ok) return { action: action, ok: false, error: out.error };
+    return { action: action, ok: true, mls: mls, draft: true, critic: out.copy.critic || null };
+  }
+  if (action === 'create_viewing_brief') {
+    const out = await brainShowingBrief(env, { viewingId: String(params.viewingId || '').slice(0, 64), mls: String(params.mls || '').slice(0, 40), leadId: String(params.leadId || '').slice(0, 64), fresh: true });
+    if (!out.ok) return { action: action, ok: false, error: out.error };
+    return { action: action, ok: true, brief: out.brief || null };
+  }
+  if (action === 'prepare_email') return brainPrepareEmail(env, params);
+  return brainExecIntent(env, intent);
+}
+
+/* ---- predictions: rules compute features; the model never invents ----
+   Every prediction is an ESTIMATE with a stored factors list. Best
+   contact time is only offered when >=3 real interaction timestamps
+   exist for the lead; otherwise it is explicitly "insufficient data". */
+async function brainComputePredictions(env) {
+  const sm = await puLeadScores(env);
+  const now = Date.now();
+  // interaction timestamps per email: lead creations + viewing datetimes
+  const timesByEmail = {};
+  const pushT = function (email, iso) { const e = normEmail(email || ''); const t = Date.parse(iso || ''); if (e && isFinite(t)) { (timesByEmail[e] = timesByEmail[e] || []).push(t); } };
+  for (const l of sm.leads) pushT(l.email, l.created_at);
+  const vidxP = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+  for (const vid of vidxP.slice(0, 300)) { const v = await env.LEADS.get('viewing:' + vid, { type: 'json' }); if (v) pushT(v.email, (v.date || '') + 'T' + (v.time || '12:00') + ':00'); }
+  const topClose = [], topCold = [];
+  const predMap = {};
+  let leadCount = 0;
+  for (const l of sm.leads.slice(0, 300)) {
+    const s = sm.map[l.id]; if (!s) continue;
+    if (l.stage === 'closed' || l.stage === 'dropped') continue;
+    const factors = [];
+    let closeBand = 'low';
+    if (l.stage === 'offer') { closeBand = 'high'; factors.push('stage: offer'); }
+    else if (s.score >= 70) { closeBand = 'high'; factors.push('lead score ' + s.score + ' (hot)'); }
+    else if (s.score >= 40 || l.stage === 'viewing' || l.stage === 'contacted') { closeBand = 'medium'; factors.push('lead score ' + s.score + ', stage ' + (l.stage || 'new')); }
+    else factors.push('lead score ' + s.score + ', stage ' + (l.stage || 'new'));
+    if (l.ai && l.ai.urgency >= 2) { factors.push('triage urgency ' + l.ai.urgency + '/3'); if (closeBand === 'medium') closeBand = 'high'; }
+    const anchor = l.stageAt || l.created_at;
+    const ageD = anchor ? (now - Date.parse(anchor)) / 86400000 : 0;
+    let coldRisk = 'low';
+    if ((l.stage === 'contacted' && ageD >= 7) || (l.stage === 'new' && ageD >= 4)) { coldRisk = 'high'; factors.push('silent ' + Math.floor(ageD) + 'd in stage ' + (l.stage || 'new')); }
+    else if (ageD >= 2) { coldRisk = 'medium'; factors.push('no recorded movement for ' + Math.floor(ageD) + 'd'); }
+    const times = timesByEmail[normEmail(l.email || '')] || [];
+    let bestContact = null;
+    if (times.length >= 3) {
+      const hours = times.map(function (t) { return new Date(t).getHours(); }).sort(function (a, b) { return a - b; });
+      const med = hours[Math.floor(hours.length / 2)];
+      bestContact = med < 11 ? 'morning' : (med < 16 ? 'afternoon' : 'evening');
+      factors.push('best contact ' + bestContact + ' (median of ' + times.length + ' recorded interactions)');
+    }
+    const pred = { closeBand: closeBand, coldRisk: coldRisk, bestContact: bestContact, bestContactData: times.length >= 3 ? 'ok' : 'insufficient data', factors: factors, at: new Date().toISOString(), estimate: true };
+    await env.LEADS.put('pred:lead:' + l.id, JSON.stringify(pred));
+    predMap[l.id] = { c: closeBand, r: coldRisk, e: normEmail(l.email || '') };
+    leadCount++;
+    if (closeBand === 'high') topClose.push({ id: l.id, name: l.name || '', band: closeBand });
+    if (coldRisk === 'high') topCold.push({ id: l.id, name: l.name || '', risk: coldRisk });
+  }
+  // listings: stale risk vs catalog norms (views from perf + days on market)
+  const perf = await perfRead(env).catch(function () { return null; });
+  const cat = mergedCatalog();
+  const doms = cat.map(function (h) { return h.dom || 0; }).filter(function (d) { return d > 0; }).sort(function (a, b) { return a - b; });
+  const medDom = doms.length ? doms[Math.floor(doms.length / 2)] : 0;
+  const viewsArr = cat.map(function (h) { return (perf && perf.listings && perf.listings[h.mls] && perf.listings[h.mls].v) || 0; }).sort(function (a, b) { return a - b; });
+  const medViews = viewsArr.length ? viewsArr[Math.floor(viewsArr.length / 2)] : 0;
+  const topStale = [];
+  let listCount = 0;
+  for (const h of cat) {
+    const factors = [];
+    const views = (perf && perf.listings && perf.listings[h.mls] && perf.listings[h.mls].v) || 0;
+    let risk = 'low';
+    if (medDom && (h.dom || 0) >= medDom * 1.5 && (h.dom || 0) >= 14) { risk = 'high'; factors.push('DOM ' + (h.dom || 0) + ' vs catalog median ' + medDom); }
+    else if (medDom && (h.dom || 0) > medDom) { risk = 'medium'; factors.push('DOM ' + (h.dom || 0) + ' above catalog median ' + medDom); }
+    if (medViews && views < medViews * 0.4) { if (risk === 'low') risk = 'medium'; factors.push('views ' + views + ' vs catalog median ' + medViews); }
+    if (!factors.length) factors.push('in line with catalog norms (median DOM ' + medDom + ', median views ' + medViews + ')');
+    await env.LEADS.put('pred:listing:' + h.mls, JSON.stringify({ staleRisk: risk, views: views, dom: h.dom || 0, factors: factors, at: new Date().toISOString(), estimate: true }));
+    listCount++;
+    if (risk === 'high') topStale.push({ mls: h.mls, street: h.street || '', city: h.city || '' });
+  }
+  // neighbourhood momentum from stored market stats deltas
+  const dsP = await mpReadStats(env);
+  const monthsP = (dsP && dsP.months) || [];
+  const hoods = [];
+  if (monthsP[0] && monthsP[1]) {
+    for (const bName of ['gvr', 'fvreb', 'bc', 'canada']) {
+      const cB = monthsP[0][bName], pB = monthsP[1][bName];
+      if (!cB || !pB || typeof cB.benchmark !== 'number' || typeof pB.benchmark !== 'number' || !pB.benchmark) continue;
+      const dPct = Math.round((cB.benchmark - pB.benchmark) / pB.benchmark * 1000) / 10;
+      hoods.push({ board: bName, momentum: dPct > 0.3 ? 'rising' : (dPct < -0.3 ? 'cooling' : 'flat'), deltaPct: dPct, factors: ['benchmark ' + pB.benchmark + ' -> ' + cB.benchmark + ' (' + monthsP[1].month + ' -> ' + monthsP[0].month + ')'] });
+    }
+  }
+  const summary = { at: new Date().toISOString(), estimate: true, leads: leadCount, listings: listCount, topClose: topClose.slice(0, 5), topCold: topCold.slice(0, 5), topStale: topStale.slice(0, 5), hoods: hoods };
+  await env.LEADS.put('pred:map', JSON.stringify(predMap));
+  await env.LEADS.put('pred:hoods', JSON.stringify(hoods));
+  await env.LEADS.put('pred:summary', JSON.stringify(summary));
+  return summary;
+}
+
+/* ---- calibration: monthly + on-demand; proposes, never auto-tunes ---- */
+async function brainCalibration(env) {
+  const outcomes = (await env.LEADS.get('brain:outcomes', { type: 'json' })) || [];
+  const counts = {};
+  for (const o of outcomes) counts[o.type] = (counts[o.type] || 0) + 1;
+  const drafts = (counts.draft_approved || 0) + (counts.draft_edited || 0);
+  const editRate = drafts ? Math.round(100 * (counts.draft_edited || 0) / drafts) : null;
+  const lines = ['Brain calibration — ' + outcomes.length + ' outcome events recorded so far.'];
+  lines.push('Drafts: ' + (counts.draft_approved || 0) + ' approved as-is, ' + (counts.draft_edited || 0) + ' edited first' + (editRate !== null ? ' (edit rate ' + editRate + '%)' : '') + '. Follow-ups completed: ' + (counts.followup_completed || 0) + '. Viewings held: ' + (counts.viewing_held || 0) + '. Stage changes: ' + (counts.stage_changed || 0) + '.');
+  const proposals = [];
+  if (editRate !== null && editRate >= 40) proposals.push('Proposal: the draft edit rate is high — review the Brain memory panel and add a preferences note describing the edits you keep making. (Nothing changes until you approve it.)');
+  if ((counts.draft_approved || 0) >= 5 && editRate !== null && editRate <= 10) proposals.push('Proposal: drafts are landing well — consider raising the style-examples count (cfg styleK) so new drafts lean on more of your approved voice.');
+  if (!proposals.length) proposals.push('No adjustments proposed this cycle.');
+  for (const pr of proposals) lines.push(pr);
+  const text = lines.join(' ');
+  await puAttentionAdd(env, 'brain-calibration', '🧠 ' + text.slice(0, 880), 'brain');
+  return { ok: true, text: text, counts: counts, editRate: editRate, proposals: proposals };
+}
+
+/* ---- video pack: script (FA + EN) + storyboard mapped to the photos ---- */
+async function brainVideoPack(env, mls) {
+  const h = puRichListing(mls);
+  if (!h) return { ok: false, error: 'not_found', status: 404 };
+  const photos = [];
+  if (h.photo) photos.push(h.photo);
+  try { const lp = await env.LEADS.get('lphoto:' + mls, { type: 'json' }); if (lp && Array.isArray(lp.photos)) for (const p of lp.photos) { const u = typeof p === 'string' ? p : (p && p.url); if (u && photos.indexOf(u) === -1) photos.push(u); } } catch (e) {}
+  const specs = { street: h.street || '', city: h.city || '', type: h.type || '', price: h.price || null, beds: h.beds, baths: h.baths, sqft: h.sqft || null, features: h.features || [], descEn: brainStr((h.desc && h.desc.en) || '', 500) };
+  const sys = 'You create a vertical social-video pack for a real-estate listing. Reply with ONLY a JSON object: {"hook":"...","scriptEn":"...","scriptFa":"...","cta":"...","shots":[{"photo":0,"captionEn":"...","captionFa":"...","seconds":4}]} — 5 to 7 shots; photo = an index into the photos array given (reuse indexes with different captions when there is only one photo). Scripts: 60-90 words each, spoken style, the hook is the first line. ' + BRAIN_GROUND + ' Never invent features or figures not in the specs.';
+  const r = await brainCall(env, { task: 'video', system: sys, prompt: 'Listing specs (JSON):\n' + JSON.stringify(specs) + '\nPhotos (index order): ' + JSON.stringify(photos), maxTokens: 1200 });
+  if (!r.ok) return { ok: false, error: r.error };
+  const p = brainJson(r.text);
+  if (!p) return { ok: false, error: 'ai_parse' };
+  const pack = { mls: mls, hook: brainStr(p.hook, 200), scriptEn: brainStr(p.scriptEn, 1500), scriptFa: brainStr(p.scriptFa, 1500), cta: brainStr(p.cta, 200),
+    shots: (Array.isArray(p.shots) ? p.shots : []).slice(0, 8).map(function (s) { const idx = Math.max(0, Math.min(Math.max(0, photos.length - 1), parseInt(s && s.photo, 10) || 0)); return { photo: photos[idx] || '', captionEn: brainStr(s && s.captionEn, 160), captionFa: brainStr(s && s.captionFa, 160), seconds: Math.max(2, Math.min(10, parseInt(s && s.seconds, 10) || 4)) }; }),
+    photos: photos, at: new Date().toISOString(), via: r.via || '', rendered: false };
+  await env.LEADS.put('videopack:' + mls, JSON.stringify(pack));
+  return { ok: true, pack: pack };
+}
+
+/* ---- voice memo -> structured proposal (nothing auto-applied) ---- */
+async function brainVoiceProposal(env, transcript, leadId) {
+  let lead = null;
+  if (leadId) lead = await env.LEADS.get('lead:' + String(leadId).slice(0, 64), { type: 'json' });
+  const sys = 'You convert a voice-memo transcript (the advisor speaking, possibly in Persian) into structured CRM updates. Reply with ONLY a JSON object: {"note":"...","tasks":[{"text":"...","dueInDays":2}],"stageSuggestion":""}. note = a clean CRM note in the language of the transcript summarising what was said (facts only). tasks = up to 3 concrete follow-ups actually mentioned or clearly implied. stageSuggestion = one of new/contacted/viewing/offer/closed ONLY if the memo clearly states a stage change, else "". ' + BRAIN_GROUND;
+  const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Transcript:\n' + String(transcript).slice(0, 3000) + (lead ? '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 1500) : ''), maxTokens: 600 });
+  if (!r.ok) return { ok: false, error: r.error };
+  const p = brainJson(r.text) || {};
+  const stageOk = ['new', 'contacted', 'viewing', 'offer', 'closed'].indexOf(String(p.stageSuggestion || '').toLowerCase()) !== -1 ? String(p.stageSuggestion).toLowerCase() : '';
+  return { ok: true, proposal: { note: brainStr(p.note, 800), tasks: (Array.isArray(p.tasks) ? p.tasks : []).slice(0, 3).map(function (t) { return { text: brainStr(t && t.text, 200), dueInDays: Math.max(0, Math.min(90, parseInt(t && t.dueInDays, 10) || 2)) }; }).filter(function (t) { return t.text; }), stageSuggestion: stageOk } };
 }
 
 /* ================= market pulse (2026-11-01) =================
@@ -4198,7 +4581,8 @@ async function handleRequest(request, env, ctx) {
           name: name, intent: intent, city: city, budget: budget,
           email: email, phone: phone, message: message,
           stage: 'new', notes: '', source: source,
-          listingId: leadHome ? leadHome.mls : ''
+          listingId: leadHome ? leadHome.mls : '',
+          chatRef: chatRefOf(d)
         };
         await env.LEADS.put('lead:' + id, JSON.stringify(lead));
         await idxAdd(env, 'leads', id);
@@ -4440,7 +4824,7 @@ async function handleRequest(request, env, ctx) {
             name: name, intent: 'seller', city: city, budget: '',
             email: email, phone: phone,
             message: 'Home valuation request: ' + address + ', ' + city + ' — ' + type + ', ' + (bd.value === null ? 'beds not given' : bd.value + ' bed') + ', ' + (bt.value === null ? 'baths not given' : bt.value + ' bath') + ', ' + (sqft ? sqft + ' sq ft. ' : 'size not given. ') + estText,
-            stage: 'new', notes: '', source: 'home-valuation',
+            stage: 'new', notes: '', source: 'home-valuation', chatRef: chatRefOf(d),
             valuation: { address: address, city: city, type: type, beds: bd.value, baths: bt.value, sqft: sqft, rawSqft: (typeof d.sqft === 'string' ? d.sqft.slice(0, 40) : (typeof d.sqft === 'number' ? d.sqft : null)), compMls: compMls, estimate: est, reason: est ? null : estReason, at: new Date().toISOString() }
           };
           // The lead is stored FIRST (F-03 H3); every side effect
@@ -5038,7 +5422,7 @@ async function handleRequest(request, env, ctx) {
           return json({ ok: false, error: 'slot_unavailable' }, 409, origin);
         }
         const vid = 'vw_' + randHex(6);
-        const rec = { id: vid, created_at: new Date().toISOString(), name: name, email: email, phone: phone, listingId: lid, date: date, time: time, lang: vlang, status: 'new', gcalEventId: 'v' + vid.slice(3) };
+        const rec = { id: vid, created_at: new Date().toISOString(), name: name, email: email, phone: phone, listingId: lid, date: date, time: time, lang: vlang, status: 'new', gcalEventId: 'v' + vid.slice(3), chatRef: chatRefOf(d) };
         // The viewing record is written BEFORE the slot claim (cycle 24): a
         // claim whose record doesn't exist yet reads as "free" to a rival
         // claimer, which let two claims pass in the gap.
@@ -5250,6 +5634,10 @@ async function handleRequest(request, env, ctx) {
           }
           if (d.notes != null) lead.notes = String(d.notes).slice(0, 2000);
           await env.LEADS.put(key, JSON.stringify(lead));
+          if (d.stage !== undefined && lead.stageAt && (Date.now() - Date.parse(lead.stageAt)) < 5000) { // stageAt is stamped only on a real change
+            try { await brainOutcome(env, { type: 'stage_changed', ref: lead.id, stage: lead.stage }); } catch (e) {}
+            try { await brainMemoryRefresh(env, lead.id, 'stage:' + lead.stage); } catch (e) {}
+          }
           return json({ ok: true, lead: lead }, 200, origin);
         }
         if (request.method === 'DELETE') {
@@ -6031,6 +6419,7 @@ async function handleRequest(request, env, ctx) {
         if (d.due !== undefined) { const du = String(d.due).slice(0, 10); if (!/^\d{4}-\d{2}-\d{2}$/.test(du) || isNaN(Date.parse(du + 'T00:00:00Z')) || new Date(Date.parse(du + 'T00:00:00Z')).toISOString().slice(0, 10) !== du) return json({ ok: false, error: 'validation' }, 400, origin); t.due = du; }
         await env.LEADS.put('task:' + tkm[1], JSON.stringify(t));
         adminCache.delete('contacts');
+        if (d.done === true && t.done) { try { await brainOutcome(env, { type: 'followup_completed', ref: tkm[1] }); } catch (e) {} } // Portal Brain 2 feedback loop
         return json({ ok: true, task: t }, 200, origin);
       }
 
@@ -6138,6 +6527,10 @@ async function handleRequest(request, env, ctx) {
         const toMeta = await getCMeta(env, to);
         if (banRec || (toMeta && toMeta.dnc)) return json({ ok: false, error: 'suppressed' }, 403, origin);
         const mid = await queueMail(env, { kind: 'manual', to: to, lang: validLang((d || {}).lang), name: String((d || {}).name || '').replace(/[\r\n]+/g, ' ').slice(0, 80), subject: subject, body: body });
+        // Portal Brain 2 style learning: the portal sends the AI's
+        // original text alongside an edited final; the pair teaches
+        // the brain Erfan's voice (stored in his KV, capped).
+        if (mid && d && typeof d.aiOriginal === 'string' && d.aiOriginal.trim() && d.aiOriginal.trim() !== body.trim()) { try { await brainStyleAdd(env, { original: d.aiOriginal, final: body, kind: 'composer', ref: to }); } catch (e) {} }
         return json({ ok: true, id: mid }, 200, origin);
       }
       const crmNoteDel = path.match(/^\/api\/admin\/crm\/([^/]+)\/notes\/([A-Za-z0-9-]+)$/);
@@ -6263,6 +6656,10 @@ async function handleRequest(request, env, ctx) {
         if (!['new', 'confirmed', 'done', 'cancelled'].includes(st)) return json({ ok: false, error: 'validation' }, 400, origin);
         if (rec.status === 'cancelled' && st !== 'cancelled') return json({ ok: false, error: 'conflict' }, 409, origin);
         rec.status = st;
+        if (st === 'done') { // Portal Brain 2 feedback loop: a held viewing is an outcome (+ memory for the matching lead)
+          try { await brainOutcome(env, { type: 'viewing_held', ref: vwm[1] }); } catch (e) {}
+          try { const smV = await puLeadScores(env); const lv = smV.leads.find(function (x) { return normEmail(x.email || '') === normEmail(rec.email || ''); }); if (lv) await brainMemoryRefresh(env, lv.id, 'viewing held'); } catch (e) {}
+        }
         // Keep the calendar in sync with the desk: cancelling removes the
         // event; confirming queues the visitor a confirmation email (once).
         let cancelEv = '';
@@ -6528,6 +6925,111 @@ async function handleRequest(request, env, ctx) {
         return json(out, 200, origin);
       }
 
+      // ---- Portal Brain 2: memory + learning panel ----
+      if (path === '/api/admin/brain/memory' && request.method === 'GET') {
+        const style = await brainStylePairs(env);
+        const prefs = await brainPrefs(env);
+        const memKeys = await listAllKeys(env, 'brain:mem:lead:', 100);
+        const summaries = [];
+        for (const k of memKeys.slice(0, 60)) { const rec = await env.LEADS.get(k.name, { type: 'json' }); if (rec) summaries.push({ leadId: rec.leadId, name: rec.name || '', summary: rec.summary || '', events: rec.events || 0, updatedAt: rec.updatedAt || '' }); }
+        const outcomes = (await env.LEADS.get('brain:outcomes', { type: 'json' })) || [];
+        return json({ ok: true, style: style, prefs: prefs, summaries: summaries, outcomeCount: outcomes.length }, 200, origin);
+      }
+      if (path === '/api/admin/brain/memory' && request.method === 'PUT') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        if (!d || typeof d.prefs !== 'string') return json({ ok: false, error: 'validation' }, 400, origin);
+        await env.LEADS.put('brain:prefs', JSON.stringify({ text: d.prefs.slice(0, 1000), at: new Date().toISOString() }));
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/admin/brain/memory' && request.method === 'DELETE') {
+        await env.LEADS.delete('brain:style');
+        await env.LEADS.delete('brain:prefs');
+        const memKeys = await listAllKeys(env, 'brain:mem:lead:', 500);
+        for (const k of memKeys) { try { await env.LEADS.delete(k.name); } catch (e) {} }
+        return json({ ok: true, cleared: memKeys.length }, 200, origin);
+      }
+      // ---- Portal Brain 2: edit a held brain draft (style learning) ----
+      if (path === '/api/admin/brain/draft-edit' && request.method === 'PUT') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const mid = String(d.mailId || '').replace(/[^A-Za-z0-9-]/g, '').slice(0, 80);
+        if (!mid || typeof d.text !== 'string' || !d.text.trim()) return json({ ok: false, error: 'validation' }, 400, origin);
+        const raw = await env.LEADS.get('mailq:' + mid);
+        if (!raw) return json({ ok: false, error: 'not_found' }, 404, origin);
+        let rec = null;
+        try { rec = JSON.parse(raw); } catch (e) {}
+        if (!rec || rec.sent) return json({ ok: false, error: 'conflict' }, 409, origin);
+        const original = String(rec.aiText || rec.body || '');
+        const finalText = d.text.slice(0, 4000);
+        rec.aiText = finalText;
+        rec.aiEdited = true;
+        await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
+        if (original && original.trim() !== finalText.trim()) { try { await brainStyleAdd(env, { original: original, final: finalText, kind: 'held-draft', ref: rec.ref || '' }); } catch (e) {} }
+        return json({ ok: true, learned: !!(original && original.trim() !== finalText.trim()) }, 200, origin);
+      }
+      // ---- Portal Brain 2: predictions ----
+      if (path === '/api/admin/brain/predictions' && request.method === 'GET') {
+        const s = await env.LEADS.get('pred:summary', { type: 'json' });
+        return json({ ok: true, predictions: s || null }, 200, origin);
+      }
+      if (path === '/api/admin/brain/predictions' && request.method === 'POST') {
+        const s = await brainComputePredictions(env);
+        return json({ ok: true, predictions: s }, 200, origin);
+      }
+      if (path === '/api/admin/brain/predictions/map' && request.method === 'GET') {
+        const pm = await env.LEADS.get('pred:map', { type: 'json' });
+        return json({ ok: true, map: pm || {} }, 200, origin);
+      }
+      if (path === '/api/admin/brain/predictions/lead' && request.method === 'GET') {
+        const id = String(url.searchParams.get('id') || '').slice(0, 64);
+        const pr = id ? await env.LEADS.get('pred:lead:' + id, { type: 'json' }) : null;
+        return json({ ok: true, pred: pr || null }, 200, origin);
+      }
+      // ---- Portal Brain 2: calibration (on demand) ----
+      if (path === '/api/admin/brain/calibrate' && request.method === 'POST') {
+        const out = await brainCalibration(env);
+        return json(out, 200, origin);
+      }
+      // ---- Portal Brain 2: voice in (Whisper via ai-chat) ----
+      if (path === '/api/admin/brain/voice' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        if (typeof d.audioBase64 !== 'string' || !d.audioBase64) return json({ ok: false, error: 'validation' }, 400, origin);
+        const bcfgV = await brainCfg(env);
+        if (!bcfgV.secret) return json({ ok: false, error: 'ai_not_configured' }, 200, origin);
+        const res = await aiFetch(env, '/internal/brain-audio', { audioBase64: d.audioBase64, mime: String(d.mime || 'audio/webm').slice(0, 60), lang: d.lang === 'en' ? 'en' : 'fa' }, bcfgV.secret);
+        const j = res.j || null;
+        if (!j || !j.ok || !j.text) return json({ ok: false, error: (j && j.error) || 'transcribe_failed' }, 200, origin);
+        const out = { ok: true, transcript: String(j.text).slice(0, 4000) };
+        if (d.leadId || d.viewingId) {
+          let leadId = String(d.leadId || '').slice(0, 64);
+          if (!leadId && d.viewingId) {
+            const v = await env.LEADS.get('viewing:' + String(d.viewingId).slice(0, 64), { type: 'json' });
+            if (v && v.email) { const smW = await puLeadScores(env); const lv = smW.leads.find(function (x) { return normEmail(x.email || '') === normEmail(v.email); }); if (lv) leadId = lv.id; }
+          }
+          const prop = await brainVoiceProposal(env, out.transcript, leadId);
+          if (prop.ok) out.proposal = prop.proposal;
+          out.leadId = leadId || null;
+        }
+        return json(out, 200, origin);
+      }
+      // ---- Portal Brain 2: video pack ----
+      if (path === '/api/admin/brain/video-pack' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const out = await brainVideoPack(env, String((d && d.mls) || '').slice(0, 40));
+        if (!out.ok) return json({ ok: false, error: out.error }, out.status || 200, origin);
+        return json({ ok: true, pack: out.pack }, 200, origin);
+      }
+      if (path === '/api/admin/brain/video-pack' && request.method === 'GET') {
+        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const pack = mls ? await env.LEADS.get('videopack:' + mls, { type: 'json' }) : null;
+        return json({ ok: true, pack: pack || null }, 200, origin);
+      }
+
       // ---- admin: portal upgrade — files, search, report data (systems 6, 7, 9) ----
       if (path === '/api/admin/files' && request.method === 'POST') {
         let d = null;
@@ -6735,6 +7237,7 @@ async function handleRequest(request, env, ctx) {
           rec.sent = true;
           rec.sent_at = new Date().toISOString();
           await env.LEADS.put('mailq:' + mqm[1], JSON.stringify(rec), { expirationTtl: 90 * 86400 }); // sent records age out instead of accumulating forever (cycle 29, Claude L7)
+          if (rec.aiText) { try { await brainOutcome(env, { type: 'draft_approved', ref: rec.ref || '', edited: !!rec.aiEdited }); } catch (e) {} } // Portal Brain 2 feedback loop
         }
         return json({ ok: true }, 200, origin);
       }
