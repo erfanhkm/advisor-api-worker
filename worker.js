@@ -474,7 +474,9 @@ async function scopedAuthed(request, env, path, method) {
   const INGEST = (method === 'POST' && path === '/api/market-leads') || (method === 'GET' && path === '/api/radar-settings') || (method === 'GET' && path === '/api/market-leads') || (path === '/api/radar-seen' && (method === 'GET' || method === 'POST')) || (path === '/api/market-pool' && (method === 'GET' || method === 'POST')) || (path === '/api/radar-coverage' && (method === 'GET' || method === 'POST'));
   const SERVICE = (path === '/api/admin/maintenance' && (method === 'GET' || method === 'POST')) ||
     (method === 'POST' && path === '/api/admin/backup-stamp') ||
-    (method === 'GET' && (path === '/api/leads' || path === '/api/admin/users' || path === '/api/admin/newsletter' || path === '/api/admin/viewings' || path === '/api/admin/mailq'));
+    (method === 'GET' && (path === '/api/leads' || path === '/api/admin/users' || path === '/api/admin/newsletter' || path === '/api/admin/viewings' || path === '/api/admin/mailq')) ||
+    (method === 'POST' && path === '/api/admin/push/ensure-keys') ||
+    (method === 'GET' && path === '/api/admin/push/status');
   const scope = INGEST ? 'ingest' : (SERVICE ? 'service' : null);
   if (!scope) return false;
   const h = request.headers.get('Authorization') || '';
@@ -2568,6 +2570,10 @@ async function runAutomations(env, source) {
       try { result.reminders = await runViewingReminders(env); } catch (e) { result.reminders = { error: 'failed' }; }
     }
     try { await env.LEADS.put('automation:last', JSON.stringify({ at: new Date().toISOString(), source: result.source, alerts: result.alerts, reminders: result.reminders, error: result.error || null })); } catch (e) {}
+    // Portal upgrade (system 8): provision the Web Push VAPID pair on
+    // the first automation run after deploy — agent-operated activation,
+    // idempotent, one KV read once the keys exist.
+    try { await puEnsurePushKeys(env); } catch (e) {}
     // Bump the admin-cache generation (Pack D, F-03S L1): mutating
     // HTTP requests bump admin:gen in the fetch wrapper, but the cron
     // path has no wrapper — without this, leads/viewings the runner
@@ -2637,6 +2643,167 @@ async function buildFollowups(env) {
   staleAll.sort(function (a, b) { return String(a.created_at).localeCompare(String(b.created_at)); });
   postAll.sort(function (a, b) { return String(a.viewingDate).localeCompare(String(b.viewingDate)); });
   return { today: todayStr, todayViewings: todayViewings, awaitingConfirm: awaiting.slice(0, 25), awaitingConfirmCount: awaiting.length, newLeads: newAll.slice(0, 25), newCount: newCount, staleLeads: staleAll.slice(0, 25), staleCount: staleCount, postViewing: postAll.slice(0, 25), postViewingCount: postAll.length };
+}
+
+/* ================= portal upgrade (2026-11-01) =================
+   Erfan's nine-system portal upgrade. Helpers live here (after
+   buildFollowups, before Market Pulse); routes live in the admin-gated
+   region. Design rules for the whole section: aggregations are
+   single-pass and cached via adminCachedGen; per-source failures degrade
+   to an error state, never a dead board; mail is only ever QUEUED
+   (held), never sent; no figure is invented — everything traces to
+   stored records or the market:stats dataset. */
+
+/* ---- system 8: Web Push (VAPID) for the portal PWA ----
+   Keys: an ECDSA P-256 pair generated INSIDE the worker on first use
+   (puEnsurePushKeys) and stored only in cfg:platform.push via
+   read-modify-write, so sibling platform fields (postLicense) survive
+   and the private key never exists in any file, repo or report — the
+   agent never handles it and the user never pastes anything. Sending is
+   therefore live by construction once a subscription exists; the portal
+   Push card shows the state and the public key's fingerprint. */
+function puB64urlToBytes(s) {
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function puConcatBytes() {
+  let n = 0;
+  for (let i = 0; i < arguments.length; i++) n += arguments[i].length;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (let i = 0; i < arguments.length; i++) { out.set(arguments[i], o); o += arguments[i].length; }
+  return out;
+}
+function puPubKeyB64(jwk) {
+  const pt = new Uint8Array(65);
+  pt[0] = 4;
+  pt.set(puB64urlToBytes(jwk.x), 1);
+  pt.set(puB64urlToBytes(jwk.y), 33);
+  return b64urlOf(pt);
+}
+async function puPushFingerprint(jwk) {
+  const h = await sha256hex(String(jwk.x) + '.' + String(jwk.y));
+  return h.slice(0, 16);
+}
+async function puPushCfg(env) {
+  try {
+    const p = await env.LEADS.get('cfg:platform', { type: 'json' });
+    if (p && p.push && p.push.vapidPrivateJwk && p.push.vapidPublicJwk) return p.push;
+  } catch (e) {}
+  return null;
+}
+async function puEnsurePushKeys(env) {
+  const existing = await puPushCfg(env);
+  if (existing) return existing;
+  const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  const pub = await crypto.subtle.exportKey('jwk', pair.publicKey);
+  const priv = await crypto.subtle.exportKey('jwk', pair.privateKey);
+  let plat = {};
+  try { plat = (await env.LEADS.get('cfg:platform', { type: 'json' })) || {}; } catch (e) { plat = {}; }
+  if (plat.push && plat.push.vapidPrivateJwk && plat.push.vapidPublicJwk) return plat.push; // lost a race — adopt the winner
+  plat.push = {
+    vapidPublicJwk: { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y },
+    vapidPrivateJwk: { kty: priv.kty, crv: priv.crv, x: priv.x, y: priv.y, d: priv.d },
+    subject: 'mailto:erfanbcrealestate@gmail.com',
+    createdAt: new Date().toISOString()
+  };
+  await env.LEADS.put('cfg:platform', JSON.stringify(plat));
+  return plat.push;
+}
+async function puHkdf(salt, ikm, info, len) {
+  const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: salt, info: info }, key, len * 8));
+}
+/* RFC 8291 (aes128gcm) payload encryption for one subscription. */
+async function puPushEncrypt(sub, payloadBytes) {
+  const uaPub = puB64urlToBytes(sub.keys.p256dh);
+  const auth = puB64urlToBytes(sub.keys.auth);
+  const eph = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const ephPubJwk = await crypto.subtle.exportKey('jwk', eph.publicKey);
+  const ephPub = puB64urlToBytes(puPubKeyB64(ephPubJwk));
+  const uaKey = await crypto.subtle.importKey('raw', uaPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', namedCurve: 'P-256', public: uaKey }, eph.privateKey, 256));
+  const enc = new TextEncoder();
+  const ikm = await puHkdf(auth, secret, puConcatBytes(enc.encode('WebPush: info\0'), uaPub, ephPub), 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await puHkdf(salt, ikm, enc.encode('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await puHkdf(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 12);
+  const aesKey = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, tagLength: 128 }, aesKey, puConcatBytes(payloadBytes, new Uint8Array([2]))));
+  const header = new Uint8Array(16 + 4 + 1 + 65);
+  header.set(salt, 0);
+  header[18] = 0x10; // record size 4096, big-endian (bytes 16..19)
+  header[20] = 65;
+  header.set(ephPub, 21);
+  return puConcatBytes(header, ct);
+}
+async function puVapidJwt(cfg, endpoint) {
+  const aud = new URL(endpoint).origin;
+  const now = Math.floor(Date.now() / 1000);
+  const enc = new TextEncoder();
+  const head = b64urlOf(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const claim = b64urlOf(enc.encode(JSON.stringify({ aud: aud, exp: now + 12 * 3600, sub: cfg.subject || 'mailto:erfanbcrealestate@gmail.com' })));
+  const key = await crypto.subtle.importKey('jwk', cfg.vapidPrivateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, enc.encode(head + '.' + claim));
+  return head + '.' + claim + '.' + b64urlOf(sig);
+}
+async function puPushSend(cfg, sub, payloadObj) {
+  const body = await puPushEncrypt(sub, new TextEncoder().encode(JSON.stringify(payloadObj)));
+  const jwt = await puVapidJwt(cfg, sub.endpoint);
+  const res = await fetch(sub.endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'vapid t=' + jwt + ', k=' + puPubKeyB64(cfg.vapidPublicJwk),
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      'TTL': '86400',
+      'Urgency': 'high'
+    },
+    body: body
+  });
+  return res.status;
+}
+/* Notify every stored portal subscription (cap 10). Provisions the
+   VAPID pair on first use. Never throws. */
+async function puNotifyPush(env, payload) {
+  try {
+    const cfg = await puEnsurePushKeys(env);
+    if (!cfg) return { sent: 0, attempted: 0, error: 'no_keys' };
+    let ids = [];
+    try { ids = await idxGet(env, 'pushsubs', 'pushsub:'); } catch (e) { ids = []; }
+    let sent = 0, pruned = 0, failed = 0, attempted = 0;
+    for (const id of ids.slice(0, 10)) {
+      let sub = null;
+      try { sub = await env.LEADS.get('pushsub:' + id, { type: 'json' }); } catch (e) {}
+      if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) continue;
+      attempted++;
+      try {
+        const st = await puPushSend(cfg, sub, payload);
+        if (st >= 200 && st < 300) sent++;
+        else if (st === 404 || st === 410) { pruned++; try { await env.LEADS.delete('pushsub:' + id); await idxRemove(env, 'pushsubs', id); } catch (e) {} }
+        else failed++;
+      } catch (e) { failed++; }
+    }
+    return { sent: sent, attempted: attempted, pruned: pruned, failed: failed, subscriptions: ids.length };
+  } catch (e) {
+    return { sent: 0, attempted: 0, error: 'notify_failed' };
+  }
+}
+async function puPushStatus(env) {
+  const cfg = await puPushCfg(env);
+  let subs = 0;
+  try { subs = (await idxGet(env, 'pushsubs', 'pushsub:')).length; } catch (e) {}
+  return {
+    configured: !!cfg,
+    sending: cfg ? 'enabled' : 'not_provisioned',
+    fingerprint: cfg ? await puPushFingerprint(cfg.vapidPublicJwk) : null,
+    publicKey: cfg ? puPubKeyB64(cfg.vapidPublicJwk) : null,
+    subscriptions: subs
+  };
 }
 
 /* ================= market pulse (2026-11-01) =================
@@ -2851,6 +3018,10 @@ async function handleRequest(request, env, ctx) {
         await env.LEADS.put('lead:' + id, JSON.stringify(lead));
         await idxAdd(env, 'leads', id);
         await perfBump(env, ctx, 'source', source);
+        // Portal upgrade (system 8): a call lead is high-intent by
+        // definition — push-notify the portal (provisions keys on
+        // first use; silently does nothing until a device subscribes).
+        if (source === 'call') { try { ctx.waitUntil(puNotifyPush(env, { title: 'Hot lead — call request', body: (name || 'A visitor') + ' asked for a call' + (leadHome ? ' about ' + leadHome.street + ', ' + leadHome.city : ''), url: '/portal-9f3k7x2q.html' })); } catch (e) {} }
         if (leadHome) await perfBump(env, ctx, 'lead', leadHome.mls);
         if (email) {
           await queueMail(env, { kind: 'followup', to: email, lang: validLang(d.lang), name: name, ref: id });
@@ -3066,6 +3237,9 @@ async function handleRequest(request, env, ctx) {
           try { await idxAdd(env, 'leads', id); } catch (e) {}
           try { await perfBump(env, ctx, 'source', 'home-valuation'); } catch (e) {}
           if (email) { try { await queueMail(env, { kind: 'followup', to: email, lang: validLang(d.lang), name: name, ref: id }); } catch (e) {} }
+          // Portal upgrade (system 8): a fresh valuation lead is the
+          // hottest lead class — push-notify the portal.
+          try { ctx.waitUntil(puNotifyPush(env, { title: 'Hot lead — home valuation', body: (name || 'A seller') + ' requested a valuation in ' + city, url: '/portal-9f3k7x2q.html' })); } catch (e) {}
         }
         return json({ ok: true, estimate: est, manual: !est }, 200, origin);
       }
@@ -3663,6 +3837,10 @@ async function handleRequest(request, env, ctx) {
             ctx.waitUntil(gcalCreateViewing(env, sa, { id: vid, eventId: rec.gcalEventId, name: name, email: email, phone: phone, date: date, time: time, listing: home ? { mls: home.mls, street: home.street, city: home.city } : null }));
           }
         } catch (e) {}
+        // Portal upgrade (system 8): push-notify the portal about the
+        // new booking (provisions keys on first use; no-op until a
+        // device has subscribed).
+        try { ctx.waitUntil(puNotifyPush(env, { title: 'New viewing booked', body: (name || 'A visitor') + ' — ' + (home ? home.street + ', ' + home.city : lid) + ' · ' + date + ' ' + time, url: '/portal-9f3k7x2q.html' })); } catch (e) {}
         return json({ ok: true, id: vid }, 200, origin);
       }
 
@@ -4743,6 +4921,45 @@ async function handleRequest(request, env, ctx) {
         return { today: todayStr, upcomingViewings: upcoming, viewingsToday: allV.filter(function (v) { return v.date === todayStr && (v.status === 'new' || v.status === 'confirmed'); }).length, newLeads24h: newLeads24h, followUps: followUps.slice(0, 5).map(function (c) { return { email: c.email, name: c.name, hours: c.followUp.hours, kind: c.followUp.kind, score: c.score }; }), followUpCount: followUps.length, hotCount: contacts2.filter(function (c) { return c.tier === 'hot'; }).length, usersTotal: ulist2.keys.length, mailUnsent: mailUnsent, tasksDue: tasksDue, tasksDueCount: tasksDueAll.length };
         });
         return json(Object.assign({ ok: true }, data), 200, origin);
+      }
+
+      // ---- admin: portal PWA Web Push (portal upgrade system 8) ----
+      if (path === '/api/admin/push/status' && request.method === 'GET') {
+        return json({ ok: true, push: await puPushStatus(env) }, 200, origin);
+      }
+      if (path === '/api/admin/push/ensure-keys' && request.method === 'POST') {
+        await puEnsurePushKeys(env);
+        return json({ ok: true, push: await puPushStatus(env) }, 200, origin);
+      }
+      if (path === '/api/admin/push/subscribe' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const sub = (d && d.subscription && typeof d.subscription === 'object') ? d.subscription : {};
+        const endpoint = String(sub.endpoint || '').slice(0, 600);
+        const keys = (sub.keys && typeof sub.keys === 'object') ? sub.keys : {};
+        const p256dh = String(keys.p256dh || '');
+        const auth = String(keys.auth || '');
+        let valid = /^https:\/\//.test(endpoint) || /^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(endpoint);
+        try { if (puB64urlToBytes(p256dh).length !== 65) valid = false; } catch (e) { valid = false; }
+        try { if (puB64urlToBytes(auth).length < 16) valid = false; } catch (e) { valid = false; }
+        if (!valid) return json({ ok: false, error: 'validation' }, 400, origin);
+        const sid = (await sha256hex(endpoint)).slice(0, 24);
+        await env.LEADS.put('pushsub:' + sid, JSON.stringify({ endpoint: endpoint, keys: { p256dh: p256dh, auth: auth }, at: new Date().toISOString(), ua: String(request.headers.get('User-Agent') || '').slice(0, 160) }));
+        await idxAdd(env, 'pushsubs', sid);
+        return json({ ok: true, id: sid, push: await puPushStatus(env) }, 200, origin);
+      }
+      if (path === '/api/admin/push/unsubscribe' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const endpoint = String((d && d.endpoint) || '').slice(0, 600);
+        if (!endpoint) return json({ ok: false, error: 'validation' }, 400, origin);
+        const sid = (await sha256hex(endpoint)).slice(0, 24);
+        try { await env.LEADS.delete('pushsub:' + sid); await idxRemove(env, 'pushsubs', sid); } catch (e) {}
+        return json({ ok: true, push: await puPushStatus(env) }, 200, origin);
+      }
+      if (path === '/api/admin/push/test' && request.method === 'POST') {
+        const r = await puNotifyPush(env, { title: 'Site Admin — test alert', body: 'Web Push is live on this device.', url: '/portal-9f3k7x2q.html' });
+        return json({ ok: true, result: r, push: await puPushStatus(env) }, 200, origin);
       }
 
       // ---- admin: outgoing mail queue (drained by the mailer cron once a sender is configured) ----
