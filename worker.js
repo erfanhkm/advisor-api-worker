@@ -217,7 +217,13 @@ const PERF_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary'
 // additionally folds unknown counter keys into 'other'.)
 const LEAD_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary'];
 const PERF_KEY_RE = /^[A-Za-z0-9_-]{1,24}$/;
-const perfIsoId = crypto.randomUUID();
+let perfIsoId = null; // isolate id for this isolate's perf delta keys — generated
+// LAZILY by perfIso() on first flush, never at module scope: crypto.randomUUID()
+// in global scope is a disallowed operation (Cloudflare's deploy validation
+// executes the module top level and rejected it with code 10021 — the
+// 2026-11-01 Workers Builds failure). Behaviour is unchanged: one random id
+// per isolate, stable for the isolate's life.
+function perfIso() { if (!perfIsoId) perfIsoId = crypto.randomUUID(); return perfIsoId; }
 let perfPending = null; // this isolate's unflushed delta (normalized doc) — never shared, never read from KV
 let perfPendingAt = null; // ISO time of the first event in perfPending
 let perfFirstTs = 0;
@@ -282,7 +288,7 @@ function flushPerf(env) {
   perfPending = perfEmptyDoc();
   perfPendingAt = null;
   perfFirstTs = 0;
-  const key = 'perf:d:' + perfIsoId + ':' + (++perfSeq);
+  const key = 'perf:d:' + perfIso() + ':' + (++perfSeq);
   const body = JSON.stringify(delta);
   perfFlushChain = perfFlushChain.then(async function () {
     try { await env.LEADS.put(key, body, { expirationTtl: PERF_DELTA_TTL }); }
