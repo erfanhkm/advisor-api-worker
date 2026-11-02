@@ -1895,20 +1895,9 @@ async function aiInternal(env, pathName, payload) {
   if (!/^\/[a-z0-9\/_-]+$/i.test(pathName)) return { ok: false, error: 'ai_path' };
   const bcSecret = await aiSharedSecret(env);
   if (!bcSecret) return { ok: false, error: 'ai_not_configured' };
-  try {
-    const ctl = new AbortController();
-    const tm = setTimeout(function () { ctl.abort(); }, 30000);
-    const fetcher = (env.AICHAT && typeof env.AICHAT.fetch === 'function') ? env.AICHAT.fetch.bind(env.AICHAT) : fetch;
-    const r = await fetcher('https://ai-chat.erfanbillion.workers.dev' + pathName, {
-      method: 'POST', signal: ctl.signal, redirect: 'error',
-      headers: { 'Content-Type': 'application/json', Origin: 'https://real-estate-platform-0aei.onrender.com', 'X-Brief-Secret': bcSecret },
-      body: JSON.stringify(payload)
-    });
-    const j = await r.json().catch(function () { return null; });
-    clearTimeout(tm);
-    if (!r.ok || !j || !j.ok) return { ok: false, error: 'ai_unavailable' };
-    return j;
-  } catch (e) { return { ok: false, error: 'ai_unavailable' }; }
+  const res = await aiFetch(env, pathName, payload, bcSecret);
+  if (!res.r || !res.r.ok || !res.j || !res.j.ok) return { ok: false, error: (res.j && res.j.error) || 'ai_unavailable', ch: res.ch || '', detail: res.detail || '' };
+  return res.j;
 }
 function crmBriefPayload(c) {
   return {
@@ -3288,6 +3277,39 @@ async function brainLog(env, entry) {
 /* The one transport for every brain feature. Never throws; the result
    is always {ok, text?, via?, error?}. Mirrors aiInternal's binding +
    header pattern, with the brain's own cfg resolution + accounting. */
+/* Ordered transport candidates for advisor -> ai-chat calls (2026-11-01
+   live lesson: the single binding + workers.dev-URL form failed silently
+   in production while direct calls worked). A service binding routes by
+   binding, not by host, so the bare service-host form avoids any public
+   workers.dev routing; the other forms are fallbacks. The first form that
+   produces a JSON reply wins; its channel tag is logged for diagnosis.
+   Every form carries the same secret header — ai-chat enforces it. */
+async function aiFetch(env, pathName, payload, secret) {
+  const forms = [];
+  const hasBinding = !!(env.AICHAT && typeof env.AICHAT.fetch === 'function');
+  if (hasBinding) {
+    forms.push({ ch: 'binding-svc', f: env.AICHAT.fetch.bind(env.AICHAT), url: 'https://ai-chat' + pathName });
+    forms.push({ ch: 'binding-dev', f: env.AICHAT.fetch.bind(env.AICHAT), url: 'https://ai-chat.erfanbillion.workers.dev' + pathName });
+  }
+  forms.push({ ch: 'fetch-dev', f: fetch, url: 'https://ai-chat.erfanbillion.workers.dev' + pathName });
+  let detail = null;
+  for (const form of forms) {
+    try {
+      const ctl = new AbortController();
+      const tm = setTimeout(function () { ctl.abort(); }, 30000);
+      const r = await form.f(form.url, {
+        method: 'POST', signal: ctl.signal,
+        headers: { 'Content-Type': 'application/json', Origin: 'https://real-estate-platform-0aei.onrender.com', 'X-Brief-Secret': String(secret) },
+        body: JSON.stringify(payload)
+      });
+      clearTimeout(tm);
+      const j = await r.json().catch(function () { return null; });
+      if (j && typeof j === 'object') return { r: r, j: j, ch: form.ch, binding: hasBinding };
+      detail = form.ch + ':non_json_' + (r && r.status);
+    } catch (e) { detail = form.ch + ':' + String((e && e.message) || e).slice(0, 50); }
+  }
+  return { error: 'ai_unavailable', ch: null, binding: hasBinding, detail: detail };
+}
 async function brainCall(env, opts) {
   opts = opts || {};
   const task = String(opts.task || 'chat').slice(0, 40);
@@ -3295,31 +3317,19 @@ async function brainCall(env, opts) {
   if (!cfg.secret) { await brainLog(env, { task: task, ok: false, error: 'ai_not_configured' }); return { ok: false, error: 'ai_not_configured' }; }
   const used = await brainUsage(env);
   if (used >= cfg.dailyCap) { await brainLog(env, { task: task, ok: false, error: 'brain_cap' }); return { ok: false, error: 'brain_cap', capped: true }; }
-  let j = null, httpOk = false;
-  try {
-    const ctl = new AbortController();
-    const tm = setTimeout(function () { ctl.abort(); }, 30000);
-    const fetcher = (env.AICHAT && typeof env.AICHAT.fetch === 'function') ? env.AICHAT.fetch.bind(env.AICHAT) : fetch;
-    const payload = { task: task, system: opts.system || '', maxTokens: opts.maxTokens || 800 };
-    if (opts.messages) payload.messages = opts.messages; else payload.prompt = opts.prompt || '';
-    const hints = brainPaidHints(cfg);
-    if (hints) payload.paid = hints;
-    const r = await fetcher('https://ai-chat.erfanbillion.workers.dev/internal/brain', {
-      method: 'POST', signal: ctl.signal, redirect: 'error',
-      headers: { 'Content-Type': 'application/json', Origin: 'https://real-estate-platform-0aei.onrender.com', 'X-Brief-Secret': String(cfg.secret) },
-      body: JSON.stringify(payload)
-    });
-    j = await r.json().catch(function () { return null; });
-    clearTimeout(tm);
-    httpOk = r.ok;
-  } catch (e) { j = null; }
-  if (!httpOk || !j || !j.ok || !j.text) {
+  const payload = { task: task, system: opts.system || '', maxTokens: opts.maxTokens || 800 };
+  if (opts.messages) payload.messages = opts.messages; else payload.prompt = opts.prompt || '';
+  const hints = brainPaidHints(cfg);
+  if (hints) payload.paid = hints;
+  const res = await aiFetch(env, '/internal/brain', payload, cfg.secret);
+  const j = res.j || null;
+  if (!res.r || !res.r.ok || !j || !j.ok || !j.text) {
     const err = (j && j.error) || 'ai_unavailable';
-    await brainLog(env, { task: task, ok: false, error: err });
+    await brainLog(env, { task: task, ok: false, error: err, ch: res.ch || '', detail: res.detail || '' });
     return { ok: false, error: err };
   }
   try { await env.LEADS.put('brain:usage:' + todayVancouver(), String(used + 1), { expirationTtl: 172800 }); } catch (e) {}
-  await brainLog(env, { task: task, via: j.via || '', ok: true });
+  await brainLog(env, { task: task, via: j.via || '', ok: true, ch: res.ch || '' });
   return { ok: true, text: String(j.text), via: j.via || '' };
 }
 function brainJson(text) {
@@ -5825,7 +5835,7 @@ async function handleRequest(request, env, ctx) {
         const used = await brainUsage(env);
         let log = [];
         try { log = (await env.LEADS.get('brain:log', { type: 'json' })) || []; } catch (e) {}
-        return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, log: log.slice(0, 10) }, 200, origin);
+        return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), binding: !!(env.AICHAT && typeof env.AICHAT.fetch === 'function'), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, log: log.slice(0, 10) }, 200, origin);
       }
       if (path === '/api/admin/brain/provision' && request.method === 'POST') {
         // One-shot: stores the shared secret into cfg:brain (merging
