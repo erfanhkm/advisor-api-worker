@@ -496,6 +496,71 @@ async function sha256hex(s) {
 function normIkey(v) { return cleanText(v, 300).replace(/\s+/g, ' ').trim().toLowerCase(); }
 function normPoolPhone(v) { const s = String(v || '').replace(/[^0-9+]/g, ''); return ((s.charAt(0) === '+' ? '+' : '') + s.replace(/\+/g, '')).slice(0, 20); }
 function postedMs(v) { const s = String(v || '').trim(); if (!s) return null; const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00Z' : s); return isFinite(t) ? t : null; }
+// Pack F (RDR-02 H6): pool identity is canonicalised HERE, from raw
+// fields the agent sends — a model following prose rules cannot apply
+// normalisation or hashing identically each run, and a fabricated
+// photo hash is worse than none. Addressed posts key on the canonical
+// address + unit; address-less posts key on the platform's own post
+// id (v2|<source>:<postId>) so two buyers with the same title words
+// no longer collapse into one record (prefer a false split over a
+// false merge — a collision costs a lead). Phone and photo are
+// attributes for match-time linking, never key parts (signed photo
+// URLs change every scan). The agent-supplied v1 identityKey remains
+// only as the fallback for posts with neither an address nor a post
+// id; the hash scheme itself (sha256 of side + '|' + key, Pack E M2)
+// is unchanged, and the pool has never run live, so no keys migrate.
+const STREET_ABBR = { st: 'street', ave: 'avenue', av: 'avenue', rd: 'road', dr: 'drive', blvd: 'boulevard', hwy: 'highway', cres: 'crescent', ct: 'court', pl: 'place', ln: 'lane', ter: 'terrace' };
+function canonAddressParts(raw) {
+  let s = ' ' + String(raw == null ? '' : raw).toLowerCase() + ' ';
+  let unit = '';
+  s = s.replace(/(#|\bapt\.?\b|\bapartment\b|\bunit\b|\bste\.?\b|\bsuite\b)\s*([a-z0-9]{1,8})\b/, function (m, d, u) { unit = u; return ' '; }); // word-bounded designators: "Steveston" must not lose its "ste"
+  s = s.replace(/[a-z]\d[a-z][ -]?\d[a-z]\d/g, ' '); // postal code dropped
+  s = s.replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return { addr: '', unit: unit };
+  return { addr: s.split(' ').map(function (t) { return STREET_ABBR[t] || t; }).join(' ').slice(0, 160), unit: unit };
+}
+function poolKeyFor(it) {
+  const addrIn = cleanText(it && it.address, 200);
+  if (addrIn) {
+    const parts = canonAddressParts(addrIn);
+    const unitIn = cleanText(it.unit, 20).toLowerCase().replace(/[^a-z0-9-]/g, '');
+    if (parts.addr) return 'v2|a|' + parts.addr + '|' + (unitIn || parts.unit);
+  }
+  const pid = cleanText(it && it.postId, 80).toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  const src = cleanText(it && it.source, 40).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  if (pid && src) return 'v2|' + src + ':' + pid;
+  return normIkey(it && it.identityKey);
+}
+// Pack F (RDR-02 M5): motivation is computed by the WORKER from facts
+// it holds — the old agent-claimed score was gameable from hostile
+// post text (wholesaler "motivated seller" copy, "estate sale"
+// contents sales, cross-posting as marketing). The agent may only
+// contribute language-signal CODES from this validated allowlist
+// (distress-specific terms; 'motivated seller', 'estate sale',
+// 'vacant' and 'price reduced' are deliberately NOT codes — marketing
+// copy, ambiguity, and double-counting the price trail). Cross-source
+// presence is stored (sources[]) but no longer scored.
+const MOTIVATION_CODES = { must_sell: 'must sell', relocating: 'relocating', divorce: 'divorce', foreclosure: 'foreclosure', power_of_sale: 'power of sale', leaving_country: 'leaving the country', obo: 'OBO', bring_offers: 'bring offers' };
+function motivationCodesIn(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const c of v) { const k = String(c || '').toLowerCase().replace(/[^a-z_]/g, ''); if (MOTIVATION_CODES[k] && out.indexOf(k) === -1) out.push(k); if (out.length >= 5) break; }
+  return out;
+}
+function computeMotivation(f) {
+  let days = null, basis = null;
+  if (f.postedMs !== null && f.postedMs !== undefined && isFinite(f.postedMs)) { days = Math.max(0, Math.floor((f.nowMs - f.postedMs) / 86400000)); basis = 'listed'; }
+  else if (f.firstSeenMs) { days = Math.max(0, Math.floor((f.nowMs - f.firstSeenMs) / 86400000)); basis = 'pooled'; }
+  let score = 0; const signals = [];
+  if (days !== null) { if (days >= 14) score += 25; else if (days >= 7) score += 15; else if (days >= 3) score += 8; if (days >= 3) signals.push(days + ' days ' + basis); }
+  const cuts = f.priceCuts || 0;
+  if (cuts > 0) { score += Math.min(3, cuts) * 12; signals.push(cuts + (cuts === 1 ? ' price cut' : ' price cuts')); }
+  if ((f.relistCount || 0) >= 1) { score += 10; signals.push('relisted ×' + f.relistCount); }
+  const codes = f.codes || [];
+  score += Math.min(3, codes.length) * 8; // language channel capped at +24 (the shipped rubric's max)
+  codes.forEach(function (c) { signals.push("'" + (MOTIVATION_CODES[c] || c) + "' in post"); });
+  return { score: Math.min(100, score), signals: signals.slice(0, 5), facts: { days: days, daysBasis: basis, priceCuts: cuts, relistCount: f.relistCount || 0, codes: codes } };
+}
 async function radarEnabled(env) { try { const s = await env.LEADS.get('radar:settings', { type: 'json' }); return !!(s && s.enabled === true); } catch (e) { return false; } }
 function timingSafeEqual(a, b) {
   a = String(a == null ? '' : a);
@@ -5671,7 +5736,7 @@ async function handleRequest(request, env, ctx) {
           // re-checked SERVER-side. A buggy or injected agent can no
           // longer pair items never pooled, same-side items, or stale
           // entries. Rejections are counted, never stored.
-          let pairIds = null;
+          let pairIds = null, pairMot = null, pairMotSignals = null;
           if (kind === 'pair') {
             const did = String(it.demandId || ''), sid = String(it.supplyId || '');
             let okPair = /^[0-9a-f]{64}$/.test(did) && /^[0-9a-f]{64}$/.test(sid) && did !== sid;
@@ -5690,6 +5755,12 @@ async function handleRequest(request, env, ctx) {
             }
             if (!okPair) { skipped++; rejected++; continue; }
             pairIds = { demandId: did, supplyId: sid };
+            // Pack F (RDR-02 M5): a pair's motivation is the SUPPLY
+            // record's worker-computed score — the agent's claim on
+            // the lead is ignored, so pool and pair can never diverge
+            // and hostile post text can't inflate the hot-pair rule.
+            pairMot = (srec && typeof srec.motivation === 'number') ? srec.motivation : null;
+            pairMotSignals = (srec && Array.isArray(srec.motivationSignals)) ? srec.motivationSignals.slice(0, 5) : [];
           }
           const conf = Math.max(0, Math.min(100, parseInt(it.confidence, 10) || 0));
           const cleanMatch = function (m) {
@@ -5728,8 +5799,8 @@ async function handleRequest(request, env, ctx) {
             marketNote: cleanText(it.marketNote, 300),
             priceNum: priceNum,
             confidence: conf,
-            motivation: (typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : null,
-            motivationSignals: Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 80); }).filter(Boolean).slice(0, 5) : [],
+            motivation: pairIds ? pairMot : ((typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : null), // Pack F: pairs inherit the supply record's computed score; unpaired leads keep the legacy clamped claim
+            motivationSignals: pairIds ? pairMotSignals : (Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 80); }).filter(Boolean).slice(0, 5) : []),
             risk: cleanText(it.risk, 300),
             presale: (it.presale && typeof it.presale === 'object') ? {
               project: cleanText(it.presale.project, 80), developer: cleanText(it.presale.developer, 80),
@@ -5795,8 +5866,15 @@ async function handleRequest(request, env, ctx) {
           const pn = (typeof it.priceNum === 'number' && isFinite(it.priceNum) && it.priceNum > 0) ? Math.round(it.priceNum) : null;
           const seenKey = 'seen:' + (await sha256hex(u));
           let keepPn = pn;
-          if (keepPn === null) { const prev = await env.LEADS.get(seenKey, { type: 'json' }); if (prev && typeof prev.priceNum === 'number') keepPn = prev.priceNum; } // an unparsed re-post must not erase the price baseline (cycle 28, Claude M10)
-          await env.LEADS.put(seenKey, JSON.stringify({ url: u, priceNum: keepPn, at: new Date().toISOString() }), { expiration: nowS2 + 61 * 86400 });
+          let keepReason = cleanText(it.reason, 40);
+          const prevSeen = await env.LEADS.get(seenKey, { type: 'json' });
+          if (keepPn === null && prevSeen && typeof prevSeen.priceNum === 'number') keepPn = prevSeen.priceNum; // an unparsed re-post must not erase the price baseline (cycle 28, Claude M10)
+          if (!keepReason && prevSeen && prevSeen.reason) keepReason = String(prevSeen.reason).slice(0, 40);
+          // Pack F (RDR-02 M8): a "reviewed, not stored" judgment
+          // expires after ~14 days (was 61) — a post misjudged from
+          // hostile text gets re-evaluated instead of being skipped
+          // forever; the reason rides along for the audit sample.
+          await env.LEADS.put(seenKey, JSON.stringify({ url: u, priceNum: keepPn, reason: keepReason, at: new Date().toISOString() }), { expiration: nowS2 + 14 * 86400 });
           saved++;
         }
         return json({ ok: true, saved: saved, dropped: Math.max(0, d.items.length - 100) }, 200, origin);
@@ -5819,6 +5897,7 @@ async function handleRequest(request, env, ctx) {
         if (!d || !Array.isArray(d.items)) return json({ ok: false, error: 'validation' }, 400, origin);
         const items = d.items.slice(0, 60);
         let added = 0, updated = 0, skipped = 0, unchanged = 0, relistedN = 0, processed = 0;
+        const idsOut = []; // Pack F (RDR-02 H6): record id per processed item (null = skipped) so the agent pairs from exact ids, never from re-derived keys
         let ops = 0; // Pack E (RDR-01 H2): ~40-op request budget; `processed` is the caller's resume index
         const nowMs = Date.now();
         const nowIso = new Date(nowMs).toISOString();
@@ -5827,15 +5906,17 @@ async function handleRequest(request, env, ctx) {
           if (ops >= 40) break;
           processed = ix + 1;
           const it = items[ix];
+          let curId = null;
           try {
             if (!it || typeof it !== 'object') { skipped++; continue; }
-            const ikey = normIkey(it.identityKey); // Pack E (RDR-01 M2): normalise BEFORE hashing
+            const ikey = poolKeyFor(it); // Pack F (RDR-02 H6): the worker canonicalises raw identity fields (Pack E normIkey remains the fallback path)
             const side = String(it.side || '').toLowerCase();
             const url = safeUrl(it.url, 600);
             if (!ikey || (side !== 'demand' && side !== 'supply') || !url) { skipped++; continue; }
             let kind = ['demand', 'supply', 'assignment'].indexOf(String(it.kind || '').toLowerCase()) !== -1 ? String(it.kind).toLowerCase() : side;
             if (kind !== side && !(kind === 'assignment' && side === 'supply')) { skipped++; continue; } // kind↔side validation (M2): assignment is supply-only, demand kind is demand-side only
             const key = 'mpool:' + (await sha256hex(side + '|' + ikey)); // M2: the hash carries the side — demand and supply posts sharing an identity no longer clobber each other (pool never ran live: no migration)
+            curId = key.slice(6);
             const xkey = 'mpoolx:' + key.slice(6);
             ops++;
             const prev = await env.LEADS.get(key, { type: 'json' });
@@ -5855,8 +5936,24 @@ async function handleRequest(request, env, ctx) {
             const postedStr = pick(cleanText(it.posted_at, 60), prev && prev.posted_at);
             const phoneIn = cleanText(it.phone, 40);
             const phone = phoneIn ? normPoolPhone(phoneIn) : ((prev && prev.phone) || ''); // L4: digits/+ only
-            const motivation = (typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : (prev && typeof prev.motivation === 'number' ? prev.motivation : null);
-            const motivationSignals = Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 60); }).filter(Boolean).slice(0, 5) : ((prev && prev.motivationSignals) || []);
+            // Pack F (RDR-02 M5): the agent's numeric motivation claim
+            // and its free-text signals are NO LONGER stored — the
+            // score is computed below from worker-held facts; the agent
+            // contributes only validated language-signal codes (kept
+            // from the previous record when a re-ingest omits them).
+            const codesIn = motivationCodesIn(it.motivationCodes);
+            const motCodes = codesIn.length ? codesIn : ((prev && prev.motivationFacts && Array.isArray(prev.motivationFacts.codes)) ? prev.motivationFacts.codes : []);
+            // Pack F (RDR-02 H6): cross-source presence is a stored
+            // fact (anti-scam cross-checks), maintained here.
+            const sources = (prev && Array.isArray(prev.sources)) ? prev.sources.slice(0) : [];
+            if (source && sources.indexOf(source) === -1) sources.push(source);
+            const sourcesCapped = sources.slice(-10);
+            // Photo URL is a match-time linking attribute (H6): query
+            // string stripped (signed URLs change every scan), never
+            // part of the identity key.
+            let photoUrl = (prev && prev.photoUrl) || '';
+            const photoIn = cleanText(it.photoUrl, 600);
+            if (photoIn) { const pq = photoIn.split('?')[0]; if (safeUrl(pq, 600)) photoUrl = pq; }
             // Pack E (RDR-01 M5): price plausibility gate — a candidate
             // outside 10k–1e9, or outside 0.4×–2.5× of the last price,
             // is a scrape typo: keep the previous price, flag 'jump',
@@ -5919,12 +6016,20 @@ async function handleRequest(request, env, ctx) {
             // Pack E (RDR-01 H2): seenCount = DAYS seen, not sightings.
             const prevDay = (prev && prev.lastSeen) ? String(prev.lastSeen).slice(0, 10) : '';
             const seenCount = prev ? ((prev.seenCount || 1) + (prevDay !== todayDay ? 1 : 0)) : 1;
+            // Pack F (RDR-02 M5): worker-computed motivation (supply
+            // records only — the rubric scores SELLER motivation).
+            const firstSeenMs = prev && prev.firstSeen ? (Date.parse(prev.firstSeen) || null) : nowMs;
+            const motC = side === 'supply' ? computeMotivation({ postedMs: pMs, firstSeenMs: firstSeenMs, priceCuts: priceCuts, relistCount: relistCount, codes: motCodes, nowMs: nowMs }) : null;
+            const motivation = motC ? motC.score : null;
+            const motivationSignals = motC ? motC.signals : [];
+            const motivationFacts = motC ? motC.facts : null;
             // H2: an unchanged sighting <24h old writes NOTHING.
             const changed = !prev || priceNum !== prev.priceNum || priceFlag !== ((prev && prev.priceFlag) || null) ||
               title !== (prev.title || '') || area !== (prev.area || '') || region !== (prev.region || '') || summary !== (prev.summary || '') ||
               phone !== (prev.phone || '') || beds !== (prev.beds || '') || ptype !== (prev.type || '') || postedStr !== (prev.posted_at || '') ||
               motivation !== (prev.motivation !== undefined ? prev.motivation : null) || kind !== prev.kind || url !== prev.url || relistBump ||
-              JSON.stringify(motivationSignals) !== JSON.stringify(prev.motivationSignals || []);
+              JSON.stringify(motivationSignals) !== JSON.stringify(prev.motivationSignals || []) ||
+              JSON.stringify(sourcesCapped) !== JSON.stringify((prev && prev.sources) || []) || photoUrl !== ((prev && prev.photoUrl) || '');
             const prevSeenMs = prev ? Date.parse(prev.lastSeen || '') : NaN;
             if (prev && !changed && isFinite(prevSeenMs) && (nowMs - prevSeenMs) < 86400000) { unchanged++; continue; }
             const rec = {
@@ -5933,7 +6038,8 @@ async function handleRequest(request, env, ctx) {
               url: url, price: priceStr, priceNum: priceNum, priceFlag: priceFlag,
               priceHistory: hist, priceCuts: priceCuts,
               relistCount: relistCount, relisted: relisted,
-              motivation: motivation, motivationSignals: motivationSignals,
+              motivation: motivation, motivationSignals: motivationSignals, motivationFacts: motivationFacts,
+              sources: sourcesCapped, photoUrl: photoUrl,
               beds: beds, type: ptype, phone: phone, summary: summary, posted_at: postedStr,
               firstSeen: (prev && prev.firstSeen) || nowIso,
               lastSeen: nowIso,
@@ -5955,8 +6061,9 @@ async function handleRequest(request, env, ctx) {
             if (wantTomb) { ops++; try { await env.LEADS.put(xkey, JSON.stringify({ relistCount: relistCount, lastSeen: nowIso, lastPrice: priceNum, priceCuts: priceCuts, tombAt: nowIso }), { expirationTtl: 15552000 }); } catch (e) {} }
             if (prev) updated++; else added++;
           } catch (e) { skipped++; } // Pack E (RDR-01 H2/L3): per-item isolation — one bad item never 500s the batch after partial writes
+          finally { idsOut.push(curId); }
         }
-        return json({ ok: true, added: added, updated: updated, skipped: skipped, unchanged: unchanged, relisted: relistedN, processed: processed, partial: processed < items.length, dropped: Math.max(0, d.items.length - 60) }, 200, origin);
+        return json({ ok: true, added: added, updated: updated, skipped: skipped, unchanged: unchanged, relisted: relistedN, processed: processed, partial: processed < items.length, dropped: Math.max(0, d.items.length - 60), ids: idsOut }, 200, origin);
       }
       if (path === '/api/market-pool' && request.method === 'GET') {
         // Pack E (RDR-01 H1): paged METADATA listing — the old handler
@@ -6052,28 +6159,64 @@ async function handleRequest(request, env, ctx) {
           cell.tier = (c.tier === 'deep' || c.tier === 'delta') ? c.tier : (prev.tier || 'delta');
           const repIn = (typeof c.reported === 'number' && isFinite(c.reported) && c.reported >= 0) ? Math.min(100000, Math.round(c.reported)) : null; // values capped (M9)
           const fetIn = (typeof c.fetched === 'number' && isFinite(c.fetched) && c.fetched >= 0) ? Math.min(100000, Math.round(c.fetched)) : null;
+          const stoIn = (typeof c.stored === 'number' && isFinite(c.stored) && c.stored >= 0) ? Math.min(100000, Math.round(c.stored)) : null;
           if (repIn !== null) cell.reported = repIn;
           if (fetIn !== null) cell.fetched = fetIn;
-          if (c.ok === true) {
+          if (stoIn !== null) cell.stored = stoIn;
+          // Pack F (RDR-02 H4/H5): the agent sends counts, the WORKER
+          // decides the verdict. countBasis says what `reported`
+          // means; a 'none'-basis cell (Facebook/Reddit/Karrot/
+          // Vansky/YorkBBS — no platform total, no usable feed) can
+          // NEVER be proven covered: it records a scan (lastScanAt)
+          // but never advances lastOkAt or the watermark. A claimed ok
+          // is proven only when basis + all three counts are present
+          // and fetched >= reported and stored >= fetched with no
+          // errors — self-attested ok:true alone proves nothing.
+          const basisRaw = String(c.countBasis || '').toLowerCase();
+          const basis = (basisRaw === 'platform' || basisRaw === 'feed' || basisRaw === 'sitemap') ? basisRaw : 'none';
+          cell.countBasis = basis;
+          cell.lastScanAt = nowIso;
+          const hasErrors = c.errors === true || (typeof c.errors === 'string' && c.errors.trim().length > 0) || (Array.isArray(c.errors) && c.errors.length > 0);
+          let verdict, vReason = null;
+          // Precedence: a count-less ok claim is unproven on its face
+          // (counts_missing) BEFORE the basis question — a 'none'-basis
+          // cell that DID send complete counts is 'unverifiable'
+          // (scanned, unprovable), but a claim with no counts at all
+          // proves nothing about any basis and stays debt.
+          if (c.ok !== true) { verdict = 'debt'; vReason = 'reported_failed'; }
+          else if (repIn === null || fetIn === null || stoIn === null) { verdict = 'short'; vReason = 'counts_missing'; }
+          else if (basis === 'none') verdict = 'unverifiable';
+          else if (hasErrors) { verdict = 'short'; vReason = 'errors_reported'; }
+          else if (fetIn < repIn) { verdict = 'short'; vReason = 'short_fetch'; } // Pack E M9's rule, kept inside the verdict
+          else if (stoIn < fetIn) { verdict = 'short'; vReason = 'short_stored'; }
+          else verdict = 'ok';
+          cell.verdict = verdict;
+          // Watermark validation runs on ANY ok claim (Pack E M9: a
+          // bad watermark is rejected + flagged) — but the frontier
+          // only ADVANCES on a proven 'ok' verdict.
+          let wmValid = null;
+          if (c.ok === true && typeof c.watermark === 'string' && c.watermark) {
+            const wmClean = cleanText(c.watermark, 80);
+            const wmT = Date.parse(wmClean);
+            const wmOk = isFinite(wmT) ? (wmT <= nowMs + 5 * 60000) : /^[A-Za-z0-9:._-]{1,80}$/.test(wmClean);
+            if (wmOk) wmValid = wmClean;
+            else { cell.watermarkRejected = true; flagged++; }
+          }
+          if (verdict === 'ok') {
             cell.lastOkAt = nowIso;
-            // Pack E (RDR-01 M9): a short fetch IN THIS REPORT
-            // (fetched < reported) is NOT coverage — the cell stays
-            // in debt, with a reason. A report carrying no counts
-            // makes no short-fetch claim either way.
-            if (repIn !== null && fetIn !== null && fetIn < repIn) { cell.debt = true; cell.debtReason = 'short_fetch'; }
-            else { cell.debt = false; delete cell.debtReason; }
-            if (typeof c.watermark === 'string' && c.watermark) {
-              // Watermark must parse (a date ≤ now+5min, or a safe
-              // token) — a far-future watermark would make the agent
-              // silently skip everything newer (a coverage hole).
-              const wmClean = cleanText(c.watermark, 80);
-              const wmT = Date.parse(wmClean);
-              const wmOk = isFinite(wmT) ? (wmT <= nowMs + 5 * 60000) : /^[A-Za-z0-9:._-]{1,80}$/.test(wmClean);
-              if (wmOk) { cell.watermark = wmClean; delete cell.watermarkRejected; }
-              else { cell.watermarkRejected = true; flagged++; }
-            }
+            if (cell.tier === 'deep') cell.lastDeepOkAt = nowIso; // Pack F (RDR-02 H3): deep cadence tracked separately — healthy deltas no longer mask a missing deep pass
+            cell.debt = false; delete cell.debtReason;
+            cell.failStreak = 0;
+            if (wmValid !== null) { cell.watermark = wmValid; delete cell.watermarkRejected; }
+            // Pack F (RDR-02 H2): the delta frontier (newest items
+            // at this proven pass) — the next delta is "caught up"
+            // only when it reaches one of these.
+            if (Array.isArray(c.frontier)) cell.frontier = c.frontier.map(function (f) { return cleanText(f, 120); }).filter(Boolean).slice(0, 20);
+          } else if (verdict === 'unverifiable') {
+            cell.debt = false; delete cell.debtReason; // scanned but unprovable: not debt, never "covered" — lastOkAt/watermark untouched so staleness stays visible
           } else {
-            cell.debt = true; cell.debtReason = 'reported_failed'; // watermark + lastOkAt untouched: the cell still owes coverage
+            cell.debt = true; cell.debtReason = vReason; // watermark + lastOkAt untouched: the cell still owes coverage
+            cell.failStreak = (typeof prev.failStreak === 'number' ? prev.failStreak : 0) + 1; // Pack F (RDR-02 M6): consecutive-failure tracking feeds the protocol's chronic-cell rule
           }
           cell.updatedAt = nowIso;
           doc.cells[ck] = cell;
@@ -6163,7 +6306,9 @@ async function handleRequest(request, env, ctx) {
           // threshold: delta 36h / deep 240h) and folds it into
           // debtCount.
           const stale = ageH === null || ageH > (c.tier === 'deep' ? 240 : 36);
-          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null };
+          const deepMs = c.lastDeepOkAt ? Date.parse(c.lastDeepOkAt) : NaN;
+          const deepAgeH = isFinite(deepMs) ? Math.max(0, Math.round((nowMs - deepMs) / 360000) / 10) : null;
+          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null, verdict: c.verdict || null, countBasis: c.countBasis || null, stored: (typeof c.stored === 'number' ? c.stored : null), lastDeepOkAt: c.lastDeepOkAt || null, deepAgeHours: deepAgeH, lastScanAt: c.lastScanAt || null, failStreak: (typeof c.failStreak === 'number' ? c.failStreak : 0) }; // Pack F (RDR-02 H3/H4/H5/M6): worker verdict + basis + stored + deep cadence + scan recency + failure streak
         }).sort(function (a, b) { return ((b.debt ? 1 : 0) - (a.debt ? 1 : 0)) || String(a.key).localeCompare(String(b.key)); });
         // RDR-01 L2 (cheap version): the pool count is isolate-cached
         // instead of a 2000-key list on every portal load.
