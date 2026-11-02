@@ -1209,10 +1209,10 @@ function prSlimParcel(r) {
   };
 }
 async function prCovParcels(env, postal) {
-  const key = 'prcov:' + postal;
+  const key = 'prcov2:' + postal; // v2: order_by-stable pagination (Pack G live fix, 2026-11-02)
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.rows)) return hit;
-  const f = await prOdsFetch('property-tax-report', 'property_postal_code="' + postal + '" and report_year="' + PR_TAX_YEAR + '"', 20);
+  const f = await prOdsFetch('property-tax-report', 'property_postal_code="' + postal + '" and report_year="' + PR_TAX_YEAR + '"', 20, 'pid');
   if (f.status !== 'ok') return f;
   const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated };
   if (!f.partial) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} }
@@ -1222,11 +1222,11 @@ async function prCovParcelsByCivic(env, streetKey, civic) {
   // primary parcel lookup (PR-01 M3): street + civic, server-side
   // equality on the civic fields; the postal-code set is only a
   // narrowing/range catch, never a hard requirement.
-  const key = 'prcovc:' + streetKey + '|' + civic.raw;
+  const key = 'prcovc2:' + streetKey + '|' + civic.raw; // v2: order_by-stable pagination (Pack G live fix, 2026-11-02)
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.rows)) return hit;
   const where = 'street_name="' + streetKey + '" and report_year="' + PR_TAX_YEAR + '" and (to_civic_number="' + civic.raw + '" or from_civic_number="' + civic.raw + '")';
-  const f = await prOdsFetch('property-tax-report', where, 20);
+  const f = await prOdsFetch('property-tax-report', where, 20, 'pid');
   if (f.status !== 'ok') return f;
   const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated };
   if (!f.partial) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} }
@@ -1273,23 +1273,30 @@ function prPermitStreet(streetKey) {
   if (TYPE[last]) toks[toks.length - 1] = TYPE[last];
   return ((dir ? dir + ' ' : '') + toks.join(' ')).trim();
 }
-async function prCovPermits(env, civicNum, streetKey, postcode) {
+async function prCovPermits(env, civicNum, streetKey, postcodes) {
   // permits are queried ONLY for a matched parcel, by that parcel's
   // street (PR-01 H1) — never by the visitor's first street word.
   const pStreet = prPermitStreet(streetKey);
   if (!pStreet) return { permits: [], status: 'not_found' };
-  const key = 'prperm:' + civicNum + ':' + (await sha256hex(pStreet + '|' + (postcode || ''))); // delimited + hashed, incl. postcode (H1)
+  /* Acceptable postcodes = the MATCHED parcels' own property_postal_code
+     values (the building's authoritative codes). The geocoder's postcode
+     is only a fallback: live check 2026-11-02 (1665 W Broadway) — the
+     geocoder said V6J 1X6 while every permit for the building carries
+     V6J 1X1, its tax-record code; filtering on the geocoder's code
+     dropped all 14 real permits. */
+  const pcList = [...new Set((Array.isArray(postcodes) ? postcodes : [postcodes]).map(prNormPostal).filter(Boolean))];
+  const key = 'prperm:' + civicNum + ':' + (await sha256hex(pStreet + '|' + pcList.join(','))); // delimited + hashed, incl. postcode set (H1)
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.permits)) return hit;
   const f = await prOdsFetch('issued-building-permits', 'address like "' + civicNum + ' ' + pStreet + '%"', 1, 'permitnumbercreateddate desc');
   if (f.status !== 'ok') return { permits: [], status: 'unavailable' };
   let rows = f.rows || [];
-  /* a permit address that CARRIES a postal code must carry the matched
-     building's; addresses without one are kept (live data shows the
-     code is often absent) — the old filter dropped those wholesale */
-  if (postcode) rows = rows.filter(r => {
+  /* a permit address that CARRIES a postal code must carry one of the
+     matched building's; addresses without one are kept (live data shows
+     the code is often absent) — the old filter dropped those wholesale */
+  if (pcList.length) rows = rows.filter(r => {
     const m = String(r.address || '').toUpperCase().match(/[A-Z]\d[A-Z] ?\d[A-Z]\d/);
-    return !m || prNormPostal(m[0]) === postcode;
+    return !m || pcList.indexOf(prNormPostal(m[0])) !== -1;
   });
   const out = {
     permits: rows.slice(0, 5).map(r => ({
@@ -4973,7 +4980,9 @@ async function handleRequest(request, env, ctx) {
           }
           if (card) { // permits only ever describe a MATCHED parcel (H1)
             try {
-              const pm = await prCovPermits(env, parsed.civic.num, streetKey, geo.postcode);
+              const matchedRows = card.kind === 'strata' ? m.strata : m.land;
+              const pcSet = [...new Set(matchedRows.map(p => prNormPostal(p.property_postal_code)).filter(Boolean))];
+              const pm = await prCovPermits(env, parsed.civic.num, streetKey, pcSet.length ? pcSet : geo.postcode);
               permits = pm.permits || [];
               permitsStatus = pm.status === 'ok' ? (permits.length ? 'ok' : 'not_found') : 'unavailable';
             } catch (e) { permits = []; permitsStatus = 'unavailable'; }
