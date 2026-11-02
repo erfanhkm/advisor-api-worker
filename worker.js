@@ -29,9 +29,15 @@
 //                                          Bank of Canada Valet API via a 24h KV cache; on upstream
 //                                          failure the last cache is served flagged stale, else an
 //                                          explicit 'unavailable' state — never a silent stale number)
-//   PUT  /api/admin/market-stats {month entry} -> {ok, month, months} (auth — appends/replaces one
-//                                          month of board statistics; figures without source/date
-//                                          are rejected)
+//   PUT  /api/admin/market-stats {month entry} -> {ok, month, months, rev, merged, dropped} (auth —
+//                                          appends one month of board statistics, merging at block
+//                                          level unless ?replace=1; allowlist-validated: a figure
+//                                          without source/date, an unknown field or an implausible
+//                                          value is rejected; ?rev= optimistic concurrency; a >15%
+//                                          headline-price jump needs ?confirm=1)
+//   DELETE /api/admin/market-stats?month=YYYY-MM -> {ok, month, months, rev} (auth — removes one
+//                                          month; the pre-write document is kept at
+//                                          market:stats:bak:<rev> before every overwrite)
 //   PATCH /api/user/searches/:id {notify} -> {ok, search}       (visitor — alerts on/off for a saved search)
 //   GET  /api/admin/perf                -> {ok, startedAt, listings, sources, dropped} (auth — aggregate
 //                                          counters; ok:false + stale when the counters are unreadable)
@@ -3447,7 +3453,7 @@ async function puToday(env) {
     return { lastRun: last, unsentAlerts: unsentAlerts };
   });
   await seg('marketPulse', async function () {
-    const ds = await mpReadStats(env);
+    const ds = await mpReadStatsSafe(env);
     const months = (ds && ds.months) || [];
     const cur = months[0] || null, prev = months[1] || null;
     const delta = function (block, field) {
@@ -4069,7 +4075,7 @@ async function brainFollowupDrafts(env) {
    brain:brief:latest and appended to the attention feed. */
 async function brainMarketBrief(env, opts) {
   opts = opts || {};
-  const ds = await mpReadStats(env);
+  const ds = await mpReadStatsSafe(env);
   const months = (ds && ds.months) || [];
   const cur = months[0] || null, prev = months[1] || null;
   if (!cur) return { ok: false, error: 'no_stats' };
@@ -4573,7 +4579,7 @@ async function brainComputePredictions(env) {
     if (risk === 'high') topStale.push({ mls: h.mls, street: h.street || '', city: h.city || '' });
   }
   // neighbourhood momentum from stored market stats deltas
-  const dsP = await mpReadStats(env);
+  const dsP = await mpReadStatsSafe(env);
   const monthsP = (dsP && dsP.months) || [];
   const hoods = [];
   if (monthsP[0] && monthsP[1]) {
@@ -4663,6 +4669,12 @@ async function brainVoiceProposal(env, transcript, leadId) {
 const MP_SERIES = { policy: 'V39079', prime: 'V80691311', bond5: 'BD.CDN.5YR.DQ.YLD' };
 const MP_RATES_TTL_MS = 24 * 3600 * 1000;
 
+/* Pack I (MP-01 M3): per-series freshness caps in days. The policy
+   rate is daily and the hub cannot do without it; prime is a WEEKLY
+   series that lags announcements by design (see the build record), so
+   its cap is looser; the 5y bond is daily. */
+const MP_SERIES_MAX_AGE = { policy: 10, prime: 21, bond5: 10 };
+
 async function mpFetchValet() {
   const start = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
   const u = 'https://www.bankofcanada.ca/valet/observations/' +
@@ -4672,98 +4684,268 @@ async function mpFetchValet() {
   if (!r.ok) throw new Error('valet http ' + r.status);
   const d = await r.json();
   const obs = (d && Array.isArray(d.observations)) ? d.observations : [];
-  function lastOf(series) {
-    for (let i = obs.length - 1; i >= 0; i--) {
-      const cell = obs[i][series];
-      const v = cell ? parseFloat(cell.v) : NaN;
-      if (isFinite(v)) return { value: v, date: obs[i].d, series: series };
-    }
-    return null;
+  // Pack I (MP-01 L2): strict numeric parse — parseFloat accepted
+  // "5.25abc" and Number("") is 0 — plus a sane rate range, and the
+  // newest observation is picked by DATE, not by array order.
+  function parseV(v) {
+    const s = String(v == null ? '' : v).trim();
+    if (!/^-?\d+(\.\d+)?$/.test(s)) return NaN;
+    const n = Number(s);
+    return (n >= 0 && n <= 25) ? n : NaN;
   }
+  function lastOf(series) {
+    let best = null;
+    for (const o of obs) {
+      const cell = o[series];
+      const v = cell ? parseV(cell.v) : NaN;
+      const t = Date.parse(o.d);
+      if (isFinite(v) && isFinite(t) && (!best || t > best.t)) best = { value: v, date: o.d, series: series, t: t };
+    }
+    return best;
+  }
+  const now = Date.now();
+  const ageDays = function (o) { return o ? (now - o.t) / 86400000 : Infinity; };
   const policy = lastOf(MP_SERIES.policy), prime = lastOf(MP_SERIES.prime), bond5 = lastOf(MP_SERIES.bond5);
-  if (!policy || !prime || !bond5) throw new Error('valet incomplete');
-  const cutoff = Date.now() - 366 * 86400000;
-  const policySeries = [];
+  // Pack I (MP-01 M3): a missing or over-age POLICY series fails the
+  // whole fetch (the caller falls back to cache/unavailable). Prime
+  // and the bond degrade individually to null + a `missing` entry
+  // instead of taking all three rates down — or worse, being served
+  // silently ancient with stale:false.
+  if (!policy || ageDays(policy) > MP_SERIES_MAX_AGE.policy) throw new Error('valet policy missing/stale');
+  const missing = [];
+  const primeOk = !!prime && ageDays(prime) <= MP_SERIES_MAX_AGE.prime;
+  const bondOk = !!bond5 && ageDays(bond5) <= MP_SERIES_MAX_AGE.bond5;
+  if (!primeOk) missing.push('prime');
+  if (!bondOk) missing.push('bond5');
+  const strip = function (o) { return o ? { value: o.value, date: o.date, series: o.series } : null; };
+  const cutoff = now - 366 * 86400000;
+  const policyObs = [];
   for (const o of obs) {
     const cell = o[MP_SERIES.policy];
-    const v = cell ? parseFloat(cell.v) : NaN;
-    if (isFinite(v) && Date.parse(o.d) >= cutoff) policySeries.push([o.d, v]);
+    const v = cell ? parseV(cell.v) : NaN;
+    const t = Date.parse(o.d);
+    if (isFinite(v) && isFinite(t) && t >= cutoff) policyObs.push([o.d, v, t]);
   }
+  policyObs.sort(function (a, b) { return a[2] - b[2]; });
+  const policySeries = policyObs.map(function (p) { return [p[0], p[1]]; });
   if (!policySeries.length) throw new Error('valet empty series');
-  return { policy: policy, prime: prime, bond5: bond5, policySeries: policySeries };
+  return { policy: strip(policy), prime: primeOk ? strip(prime) : null, bond5: bondOk ? strip(bond5) : null, policySeries: policySeries, missing: missing };
 }
 
+/* Pack I (MP-01 M3/M4/L1): cache entries are shape-checked before
+   they are served (a future fetchedAt used to read as "fresh" — L1);
+   a stale cache older than 7 days is NOT served (M3) — the endpoint
+   answers unavailable rather than presenting a weeks-old rate. The
+   Valet fetch is single-flighted behind a 5-minute failure backoff,
+   and the last fresh payload is kept in module memory for 10 minutes
+   so a failed KV put cannot turn every request into an upstream
+   call (M4). */
+const MP_RATES_MAX_STALE_MS = 7 * 86400000;
+const MP_FAIL_BACKOFF_MS = 5 * 60000;
+const MP_MEM_TTL_MS = 10 * 60000;
+let mpInflight = null, mpFailUntil = 0, mpMem = null, mpMemAt = 0;
+
+function mpSeriesShapeOk(s, nullable) {
+  if (s === null) return !!nullable;
+  return !!s && typeof s === 'object' && typeof s.value === 'number' && isFinite(s.value) && typeof s.date === 'string';
+}
+function mpCacheShapeOk(c) {
+  if (!c || typeof c !== 'object') return false;
+  const t = Date.parse(c.fetchedAt);
+  if (!isFinite(t)) return false;
+  if (Date.now() - t < 0) return false; // a future fetchedAt is corrupt, not fresh (L1)
+  return mpSeriesShapeOk(c.policy, false) && mpSeriesShapeOk(c.prime, true) && mpSeriesShapeOk(c.bond5, true);
+}
+function mpStaleServe(cache) {
+  let best = null, bestAt = -1;
+  if (cache && mpCacheShapeOk(cache)) { best = cache; bestAt = Date.parse(cache.fetchedAt); }
+  if (mpMem && mpMemAt > bestAt) { best = mpMem; bestAt = mpMemAt; }
+  if (best && (Date.now() - bestAt) <= MP_RATES_MAX_STALE_MS) return Object.assign({}, best, { ok: true, stale: true });
+  return { ok: false, state: 'unavailable', source: 'Bank of Canada Valet API' };
+}
 async function mpRates(env) {
   let cache = null;
   try { cache = await env.LEADS.get('market:rates', { type: 'json' }); } catch (e) { cache = null; }
-  if (cache && cache.policy && cache.fetchedAt && (Date.now() - Date.parse(cache.fetchedAt)) < MP_RATES_TTL_MS) {
+  if (cache && mpCacheShapeOk(cache) && (Date.now() - Date.parse(cache.fetchedAt)) < MP_RATES_TTL_MS) {
     return Object.assign({}, cache, { ok: true, stale: false });
   }
-  try {
-    const fresh = await mpFetchValet();
-    const payload = { source: 'Bank of Canada Valet API', fetchedAt: new Date().toISOString(),
-      policy: fresh.policy, prime: fresh.prime, bond5: fresh.bond5, policySeries: fresh.policySeries };
-    try { await env.LEADS.put('market:rates', JSON.stringify(payload)); } catch (e) {}
-    return Object.assign({}, payload, { ok: true, stale: false });
-  } catch (e) {
-    if (cache && cache.policy) return Object.assign({}, cache, { ok: true, stale: true });
-    return { ok: false, state: 'unavailable', source: 'Bank of Canada Valet API' };
+  if (mpMem && (Date.now() - mpMemAt) < MP_MEM_TTL_MS) return Object.assign({}, mpMem, { ok: true, stale: false });
+  if (Date.now() < mpFailUntil) return mpStaleServe(cache);
+  if (!mpInflight) {
+    mpInflight = (async function () {
+      try {
+        const fresh = await mpFetchValet();
+        const payload = { source: 'Bank of Canada Valet API', fetchedAt: new Date().toISOString(),
+          policy: fresh.policy, prime: fresh.prime, bond5: fresh.bond5, policySeries: fresh.policySeries, missing: fresh.missing };
+        mpMem = payload; mpMemAt = Date.now();
+        try { await env.LEADS.put('market:rates', JSON.stringify(payload)); } catch (e) {}
+        return payload;
+      } catch (e) {
+        mpFailUntil = Date.now() + MP_FAIL_BACKOFF_MS;
+        return null;
+      } finally { mpInflight = null; }
+    })();
   }
+  const payload = await mpInflight;
+  if (payload) return Object.assign({}, payload, { ok: true, stale: false });
+  return mpStaleServe(cache);
 }
 
 /* ---- market stats dataset: validation + read ----
    A month entry: { month:'YYYY-MM', canada?, bc?, gvr?, fvreb?, rates? }.
-   Present blocks are type-checked figure by figure; undeclared string
-   fields (a board's conditions note, a snapshot's as-of date) ride along
-   untouched — they are display metadata, and the page escapes everything
-   it renders. */
+   Pack I (MP-01 H1/H2): validation is an ALLOWLIST, not a pass-through
+   — unknown keys at any level are rejected, so a source-less figure or
+   a typo'd field name can no longer slip in unvalidated. Display-only
+   strings are declared per block in MP_META, derived from what the
+   September 2026 seed and the newsletter job's documented block shapes
+   actually send (canada.listingsEndNote, fvreb.conditions, the rates
+   block's per-figure dates and bestSource). Every figure is
+   range-checked by mpBoundsFor. The canada forecast fields keep BOTH
+   spellings: the seed writes forecastSales2026/forecastSalesChgPct,
+   the newsletter job's shape writes forecastSales/forecastSalesYoyPct
+   — renaming either would break a live writer, so both are declared. */
 const MP_MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
-const MP_DATE_RE = /^\d{4}-\d{2}(-\d{2})?$/;
 const MP_BLOCK_FIELDS = {
-  canada: ['salesMomPct', 'salesYoyPct', 'newListingsMomPct', 'hpiMomPct', 'hpiYoyPct', 'benchmark', 'avgPrice', 'avgPriceYoyPct', 'stnl', 'stnlLongTerm', 'monthsInventory', 'forecastSales2026', 'forecastSalesChgPct', 'forecastAvgPrice', 'forecastAvgPriceChgPct'],
+  canada: ['salesMomPct', 'salesYoyPct', 'newListingsMomPct', 'newListingsChgPct', 'hpiMomPct', 'hpiYoyPct', 'benchmark', 'benchmarkYoyPct', 'avgPrice', 'avgPriceYoyPct', 'stnl', 'stnlLongTerm', 'monthsInventory', 'forecastSales', 'forecastSalesYoyPct', 'forecastSales2026', 'forecastSalesChgPct', 'forecastAvgPrice', 'forecastAvgPriceChgPct'],
   bc: ['sales', 'salesYoyPct', 'vs10yrAvgPct', 'avgPrice', 'avgPriceYoyPct', 'dollarVolumeB', 'dollarVolumeChgPct', 'ytdSales', 'ytdSalesChgPct', 'ytdVolumeB', 'ytdVolumeChgPct', 'ytdAvgPrice', 'ytdAvgPriceChgPct'],
   gvr: ['sales', 'salesYoyPct', 'vs10yrAvgPct', 'newListings', 'newListingsYoyPct', 'activeListings', 'activeListingsYoyPct', 'activeVs10yrPct', 'benchmark', 'benchmarkYoyPct', 'benchmarkMomPct', 'salesToActivePct'],
   fvreb: ['sales', 'salesMomPct', 'salesYoyPct', 'newListings', 'newListingsMomPct', 'newListingsYoyPct', 'activeListings', 'activeVs10yrPct', 'benchmark', 'benchmarkMomPct', 'benchmarkYoyPct'],
   rates: ['policyRate', 'bankRate', 'depositRate', 'prime', 'bestFixed5', 'bestVariable5']
 };
+const MP_META = {
+  canada: ['listingsEndNote'],
+  bc: [],
+  gvr: [],
+  fvreb: ['conditions'],
+  rates: ['policyDate', 'primeDate', 'bestRatesDate', 'bestSource']
+};
+const MP_TYPES = ['detached', 'townhouse', 'apartment', 'condo'];
+const MP_TYPES_BLOCKS = ['gvr', 'fvreb']; // a types object anywhere else (incl. rates — MP-01 L7) is rejected
 const MP_TYPE_FIELDS = ['price', 'yoyPct', 'sales', 'salesYoyPct', 'dom'];
-function mpNumFields(obj, fields, path, errs) {
+const MP_BLOCK_NAMES = Object.keys(MP_BLOCK_FIELDS);
+function mpHas(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+function mpBoundsFor(block, f) {
+  if (block === 'rates') return [0, 25];
+  if (f === 'price' || f === 'avgPrice' || f === 'benchmark' || f === 'forecastAvgPrice' || f === 'ytdAvgPrice') return [50000, 5000000];
+  if (f === 'monthsInventory') return [0, 60];
+  if (f === 'stnl' || f === 'stnlLongTerm') return [0, 100];
+  if (f === 'dom') return [0, 365];
+  if (f.slice(-7) === 'VolumeB') return [0, 1000];
+  if (f.slice(-3) === 'Pct') return [-100, 500];
+  return [0, Infinity]; // plain counts: non-negative
+}
+function mpNumFields(obj, fields, path, errs, block) {
+  let n = 0;
   for (const f of fields) {
     if (obj[f] === undefined) continue;
-    if (typeof obj[f] !== 'number' || !isFinite(obj[f])) errs.push(path + '.' + f + ' must be a number');
+    if (typeof obj[f] !== 'number' || !isFinite(obj[f])) { errs.push(path + '.' + f + ' must be a number'); continue; }
+    const b = mpBoundsFor(block, f);
+    if (obj[f] < b[0] || obj[f] > b[1]) { errs.push(path + '.' + f + ' is outside the plausible range ' + b[0] + '..' + (isFinite(b[1]) ? b[1] : 'no cap')); continue; }
+    n++;
   }
+  return n;
+}
+/* Pack I (MP-01 H2): a REAL calendar date (round-trip through
+   Date.UTC rejects 2026-13-45 and 2026-02-30, which the old regex
+   accepted), in YYYY-MM-DD or YYYY-MM form, not in the future. */
+function mpDateOk(s) {
+  const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec(s);
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], dd = m[3] ? +m[3] : 1;
+  const dt = new Date(Date.UTC(y, mo - 1, dd));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== dd) return false;
+  return dt.getTime() <= Date.now() + 86400000;
 }
 function mpValidateMonth(d) {
   const errs = [];
   if (!d || typeof d !== 'object' || Array.isArray(d)) return ['entry must be an object'];
+  for (const k of Object.keys(d)) {
+    if (k !== 'month' && !mpHas(MP_BLOCK_FIELDS, k)) errs.push('unknown top-level key: ' + k);
+  }
   if (typeof d.month !== 'string' || !MP_MONTH_RE.test(d.month)) errs.push('month must be YYYY-MM');
+  else {
+    const cur = new Date().toISOString().slice(0, 7);
+    if (d.month < '2015-01' || d.month > cur) errs.push('month must be between 2015-01 and ' + cur);
+  }
   let any = false;
-  for (const b of Object.keys(MP_BLOCK_FIELDS)) {
+  for (const b of MP_BLOCK_NAMES) {
     const blk = d[b];
     if (blk === undefined) continue;
     any = true;
     if (!blk || typeof blk !== 'object' || Array.isArray(blk)) { errs.push(b + ' must be an object'); continue; }
-    if (typeof blk.source !== 'string' || !blk.source.trim()) errs.push(b + '.source is required');
-    if (typeof blk.sourceDate !== 'string' || !MP_DATE_RE.test(blk.sourceDate)) errs.push(b + '.sourceDate must be YYYY-MM-DD or YYYY-MM');
-    mpNumFields(blk, MP_BLOCK_FIELDS[b], b, errs);
+    const allowed = { source: 1, sourceDate: 1, sourceUrl: 1 };
+    for (const f of MP_BLOCK_FIELDS[b]) allowed[f] = 1;
+    for (const f of MP_META[b]) allowed[f] = 1;
+    if (MP_TYPES_BLOCKS.indexOf(b) !== -1) allowed.types = 1;
+    for (const k of Object.keys(blk)) if (!mpHas(allowed, k)) errs.push(b + ': unknown field: ' + k);
+    if (typeof blk.source !== 'string' || blk.source.trim().length < 3 || blk.source.length > 120) errs.push(b + '.source must name the publisher (3-120 chars)');
+    if (typeof blk.sourceDate !== 'string' || !mpDateOk(blk.sourceDate)) errs.push(b + '.sourceDate must be a real YYYY-MM-DD or YYYY-MM date, not in the future');
+    if (blk.sourceUrl !== undefined && (typeof blk.sourceUrl !== 'string' || blk.sourceUrl.indexOf('https://') !== 0 || blk.sourceUrl.length > 300)) errs.push(b + '.sourceUrl must be an https URL of at most 300 chars');
+    for (const f of MP_META[b]) {
+      if (blk[f] !== undefined && (typeof blk[f] !== 'string' || blk[f].length > 300)) errs.push(b + '.' + f + ' must be a string of at most 300 chars');
+    }
+    let figures = mpNumFields(blk, MP_BLOCK_FIELDS[b], b, errs, b);
     if (blk.types !== undefined) {
-      if (!blk.types || typeof blk.types !== 'object' || Array.isArray(blk.types)) { errs.push(b + '.types must be an object'); continue; }
-      for (const t of Object.keys(blk.types)) {
-        const tb = blk.types[t];
-        if (!tb || typeof tb !== 'object' || Array.isArray(tb)) { errs.push(b + '.types.' + t + ' must be an object'); continue; }
-        mpNumFields(tb, MP_TYPE_FIELDS, b + '.types.' + t, errs);
-        if (tb.price !== undefined && !(tb.price > 0)) errs.push(b + '.types.' + t + '.price must be positive');
+      if (!blk.types || typeof blk.types !== 'object' || Array.isArray(blk.types)) { errs.push(b + '.types must be an object'); }
+      else {
+        for (const t of Object.keys(blk.types)) {
+          if (MP_TYPES.indexOf(t) === -1) { errs.push(b + '.types.' + t + ' is not a known home type'); continue; }
+          const tb = blk.types[t];
+          if (!tb || typeof tb !== 'object' || Array.isArray(tb)) { errs.push(b + '.types.' + t + ' must be an object'); continue; }
+          for (const k of Object.keys(tb)) if (MP_TYPE_FIELDS.indexOf(k) === -1) errs.push(b + '.types.' + t + ': unknown field: ' + k);
+          figures += mpNumFields(tb, MP_TYPE_FIELDS, b + '.types.' + t, errs, 'types');
+        }
       }
     }
+    if (figures === 0) errs.push(b + ' must carry at least one numeric figure');
   }
   if (!any) errs.push('at least one board block (canada, bc, gvr, fvreb, rates) is required');
   return errs;
 }
+/* Pack I (MP-01 H2): a headline price moving more than 15% from the
+   previous stored month is almost always a unit slip or a misparse,
+   not a market move — the PUT refuses it (409 confirm_jump) unless
+   the caller re-sends with ?confirm=1. The comparison runs against
+   the latest stored month EARLIER than the incoming one, so a
+   same-month correction never trips on itself and the first month
+   ever stored has nothing to trip on. */
+function mpJumpCheck(prev, d) {
+  const out = [];
+  for (const b of MP_BLOCK_NAMES) {
+    if (!d[b] || !prev[b]) continue;
+    for (const f of ['avgPrice', 'benchmark']) {
+      const a = prev[b][f], n = d[b][f];
+      if (typeof a === 'number' && typeof n === 'number' && a > 0) {
+        const pct = Math.abs(n - a) / a * 100;
+        if (pct > 15) out.push(b + '.' + f + ' moved ' + pct.toFixed(1) + '% vs ' + prev.month + ' (' + a + ' -> ' + n + ')');
+      }
+    }
+  }
+  return out;
+}
+/* Pack I (MP-01 C1): the read distinguishes the three states the old
+   code collapsed into "empty": key ABSENT (a genuinely empty dataset),
+   a read ERROR, and a MALFORMED stored document — the last two throw.
+   The PUT and the public GET turn a throw into 503 store_unavailable
+   instead of wiping history or claiming an empty dataset; internal
+   read-only consumers use mpReadStatsSafe and keep the old degrade. */
 async function mpReadStats(env) {
+  const raw = await env.LEADS.get('market:stats');
+  if (raw === null || raw === undefined) return { version: 1, months: [], updatedAt: null };
   let ds = null;
-  try { ds = await env.LEADS.get('market:stats', { type: 'json' }); } catch (e) { ds = null; }
-  if (!ds || !Array.isArray(ds.months)) ds = { version: 1, months: [], updatedAt: null };
+  try { ds = JSON.parse(raw); } catch (e) { throw new Error('market:stats is not valid JSON'); }
+  if (!ds || typeof ds !== 'object' || Array.isArray(ds) || !Array.isArray(ds.months)) throw new Error('market:stats document is malformed');
   return ds;
+}
+async function mpReadStatsSafe(env) {
+  try { return await mpReadStats(env); } catch (e) { return { version: 1, months: [], updatedAt: null }; }
+}
+/* Pack I (MP-01 C1/M1): before every dataset overwrite the pre-write
+   document is preserved under market:stats:bak:<rev> (90-day TTL), so
+   a bad write can be rolled back by hand. Best-effort by design: a
+   backup failure never blocks the write it protects. */
+async function mpBackupStats(env, ds) {
+  try { await env.LEADS.put('market:stats:bak:' + (ds.rev || 0), JSON.stringify(ds), { expirationTtl: 7776000 }); } catch (e) {}
 }
 
 async function handleRequest(request, env, ctx) {
@@ -4808,7 +4990,7 @@ async function handleRequest(request, env, ctx) {
     // weaken the captcha signal and mismatch Cloudflare's records.
     // Admin-cache generation bump: handled by the fetch wrapper in the
     // default export below, AFTER the response is known (cycle 26, H1).
-    if (path.indexOf('/api/') === 0 && path !== '/api/track') { try { await refreshCustomCatalog(env, false); } catch (e) {} }
+    if (path.indexOf('/api/') === 0 && path !== '/api/track' && path.indexOf('/api/market/') !== 0) { try { await refreshCustomCatalog(env, false); } catch (e) {} } // Pack I (MP-01 L4): market routes never touch the catalog
     try {
       // ---- public: health ----
       if (path === '/api/health') {
@@ -5031,9 +5213,20 @@ async function handleRequest(request, env, ctx) {
       // ---- public: market pulse data hub (2026-11-01) ----
       if (path === '/api/market/stats' && request.method === 'GET') {
         if (limited('mps:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const ds = await mpReadStats(env);
-        const months = ds.months.slice().sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); });
-        return json({ ok: true, version: ds.version || 1, months: months, updatedAt: ds.updatedAt || null }, 200, origin);
+        // Pack I (MP-01 C1/L3): a store error is a 503, never a fake
+        // empty dataset; months are filtered to valid entries before
+        // sorting (a null entry used to crash the comparator); the
+        // history is capped (default latest 24, ?limit= up to 120)
+        // and the answer is briefly cacheable in browsers.
+        let ds = null;
+        try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
+        let lim = parseInt(url.searchParams.get('limit') || '', 10);
+        if (!isFinite(lim) || lim < 1) lim = 24; if (lim > 120) lim = 120;
+        const months = ds.months.filter(function (m) { return m && typeof m === 'object' && typeof m.month === 'string' && MP_MONTH_RE.test(m.month); })
+          .sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); }).slice(0, lim);
+        const resp = json({ ok: true, version: ds.version || 1, rev: ds.rev || 0, months: months, updatedAt: ds.updatedAt || null }, 200, origin);
+        resp.headers.set('Cache-Control', 'public, max-age=300');
+        return resp;
       }
       if (path === '/api/market/rates' && request.method === 'GET') {
         if (limited('mpr:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -7507,14 +7700,14 @@ async function handleRequest(request, env, ctx) {
         if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
         const totals = await perfRead(env);
         const perf = (totals.listings && totals.listings[mls]) || { v: 0, s: 0, b: 0, l: 0 };
-        const ds = await mpReadStats(env);
+        const ds = await mpReadStatsSafe(env);
         return json({ ok: true, listing: h, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, since: totals.startedAt || null, sources: totals.sources || {} }, market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
       }
       if (path === '/api/admin/reports/property' && request.method === 'GET') {
         const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
         const h = puRichListing(mls);
         if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
-        const ds = await mpReadStats(env);
+        const ds = await mpReadStatsSafe(env);
         return json({ ok: true, listing: h, neighbourhood: puNeighbourhood(h), market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
       }
       if (path === '/api/admin/handbook-data' && request.method === 'GET') {
@@ -7539,7 +7732,7 @@ async function handleRequest(request, env, ctx) {
           }
         }
         const settings = await getSiteSettings(env);
-        const ds = await mpReadStats(env);
+        const ds = await mpReadStatsSafe(env);
         const monthsArr = (ds && ds.months) || [];
         const month = monthsArr[0] || null;
         const rateMonth = monthsArr.find(function (m) { return m && m.rates && typeof m.rates.bestFixed5 === 'number'; }) || null;
@@ -8039,17 +8232,70 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         const errs = mpValidateMonth(d);
         if (errs.length) return json({ ok: false, error: 'validation', details: errs.slice(0, 8) }, 400, origin);
-        const ds = await mpReadStats(env);
+        // Pack I (MP-01 C1): a failed read must never become an
+        // overwrite — refuse the write, dataset untouched.
+        let ds = null;
+        try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
+        const curRev = ds.rev || 0;
+        // Pack I (MP-01 M1): optimistic concurrency — a caller echoing
+        // ?rev= must have based its write on the current revision.
+        const revQ = url.searchParams.get('rev');
+        if (revQ !== null && Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
+        // Pack I (MP-01 H2): the >15% headline-price jump gate.
+        if (url.searchParams.get('confirm') !== '1') {
+          const prev = ds.months.filter(function (mm) { return mm && typeof mm.month === 'string' && mm.month < d.month; })
+            .sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); })[0] || null;
+          if (prev) { const jumps = mpJumpCheck(prev, d); if (jumps.length) return json({ ok: false, error: 'confirm_jump', details: jumps }, 409, origin); }
+        }
+        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) await mpBackupStats(env, ds);
+        // Pack I (MP-01 M2): block-level merge by default — a partial
+        // PUT (one board's block) no longer deletes the month's other
+        // blocks. ?replace=1 restores full replacement and the answer
+        // names the blocks it dropped.
+        const replace = url.searchParams.get('replace') === '1';
         const ix = ds.months.findIndex(function (mm) { return mm && mm.month === d.month; });
-        if (ix >= 0) ds.months[ix] = d; else ds.months.push(d);
+        let dropped = [], merged = false;
+        if (ix >= 0) {
+          if (replace) {
+            dropped = MP_BLOCK_NAMES.filter(function (b) { return ds.months[ix][b] !== undefined && d[b] === undefined; });
+            ds.months[ix] = d;
+          } else {
+            const mrg = Object.assign({}, ds.months[ix]);
+            for (const b of MP_BLOCK_NAMES) if (d[b] !== undefined) mrg[b] = d[b];
+            ds.months[ix] = mrg; merged = true;
+          }
+        } else ds.months.push(d);
         ds.months.sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); });
-        ds.version = 1;
+        ds.rev = curRev + 1;
+        ds.version = ds.version || 1; // Pack I (MP-01 M1): never hard-reset the schema version
         ds.updatedAt = new Date().toISOString();
         await env.LEADS.put('market:stats', JSON.stringify(ds));
         // Portal brain (2026-11-01): a fresh month of board stats gets
         // an automatic Persian market brief in the attention feed.
         try { ctx.waitUntil(brainMarketBrief(env, { auto: true })); } catch (e) {}
-        return json({ ok: true, month: d.month, months: ds.months.length }, 200, origin);
+        return json({ ok: true, month: d.month, months: ds.months.length, rev: ds.rev, merged: merged, dropped: dropped }, 200, origin);
+      }
+      // Pack I (MP-01 L5): remove a wrongly entered month. Same auth,
+      // same revision guard and the same pre-write backup as the PUT —
+      // the removed month stays recoverable from market:stats:bak:<rev>.
+      if (path === '/api/admin/market-stats' && request.method === 'DELETE') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const month = url.searchParams.get('month') || '';
+        if (!MP_MONTH_RE.test(month)) return json({ ok: false, error: 'validation', details: ['month must be YYYY-MM'] }, 400, origin);
+        let ds = null;
+        try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
+        const curRev = ds.rev || 0;
+        const revQ = url.searchParams.get('rev');
+        if (revQ !== null && Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
+        const ix = ds.months.findIndex(function (mm) { return mm && mm.month === month; });
+        if (ix < 0) return json({ ok: false, error: 'not_found', month: month }, 404, origin);
+        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) await mpBackupStats(env, ds);
+        ds.months.splice(ix, 1);
+        ds.rev = curRev + 1;
+        ds.version = ds.version || 1;
+        ds.updatedAt = new Date().toISOString();
+        await env.LEADS.put('market:stats', JSON.stringify(ds));
+        return json({ ok: true, month: month, months: ds.months.length, rev: ds.rev }, 200, origin);
       }
 
       // ---- market radar on/off switch (portal toggle; the daily scan checks this first) ----
