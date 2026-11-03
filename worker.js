@@ -39,6 +39,11 @@
 //   DELETE /api/admin/market-stats?month=YYYY-MM -> {ok, month, months, rev} (auth — removes one
 //                                          month; the pre-write document is kept at
 //                                          market:stats:bak:<rev> before every overwrite)
+//   POST /api/app/push-token {token, platform, lang} -> {ok} (public, rate-limited — APP stage 3:
+//                                          the Capacitor apps register their FCM/APNs device token
+//                                          for saved-search + viewing alerts; stored hashed at
+//                                          app:push:<sha256(token)>; REGISTRATION ONLY — sends are
+//                                          gated on cfg:apppush credentials, plug-in day work)
 //   PATCH /api/user/searches/:id {notify} -> {ok, search}       (visitor — alerts on/off for a saved search)
 //   GET  /api/admin/perf                -> {ok, startedAt, listings, sources, dropped} (auth — aggregate
 //                                          counters; ok:false + stale when the counters are unreadable)
@@ -50,7 +55,13 @@
 
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
-  'https://muse.ai'
+  'https://muse.ai',
+  // APP (2026-11-02): the Capacitor apps' WebView origins — Android serves
+  // the bundled site from https://localhost, iOS from capacitor://localhost.
+  // Only an app installed on the device can present these origins; every
+  // route keeps its own auth, ban and rate-limit checks.
+  'https://localhost',
+  'capacitor://localhost'
 ];
 const INTENTS = ['buyer', 'seller', 'investor', 'renter'];
 const STAGES = ['new', 'contacted', 'viewing', 'offer', 'closed', 'dropped'];
@@ -60,7 +71,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`]+@[^\s@<>"'`]+\.[^\s@<>"'`]+$/;
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain']; // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush']; // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'muse.ai'];
 
@@ -5890,6 +5901,33 @@ async function handleRequest(request, env, ctx) {
           const p = flushTrack(env);
           if (ctx && ctx.waitUntil) ctx.waitUntil(p);
         }
+        return json({ ok: true }, 200, origin);
+      }
+
+      // ---- native app push tokens (APP stage 3, 2026-11-02): the
+      // Capacitor apps register their FCM/APNs device token here so the
+      // saved-search / viewing alerts can reach them once Erfan's store
+      // accounts exist. REGISTRATION ONLY — nothing is ever sent from
+      // this worker until the send side lands on plug-in day, gated on
+      // cfg:apppush credentials. The raw token is never a KV key: the
+      // record lives under app:push:<sha256(token)>, which also makes
+      // re-registration naturally idempotent (same key, stamps merge).
+      if (path === '/api/app/push-token' && request.method === 'POST') {
+        if (limited('apppush:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const ptoken = typeof d.token === 'string' ? d.token.trim() : '';
+        if (ptoken.length < 20 || ptoken.length > 4096) return json({ ok: false, error: 'validation', details: ['token must be a string of 20..4096 chars'] }, 400, origin);
+        const pplatform = String(d.platform || '').toLowerCase();
+        if (pplatform !== 'android' && pplatform !== 'ios') return json({ ok: false, error: 'validation', details: ['platform must be android or ios'] }, 400, origin);
+        const plang = String(d.lang || '').toLowerCase();
+        if (['en', 'fa', 'hi', 'zh', 'es'].indexOf(plang) < 0) return json({ ok: false, error: 'validation', details: ['lang must be one of en/fa/hi/zh/es'] }, 400, origin);
+        const pkey = 'app:push:' + await sha256hex(ptoken);
+        const pnow = Date.now();
+        let prec = null;
+        try { prec = await env.LEADS.get(pkey, { type: 'json' }); } catch (e) {}
+        await env.LEADS.put(pkey, JSON.stringify({ platform: pplatform, lang: plang, createdAt: (prec && prec.createdAt) || pnow, lastSeen: pnow }));
         return json({ ok: true }, 200, origin);
       }
 
