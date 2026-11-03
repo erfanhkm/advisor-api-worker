@@ -34,7 +34,8 @@
 //                                          level unless ?replace=1; allowlist-validated: a figure
 //                                          without source/date, an unknown field or an implausible
 //                                          value is rejected; ?rev= optimistic concurrency; a >15%
-//                                          headline-price jump needs ?confirm=1)
+//                                          headline-price jump needs ?confirm=1; auth = admin
+//                                          session OR the scoped SERVICE token, Pack L)
 //   DELETE /api/admin/market-stats?month=YYYY-MM -> {ok, month, months, rev} (auth — removes one
 //                                          month; the pre-write document is kept at
 //                                          market:stats:bak:<rev> before every overwrite)
@@ -659,7 +660,12 @@ async function scopedAuthed(request, env, path, method) {
     // exists). Nothing else brain-related is in scope.
     (method === 'GET' && path === '/api/admin/brain/status') ||
     (method === 'POST' && path === '/api/admin/brain/smoke') ||
-    (method === 'POST' && path === '/api/admin/brain/provision');
+    (method === 'POST' && path === '/api/admin/brain/provision') ||
+    // Pack L (2026-11-02): the monthly newsletter job publishes the
+    // Market Pulse dataset with the service token — /api/login is
+    // Turnstile-gated server-side, so a job can never hold an admin
+    // session. PUT only; DELETE stays session-only.
+    (method === 'PUT' && path === '/api/admin/market-stats');
   const scope = INGEST ? 'ingest' : (SERVICE ? 'service' : null);
   if (!scope) return false;
   const h = request.headers.get('Authorization') || '';
@@ -8823,7 +8829,7 @@ async function handleRequest(request, env, ctx) {
       // one month of board statistics; validated so a figure without a
       // source can never enter the dataset) ----
       if (path === '/api/admin/market-stats' && request.method === 'PUT') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (!(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         const errs = mpValidateMonth(d);
