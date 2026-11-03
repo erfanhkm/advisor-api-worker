@@ -155,18 +155,35 @@ async function currentGen(env) {
   } catch (e) { return null; }
 }
 async function adminCachedGen(env, name, loader) {
+  // Pack K (PU-01 #3): the cache key carries the Vancouver date — the
+  // admin payloads are "as of today" shapes, and a long-lived isolate
+  // must never serve yesterday's Today/pipeline/demand after midnight
+  // (the followups worklist already carried its date in the name; this
+  // makes it uniform).
+  const key = name + '@' + todayVancouver();
   const g = await currentGen(env);
-  const hit = adminCache.get(name);
+  const hit = adminCache.get(key);
   if (hit && hit.gen !== undefined) {
     if (g !== null && hit.gen === g && Date.now() - hit.t < GEN_CACHE_MAX_AGE) return hit.promise;
     if (g === null && Date.now() - hit.t < ADMIN_CACHE_TTL) return hit.promise;
   }
   const promise = Promise.resolve().then(loader);
-  adminCache.set(name, { t: Date.now(), gen: g === null ? '__unknown__' : g, promise: promise });
+  adminCache.set(key, { t: Date.now(), gen: g === null ? '__unknown__' : g, promise: promise });
   promise.catch(function () {
-    const c = adminCache.get(name);
-    if (c && c.promise === promise) adminCache.delete(name);
+    const c = adminCache.get(key);
+    if (c && c.promise === promise) adminCache.delete(key);
   });
+  // Pack K (PU-01 #2): a DEGRADED payload (a segment marked 'error' in
+  // its sources, or the builder flagged itself degraded) is served to
+  // THIS caller but never cached as truth — the next load recomputes
+  // instead of replaying a failure-shaped snapshot for up to
+  // GEN_CACHE_MAX_AGE.
+  promise.then(function (result) {
+    if (result && typeof result === 'object' && (result.degraded === true || (result.sources && typeof result.sources === 'object' && Object.keys(result.sources).some(function (k) { return result.sources[k] === 'error'; })))) {
+      const c = adminCache.get(key);
+      if (c && c.promise === promise) adminCache.delete(key);
+    }
+  }, function () {});
   return promise;
 }
 const SESS_CACHE_TTL = 60000;
@@ -1589,6 +1606,13 @@ const MAIL_TTL_BY_KIND = { verify: 86400, viewing: 14 * 86400, alert: 129600, re
 const MAIL_TTL_DEFAULT = 30 * 86400;
 async function queueMail(env, item, opts) {
   opts = opts || {};
+  // Pack K (PU-01 #11): the recipient is validated at the queue
+  // boundary — a CR/LF or malformed address must never reach a mail
+  // header downstream. Callers that queue from user input already
+  // validate; this is the last line of defence for every caller.
+  const mto = String((item && item.to) || '');
+  if (!mto || /[\r\n]/.test(mto) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mto)) throw new Error('queueMail: invalid recipient');
+
   if (opts.key) {
     // Pack E (R-03 L2): the stored id/key must not embed the readable
     // key — alert/reminder keys contain the visitor's email (PII in
@@ -3310,6 +3334,13 @@ function puScoreLead(l, ctx) {
   else if (l.stage === 'offer') add('stage_offer', 15);
   const stageTs = l.stageAt ? Date.parse(l.stageAt) : NaN;
   const stageAgeH = isFinite(stageTs) ? Math.max(0, (ctx.now - stageTs) / 3600000) : ageH;
+  // Pack K (PU-02 #9): ONE silence measure shared with the rules
+  // engine's lead_cold trigger — days since the stage-appropriate
+  // last-activity anchor (stage entry for contacted; otherwise the
+  // newest of last touch / stage entry / creation).
+  const silenceAnchor = l.stage === 'contacted' ? (l.stageAt || l.lastTouchAt || l.created_at) : (l.lastTouchAt || l.stageAt || l.created_at);
+  const silenceTs = silenceAnchor ? Date.parse(silenceAnchor) : NaN;
+  const silentDays = isFinite(silenceTs) ? Math.max(0, (ctx.now - silenceTs) / 86400000) : null;
   if (l.stage === 'new' && ageH !== null && ageH > 48) add('silent_new_48h', -15);
   if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) add('silent_contacted_7d', -10);
   // Portal brain (2026-11-01): AI triage signals join the trail as
@@ -3322,8 +3353,11 @@ function puScoreLead(l, ctx) {
     else if (urgB === 1) add('ai_urgency_low', 5);
     if (l.ai.intent) reasons.push({ code: 'ai_intent_' + String(l.ai.intent).replace(/[^a-z0-9_-]/gi, '').slice(0, 24), pts: 0 });
   }
-  if (l.stage === 'closed') score = Math.max(score, 85);
-  if (l.stage === 'dropped') score = Math.min(score, 10);
+  // Pack K (PU-01 #7): the closed floor / dropped cap are labelled in
+  // the reason trail (0-pt informational markers, like the AI intent
+  // marker) so the displayed score never contradicts its explanation.
+  if (l.stage === 'closed') { score = Math.max(score, 85); reasons.push({ code: 'closed_floor', pts: 0 }); }
+  if (l.stage === 'dropped') { score = Math.min(score, 10); reasons.push({ code: 'dropped_cap', pts: 0 }); }
   score = Math.max(0, Math.min(100, Math.round(score)));
   let next;
   if (l.stage === 'closed') next = { kind: 'done', text: 'Closed — ask for a referral or review' };
@@ -3334,33 +3368,68 @@ function puScoreLead(l, ctx) {
   else if (l.stage === 'new') next = { kind: 'call', text: 'First contact today — call or message within 24h' };
   else if (ctx.pastViewing && l.stage === 'viewing') next = { kind: 'feedback', text: 'Ask for feedback on the viewing and agree the next step' };
   else if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) next = { kind: 'reengage', text: 'Re-engage — silent for 7+ days' };
-  else if (!l.phone) next = { kind: 'message', text: 'Ask for a phone number to speed up follow-up' };
   else if (l.stage === 'offer') next = { kind: 'offer', text: 'Support the offer — keep daily contact' };
+  else if (!l.phone) next = { kind: 'message', text: 'Ask for a phone number to speed up follow-up' };
   else if (ctx.searchCount >= 1 && !ctx.futureViewing && !ctx.pastViewing) next = { kind: 'invite', text: 'Invite them to view a matching home' };
   else next = { kind: 'nurture', text: 'Keep in touch — send a market update' };
-  return { score: score, band: puBand(score), reasons: reasons, next: next, at: new Date(ctx.now).toISOString() };
+  return { score: score, band: puBand(score), reasons: reasons, next: next, silentDays: silentDays, at: new Date(ctx.now).toISOString() };
 }
-/* One pass over the leads index + vidx (≤200) + one user record and one
-   search list per unique lead email (≤300). Cached via adminCachedGen —
+/* Pack K (PU-01 #1): ONE cached viewing summary shared by lead
+   scoring, the Today page, contact search and the handbook — each of
+   those used to rescan up to 200 viewing records independently.
+   vidx is newest-first (Pack E reconcile order), so its first 200
+   ids are the newest 200 viewings; `partial` says the index ran
+   longer. Status discipline (PU-01 #7): a PAST viewing only counts
+   when it actually happened (confirmed / completed); a FUTURE one
+   only while it is live (new / confirmed). */
+async function puViewingSummary(env) {
+  return adminCachedGen(env, 'viewsum', async function () {
+    const today = todayVancouver();
+    const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+    const take = vidx.slice(0, 200);
+    const rows = [];
+    for (let i = 0; i < take.length; i += 20) {
+      const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return env.LEADS.get('viewing:' + id, { type: 'json' }).catch(function () { return null; }); }));
+      for (const v of batch) if (v) rows.push(v);
+    }
+    const byEmail = Object.create(null);
+    for (const v of rows) {
+      if (v.status === 'cancelled' || !v.email) continue;
+      const ne = normEmail(v.email);
+      if (!ne) continue;
+      const e = byEmail[ne] || (byEmail[ne] = { future: false, past: false, last: null });
+      if (v.date >= today) { if (v.status === 'new' || v.status === 'confirmed') e.future = true; }
+      else {
+        if (v.status === 'confirmed' || v.status === 'completed') e.past = true;
+        if (!e.last || v.date > e.last) e.last = v.date;
+      }
+    }
+    return { at: new Date().toISOString(), rows: rows, byEmail: byEmail, total: vidx.length, partial: vidx.length > take.length };
+  });
+}
+/* One pass over the leads index (capped, bounded-concurrency) + the
+   shared viewing summary + one search list and one user record per
+   unique lead email (capped, batched). Cached via adminCachedGen —
    this is THE scoring aggregation; every surface (Today, pipeline,
-   draft) reads from it instead of rescanning. */
+   draft, rules) reads from it instead of rescanning. A failed
+   sub-read marks the payload degraded so it is never cached as
+   truth (PU-01 #2); caps are labelled on the payload (PU-01 #1). */
 async function puLeadScores(env) {
   return adminCachedGen(env, 'leadscores', async function () {
     const now = Date.now();
-    const today = todayVancouver();
-    const viewByEmail = Object.create(null);
-    const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-    for (const id of vidx.slice(0, 200)) {
-      const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
-      if (!v || !v.email || v.status === 'cancelled') continue;
-      const ne = normEmail(v.email);
-      const e = viewByEmail[ne] || (viewByEmail[ne] = { future: false, past: false });
-      if (v.date >= today) e.future = true; else e.past = true;
-    }
+    const sources = { viewings: 'ok', searches: 'ok' };
+    let degraded = false;
+    let vs = null;
+    try { vs = await puViewingSummary(env); }
+    catch (e) { degraded = true; sources.viewings = 'error'; console.error('puLeadScores: viewing summary failed: ' + (e && e.message || e)); }
+    const viewByEmail = vs ? vs.byEmail : Object.create(null);
+    const lids = await idxGet(env, 'leads', 'lead:');
+    const leadsTruncated = lids.length > 1000;
+    const take = lids.slice(0, 1000);
     const leads = [];
-    for (const lid of await idxGet(env, 'leads', 'lead:')) {
-      const l = await env.LEADS.get('lead:' + lid, { type: 'json' });
-      if (l) leads.push(l);
+    for (let i = 0; i < take.length; i += 20) {
+      const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return env.LEADS.get('lead:' + id, { type: 'json' }).catch(function () { return null; }); }));
+      for (const l of batch) if (l) leads.push(l);
     }
     const searchCount = Object.create(null);
     const langByEmail = Object.create(null);
@@ -3370,9 +3439,14 @@ async function puLeadScores(env) {
       const ne = normEmail(l.email || '');
       if (ne && !seen[ne]) { seen[ne] = 1; emails.push(ne); }
     }
-    for (const ne of emails.slice(0, 300)) {
-      try { const s = await userSearches(env, ne); searchCount[ne] = Array.isArray(s) ? s.length : 0; } catch (e) { searchCount[ne] = 0; }
-      try { const u = await env.LEADS.get('user:' + ne, { type: 'json' }); if (u && u.lang) langByEmail[ne] = validLang(u.lang); } catch (e) {}
+    const mailTake = emails.slice(0, 1000);
+    if (emails.length > mailTake.length) degraded = true;
+    for (let i = 0; i < mailTake.length; i += 20) {
+      await Promise.all(mailTake.slice(i, i + 20).map(async function (ne) {
+        try { const s2 = await userSearches(env, ne); searchCount[ne] = Array.isArray(s2) ? s2.length : 0; }
+        catch (e) { degraded = true; sources.searches = 'error'; console.error('puLeadScores: searches failed for a lead email: ' + (e && e.message || e)); }
+        try { const u = await env.LEADS.get('user:' + ne, { type: 'json' }); if (u && u.lang) langByEmail[ne] = validLang(u.lang); } catch (e) {}
+      }));
     }
     const map = Object.create(null);
     for (const l of leads) {
@@ -3380,7 +3454,12 @@ async function puLeadScores(env) {
       const vc = viewByEmail[ne] || { future: false, past: false };
       map[l.id] = puScoreLead(l, { now: now, searchCount: searchCount[ne] || 0, futureViewing: vc.future, pastViewing: vc.past });
     }
-    return { at: new Date(now).toISOString(), map: map, leads: leads, langByEmail: langByEmail };
+    const out = { at: new Date(now).toISOString(), map: map, leads: leads, langByEmail: langByEmail, sources: sources };
+    if (degraded) out.degraded = true;
+    if (leadsTruncated) out.leadsTruncated = true;
+    if (vs && vs.partial) out.viewingsTruncated = true;
+    if (emails.length > mailTake.length) out.searchesCapped = emails.length;
+    return out;
   });
 }
 /* Mirror scores onto lscore:<leadId> (diff-only, capped) from the
@@ -3395,7 +3474,14 @@ async function puPersistScores(env) {
     if (!s) continue;
     let cur = null;
     try { cur = await env.LEADS.get('lscore:' + l.id, { type: 'json' }); } catch (e) {}
-    if (!cur || cur.score !== s.score || cur.band !== s.band || cur.next.kind !== (s.next && s.next.kind)) {
+    // Pack K (PU-01 #5): the stored record's next/reasons are read
+    // defensively — a legacy or partial record must not crash the
+    // automation run — and the write also fires on a reasons
+    // SIGNATURE change: a score can keep its number while its
+    // explanation changes, and the mirror must not go stale on it.
+    const sig = function (x) { return (x && Array.isArray(x.reasons)) ? x.reasons.map(function (r) { return r && r.code; }).join(',') : ''; };
+    const curNext = cur && cur.next && cur.next.kind;
+    if (!cur || cur.score !== s.score || cur.band !== s.band || curNext !== (s.next && s.next.kind) || sig(cur) !== sig(s)) {
       try { await env.LEADS.put('lscore:' + l.id, JSON.stringify(s)); written++; } catch (e) {}
     }
   }
@@ -3406,14 +3492,14 @@ async function puToday(env) {
   const out = { today: today, tomorrow: addDaysYmd(today, 1), sources: {} };
   const seg = async function (name, fn) {
     try { out[name] = await fn(); out.sources[name] = 'ok'; }
-    catch (e) { out[name] = null; out.sources[name] = 'error'; }
+    catch (e) { out[name] = null; out.sources[name] = 'error'; console.error('puToday segment ' + name + ' failed: ' + (e && e.message || e)); }
   };
   await seg('viewings', async function () {
-    const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
+    // Pack K (PU-01 #1): rows come from the ONE shared viewing
+    // summary — this segment no longer rescans vidx on its own.
+    const vs = await puViewingSummary(env);
     const t = [], tm = [], awaiting = [];
-    for (const id of vidx.slice(0, 200)) {
-      const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
-      if (!v) continue;
+    for (const v of vs.rows) {
       const h = v.listingId ? catalogByMls(v.listingId) : null;
       const item = { id: v.id, date: v.date, time: v.time, name: v.name || '', email: v.email || '', status: v.status, listing: h ? (h.street + ', ' + h.city) : (v.listingId || '') };
       if ((v.status === 'new' || v.status === 'confirmed') && v.date === today) t.push(item);
@@ -3422,7 +3508,9 @@ async function puToday(env) {
     }
     const byDT = function (a, b) { return String(a.date + ' ' + a.time).localeCompare(String(b.date + ' ' + b.time)); };
     t.sort(byDT); tm.sort(byDT); awaiting.sort(byDT);
-    return { today: t, tomorrow: tm, awaiting: awaiting.slice(0, 10), awaitingCount: awaiting.length };
+    const vres = { today: t, tomorrow: tm, awaiting: awaiting.slice(0, 10), awaitingCount: awaiting.length };
+    if (vs.partial) vres.truncated = true;
+    return vres;
   });
   await seg('predictions', async function () { return await env.LEADS.get('pred:summary', { type: 'json' }); }); // Portal Brain 2
   await seg('followups', async function () {
@@ -3431,12 +3519,18 @@ async function puToday(env) {
   });
   await seg('hotLeads', async function () {
     const sm = await puLeadScores(env);
-    const counts = { hot: 0, warm: 0, cold: 0 };
+    // Pack K (PU-01 #7): band counts cover ACTIVE leads only — closed
+    // leads are floored to the hot band by the scorer, so counting
+    // them here inflated "hot" with finished business. Closed and
+    // dropped are reported separately.
+    const counts = { hot: 0, warm: 0, cold: 0, closed: 0, dropped: 0 };
     const rows = [];
     for (const l of sm.leads) {
       const s = sm.map[l.id];
       if (!s) continue;
-      counts[s.band]++;
+      if (l.stage === 'closed') counts.closed++;
+      else if (l.stage === 'dropped') counts.dropped++;
+      else counts[s.band]++;
       if (s.band === 'hot' && l.stage !== 'closed' && l.stage !== 'dropped') rows.push({ id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, source: l.source || '', score: s.score, next: s.next });
     }
     rows.sort(function (a, b) { return b.score - a.score; });
@@ -3446,11 +3540,17 @@ async function puToday(env) {
     const last = (await env.LEADS.get('automation:last', { type: 'json' })) || null;
     let unsentAlerts = 0;
     const mids = await idxGet(env, 'mailq', 'mailq:');
-    for (const mid of mids.slice(-200)) {
+    // Pack K (PU-01 #1): the old slice(-200) silently undercounted
+    // unsent alerts once the queue grew past 200 — scan the full
+    // queue up to a labelled cap instead.
+    const take = mids.slice(-1000);
+    for (const mid of take) {
       const mm = await env.LEADS.get('mailq:' + mid, { type: 'json' });
       if (mm && !mm.sent && mm.kind === 'alert') unsentAlerts++;
     }
-    return { lastRun: last, unsentAlerts: unsentAlerts };
+    const ares = { lastRun: last, unsentAlerts: unsentAlerts };
+    if (mids.length > take.length) ares.truncated = true;
+    return ares;
   });
   await seg('marketPulse', async function () {
     const ds = await mpReadStatsSafe(env);
@@ -3477,13 +3577,20 @@ async function puToday(env) {
   });
   await seg('newsletter', async function () {
     let total = 0;
-    const byLang = {}; // dynamic keys — no fixed language list (ES-ready)
-    for (const nid of await idxGet(env, 'nlsubs', 'nlsub:')) {
+    // Null-prototype map (PU-01 #9): keys are stored language strings,
+    // so a hostile or corrupt value must never collide with
+    // Object.prototype members.
+    const byLang = Object.create(null); // dynamic keys — no fixed language list (ES-ready)
+    const nids = await idxGet(env, 'nlsubs', 'nlsub:');
+    const take = nids.slice(0, 1000);
+    for (const nid of take) {
       const raw = await env.LEADS.get('nlsub:' + nid);
       if (!raw) continue;
       try { const s = JSON.parse(raw); total++; const lg = s.lang || 'en'; byLang[lg] = (byLang[lg] || 0) + 1; } catch (e) {}
     }
-    return { total: total, byLang: byLang };
+    const nres = { total: total, byLang: byLang };
+    if (nids.length > take.length) { nres.sampled = true; nres.subscribersTotal = nids.length; }
+    return nres;
   });
   await seg('tasks', async function () {
     const all = (await allTasks(env)).filter(function (t) { return !t.done && t.due <= out.tomorrow; });
@@ -3498,28 +3605,39 @@ async function puToday(env) {
 /* ---- system 3 data: kanban pipeline over lead stages ---- */
 async function puPipeline(env) {
   const sm = await puLeadScores(env);
-  const now = Date.now();
-  const columns = {}; const counts = {};
+  // Pack K (PU-01 #4): null-prototype buckets + stage normalization
+  // at load. A stage literally named 'constructor' used to resolve
+  // through Object.prototype and throw the whole board; an unknown
+  // stage was silently skipped from the columns while still counting
+  // in the total. Now every lead lands in a real bucket ('new' when
+  // its stage is unknown) and the payload says how many were moved.
+  const columns = Object.create(null); const counts = Object.create(null);
   STAGES.forEach(function (s) { columns[s] = []; counts[s] = 0; });
+  let normalized = 0;
   for (const l of sm.leads) {
-    if (!columns[l.stage]) continue;
+    let st = l.stage;
+    if (STAGES.indexOf(st) === -1) { st = 'new'; normalized++; }
     const s = sm.map[l.id];
-    const stageMs = l.stageAt ? Date.parse(l.stageAt) : NaN;
-    columns[l.stage].push({
+    columns[st].push({
       id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '',
       intent: l.intent || '', city: l.city || '', source: l.source || '',
-      lang: (l.lang || (sm.langByEmail && sm.langByEmail[normEmail(l.email || '')]) || ''),
+      lang: validLang(l.lang || (sm.langByEmail && sm.langByEmail[normEmail(l.email || '')]) || 'en'),
       created_at: l.created_at || '', stageAt: l.stageAt || null,
       score: s ? s.score : null, band: s ? s.band : null, next: s ? s.next : null,
-      goingCold: !!(l.stage === 'contacted' && isFinite(stageMs) && (now - stageMs) >= 7 * 86400000)
+      // Pack K (PU-01 #7): goingCold derives from the score's own
+      // silence reasons, so the board and the scorer can never
+      // disagree about what "cold" means.
+      goingCold: !!(s && s.reasons && s.reasons.some(function (r) { return r.code === 'silent_contacted_7d' || r.code === 'silent_new_48h'; }))
     });
-    counts[l.stage]++;
+    counts[st]++;
   }
   STAGES.forEach(function (st) {
     columns[st].sort(function (a, b) { return (b.score || 0) - (a.score || 0) || String(b.created_at).localeCompare(String(a.created_at)); });
     columns[st] = columns[st].slice(0, 120);
   });
-  return { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at };
+  const out = { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at };
+  if (normalized) out.normalizedStages = normalized;
+  return out;
 }
 
 /* ---- system 4 data: aggregate demand (never exact lead addresses) ---- */
@@ -3531,48 +3649,112 @@ const PU_CITY_COORDS = {
   'maple ridge': [49.2193, -122.5989], 'white rock': [49.0253, -122.8026], 'abbotsford': [49.0504, -122.3045],
   'mission': [49.1337, -122.3119], 'pitt meadows': [49.2334, -122.6894], 'squamish': [49.7016, -123.1558]
 };
+/* Pack K (PU-02 #11): ONE canonical-city resolver for the demand
+   aggregation. Free-text city strings match the known municipality
+   list (the PU_CITY_COORDS keys); anything else falls into the
+   'Other' bucket instead of becoming its own aggregate key — this
+   caps the key space AND keeps one-off strings (near-identifying in
+   a small dataset) out of the payload. */
+const PU_CITY_CANON = (function () {
+  const m = Object.create(null);
+  for (const k of Object.keys(PU_CITY_COORDS)) m[k.replace(/[^a-z0-9]/g, '')] = k;
+  return m;
+})();
+function puCanonCity(raw) {
+  const key = String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!key) return null;
+  const hit = PU_CITY_CANON[key];
+  if (!hit) return null;
+  return hit.split(' ').map(function (w) { return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ');
+}
+function puCityBucket(raw) { return puCanonCity(raw) || 'Other'; }
+/* True median over finite positive numbers (PU-02 #11): the old
+   upper-middle pick overstated the median on every even count. */
+function puMedianPrice(prices) {
+  const pp = (prices || []).filter(function (x) { return typeof x === 'number' && isFinite(x) && x > 0; }).sort(function (a, b) { return a - b; });
+  if (!pp.length) return null;
+  const mid = Math.floor(pp.length / 2);
+  return pp.length % 2 ? pp[mid] : Math.round((pp[mid - 1] + pp[mid]) / 2);
+}
+/* Small-cell suppression (PU-02 #11): buckets with fewer than `min`
+   observations fold into 'Other' — aggregate demand data must not
+   pinpoint a near-unique household. */
+/* Pack K (PU-03 #8): search text folding — NFKC (full-width and
+   compatibility forms collapse), case folding, and Arabic/Persian
+   variant unification, so a query typed with Arabic letters finds
+   the Persian spelling stored in records (and vice versa). */
+function puFoldText(v) {
+  let t = String(v || '').normalize('NFKC').toLowerCase();
+  t = t.replace(/\u064a/g, '\u06cc').replace(/\u0643/g, '\u06a9').replace(/\u0629/g, '\u0647').replace(/[\u0623\u0625]/g, '\u0627').replace(/\u0624/g, '\u0648').replace(/\u0640/g, '');
+  return t;
+}
+function puSuppressSmall(map, min) {
+  const out = Object.create(null);
+  let suppressed = 0, other = 0;
+  for (const k of Object.keys(map)) {
+    if (k !== 'Other' && map[k] < min) { suppressed++; other += map[k]; }
+    else out[k] = map[k];
+  }
+  if (other > 0) out.Other = (out.Other || 0) + other;
+  return { map: out, suppressed: suppressed };
+}
 async function puDemand(env) {
   const out = { sources: {}, generatedAt: new Date().toISOString() };
   // demand from valuation leads (city-level + FSA extracted from the
-  // postal code the seller typed — aggregate only, address never leaves)
-  const valByCity = {}, valByFsa = {};
-  let valTotal = 0;
-  for (const lid of await idxGet(env, 'leads', 'lead:')) {
-    const l = await env.LEADS.get('lead:' + lid, { type: 'json' });
-    if (!l || l.source !== 'home-valuation') continue;
-    valTotal++;
-    const city = String(l.city || (l.valuation && l.valuation.city) || '').trim();
-    if (city) valByCity[city] = (valByCity[city] || 0) + 1;
-    const src = String((l.valuation && l.valuation.address) || '') + ' ' + String(l.postal || '');
-    const m = src.match(/\b([A-Za-z]\d[A-Za-z])\s?\d[A-Za-z]\d\b/);
-    if (m) { const f = m[1].toUpperCase(); valByFsa[f] = (valByFsa[f] || 0) + 1; }
-  }
-  out.valuations = { total: valTotal, byCity: valByCity, byFsa: valByFsa };
-  out.sources.valuations = 'ok';
+  // postal code the seller typed — aggregate only, address never
+  // leaves). Pack K (PU-02 #11): read from the SHARED score
+  // aggregation instead of rescanning every lead record here.
+  try {
+    const sm = await puLeadScores(env);
+    const valByCity = Object.create(null), valByFsa = Object.create(null);
+    let valTotal = 0;
+    for (const l of sm.leads) {
+      if (!l || l.source !== 'home-valuation') continue;
+      valTotal++;
+      const rawCity = String(l.city || (l.valuation && l.valuation.city) || '').trim();
+      if (rawCity) { const c = puCityBucket(rawCity); valByCity[c] = (valByCity[c] || 0) + 1; }
+      const src = String((l.valuation && l.valuation.address) || '') + ' ' + String(l.postal || '');
+      const m = src.match(/\b([A-Za-z]\d[A-Za-z])\s?\d[A-Za-z]\d\b/);
+      if (m) { const f = m[1].toUpperCase(); valByFsa[f] = (valByFsa[f] || 0) + 1; }
+    }
+    const sc = puSuppressSmall(valByCity, 3);
+    const sf = puSuppressSmall(valByFsa, 3);
+    out.valuations = { total: valTotal, byCity: sc.map, byFsa: sf.map, suppressedCells: sc.suppressed + sf.suppressed };
+    out.sources.valuations = 'ok';
+  } catch (e) { out.valuations = null; out.sources.valuations = 'error'; console.error('puDemand valuations failed: ' + (e && e.message || e)); }
   // saved-search demand (bounded user sample, coverage labelled)
   try {
     const uids = await idxGet(env, 'users', 'user:', 5000);
     const sample = uids.slice(0, 300);
-    const byCity = {}, byType = {};
-    let searches = 0;
-    for (const em of sample) {
-      const ss = await userSearches(env, em);
-      if (!Array.isArray(ss)) continue;
-      for (const s of ss) {
-        searches++;
-        const c = (s.criteria && s.criteria.city) || '';
-        if (c) byCity[c] = (byCity[c] || 0) + 1;
-        const t = (s.criteria && s.criteria.type) || '';
-        if (t) byType[t] = (byType[t] || 0) + 1;
-      }
+    const byCity = Object.create(null), byType = Object.create(null);
+    let searches = 0, userErrors = 0;
+    for (let i = 0; i < sample.length; i += 20) {
+      await Promise.all(sample.slice(i, i + 20).map(async function (em) {
+        // Per-user isolation (PU-02 #11): one user's bad search data
+        // must not take down the whole section.
+        try {
+          const ss = await userSearches(env, em);
+          if (!Array.isArray(ss)) return;
+          for (const s of ss) {
+            searches++;
+            const rawC = (s.criteria && s.criteria.city) || '';
+            if (rawC) { const c = puCityBucket(rawC); byCity[c] = (byCity[c] || 0) + 1; }
+            const t = String((s.criteria && s.criteria.type) || '').slice(0, 40);
+            if (t) byType[t] = (byType[t] || 0) + 1;
+          }
+        } catch (e) { userErrors++; }
+      }));
     }
-    out.searchDemand = { searches: searches, byCity: byCity, byType: byType, usersScanned: sample.length, usersTotal: uids.length };
+    const sc2 = puSuppressSmall(byCity, 3);
+    out.searchDemand = { searches: searches, byCity: sc2.map, byType: byType, usersScanned: sample.length, usersTotal: uids.length, suppressedCells: sc2.suppressed };
+    if (userErrors) out.searchDemand.userErrors = userErrors;
     out.sources.searchDemand = 'ok';
   } catch (e) { out.searchDemand = null; out.sources.searchDemand = 'error'; }
   // radar pool density (metadata-level sample; pool is empty while OFF)
   try {
-    const keys = await kvList(env, 'mpool:', 200);
-    const byRegion = {}, bySide = { demand: 0, supply: 0 };
+    const page = await kvList(env, { prefix: 'mpool:', limit: 200 });
+    const keys = (page && page.keys) || [];
+    const byRegion = Object.create(null), bySide = { demand: 0, supply: 0 };
     let sampled = 0;
     for (const k of keys.slice(0, 60)) {
       const r = await env.LEADS.get(k.name, { type: 'json' });
@@ -3582,31 +3764,43 @@ async function puDemand(env) {
       if (reg) byRegion[reg] = (byRegion[reg] || 0) + 1;
       if (r.side === 'demand' || r.side === 'supply') bySide[r.side]++;
     }
-    out.pool = { total: keys.length, sampled: sampled, byRegion: byRegion, bySide: bySide };
+    out.pool = { total: keys.length, sampled: sampled, byRegion: byRegion, bySide: bySide, truncated: keys.length >= 200 };
     out.sources.pool = 'ok';
   } catch (e) { out.pool = null; out.sources.pool = 'error'; }
-  // supply: active catalog by city
-  const supply = {};
-  for (const h of mergedCatalog()) {
-    if (h.status !== 'active') continue;
-    const c = supply[h.city] || (supply[h.city] = { count: 0, prices: [] });
-    c.count++;
-    if (h.price) c.prices.push(h.price);
-  }
-  const supplyRows = Object.keys(supply).map(function (city) {
-    const p = supply[city].prices.slice().sort(function (a, b) { return a - b; });
-    return { city: city, count: supply[city].count, median: p.length ? p[Math.floor(p.length / 2)] : null, coords: PU_CITY_COORDS[city.toLowerCase()] || null };
-  }).sort(function (a, b) { return b.count - a.count; });
-  out.supply = supplyRows;
-  // census overlay for Metro Vancouver FSAs (V3–V7) from the embedded
-  // property-report dataset; index order documented at PR_CENSUS_FSA.
-  const census = {};
-  for (const fsa of Object.keys(PR_CENSUS_FSA)) {
-    if (!/^V[3-7]/.test(fsa)) continue;
-    const r = PR_CENSUS_FSA[fsa];
-    census[fsa] = { pop: r[0], dwellings: r[1], pctAge0to14: r[2], pctAge65plus: r[3], medianAge: r[4], pctSingleDetached: r[5], avgHouseholdSize: r[6], medianIncome: r[7], pctOwner: r[8], pctRenter: r[9], pctEnglishAtHome: r[10], pctNonOfficialAtHome: r[11] };
-  }
-  out.census = census;
+  // supply: active catalog by city (guarded like every other section —
+  // an unguarded throw here used to 500 the whole route, PU-02 #11)
+  try {
+    const supply = Object.create(null);
+    for (const h of mergedCatalog()) {
+      if (h.status !== 'active') continue;
+      const c = supply[h.city] || (supply[h.city] = { count: 0, prices: [] });
+      c.count++;
+      if (h.price) c.prices.push(h.price);
+    }
+    const supplyRows = Object.keys(supply).map(function (city) {
+      return { city: city, count: supply[city].count, median: puMedianPrice(supply[city].prices), coords: PU_CITY_COORDS[String(city).toLowerCase()] || null };
+    }).sort(function (a, b) { return b.count - a.count; });
+    out.supply = supplyRows;
+    out.supplySource = customListings.length ? 'catalog' : 'seed';
+    out.sources.supply = 'ok';
+  } catch (e) { out.supply = null; out.sources.supply = 'error'; console.error('puDemand supply failed: ' + (e && e.message || e)); }
+  // census overlay: only FSAs with unsuppressed demand present
+  // (PU-02 #11) — the old payload embedded the whole V3–V7 dataset
+  // whether or not anyone was looking at those areas. Source and
+  // vintage travel with the payload.
+  try {
+    const census = Object.create(null);
+    const fsaKeys = out.valuations ? Object.keys(out.valuations.byFsa) : [];
+    for (const fsa of fsaKeys) {
+      if (fsa === 'Other') continue;
+      const r = PR_CENSUS_FSA[fsa];
+      if (!r) continue;
+      census[fsa] = { pop: r[0], dwellings: r[1], pctAge0to14: r[2], pctAge65plus: r[3], medianAge: r[4], pctSingleDetached: r[5], avgHouseholdSize: r[6], medianIncome: r[7], pctOwner: r[8], pctRenter: r[9], pctEnglishAtHome: r[10], pctNonOfficialAtHome: r[11] };
+    }
+    out.census = census;
+    out.censusSource = 'Statistics Canada, 2021 Census Profile (FSA geography)';
+    out.sources.census = 'ok';
+  } catch (e) { out.census = null; out.sources.census = 'error'; }
   out.cityCoords = PU_CITY_COORDS;
   return out;
 }
@@ -3617,15 +3811,25 @@ async function puDemand(env) {
    The engine is STATE-based: triggers are predicates over current
    records, deduplicated by rulefire:<ruleId>:<target> keys, evaluated
    inside runAutomations AFTER the built-ins under the same lock with
-   a strict op budget + per-run firing cap. 'lead_cold' is a documented
+   a strict op budget + per-run firing cap (Pack K: per-trigger
+   dedupe TTLs, fail-closed dedupe, one rulelog write per run). 'lead_cold' is a documented
    superset trigger (state-evaluated from stage + stageAt) — the
    brief's cold-lead preset cannot be expressed with event triggers.
    Actions never send mail: queue_draft only queues HELD mail. */
 const PU_RULE_TRIGGERS = ['lead_created', 'valuation_submitted', 'viewing_booked', 'viewing_cancelled', 'stage_changed', 'search_match', 'lead_cold'];
 const PU_RULE_ACTIONS = ['create_followup', 'queue_draft', 'flag_hot', 'portal_note'];
+/* Pack K (PU-02 #2): per-trigger dedupe TTLs, each at least the
+   trigger's match window plus margin — the old flat 48h let
+   week-window triggers (valuation, viewing cancellation) re-fire
+   days before their window closed. lead_cold gets a long TTL: a
+   cold lead is re-flagged at most monthly. */
+const PU_RULE_TTLS = { lead_created: 3 * 86400, valuation_submitted: 9 * 86400, viewing_booked: 4 * 86400, viewing_cancelled: 9 * 86400, stage_changed: 4 * 86400, search_match: 2 * 86400, lead_cold: 30 * 86400 };
 function puRulePresets() {
   return [
-    { id: 'preset_new_lead_followup', name: 'New lead → follow-up task', enabled: true, trigger: 'lead_created', conditions: {}, actions: [{ type: 'create_followup', text: 'Follow up with the new lead', dueDays: 1 }] },
+    // Pack K (PU-02 #4): presets ship DISABLED. The follow-up preset
+    // used to seed enabled, so a fresh workspace started creating
+    // tasks before the owner ever saw the rules page.
+    { id: 'preset_new_lead_followup', name: 'New lead → follow-up task', enabled: false, trigger: 'lead_created', conditions: {}, actions: [{ type: 'create_followup', text: 'Follow up with the new lead', dueDays: 1 }] },
     { id: 'preset_cold_flag', name: 'Lead cold 7 days → flag + note', enabled: false, trigger: 'lead_cold', conditions: { days: 7 }, actions: [{ type: 'flag_hot' }, { type: 'portal_note', text: 'Lead went cold (7+ days in Contacted)' }] },
     { id: 'preset_valuation_note', name: 'Valuation submitted → portal note', enabled: false, trigger: 'valuation_submitted', conditions: {}, actions: [{ type: 'portal_note', text: 'New home-valuation request' }] }
   ];
@@ -3636,6 +3840,10 @@ function puCleanRule(r) {
   const actions = [];
   for (const a of (Array.isArray(r.actions) ? r.actions : []).slice(0, 3)) {
     if (!a || PU_RULE_ACTIONS.indexOf(a.type) === -1) continue;
+    // Pack K (PU-02 #9): search_match has no single lead target, so
+    // lead-scoped actions are inert there — reject them at save time
+    // instead of letting a rule look armed while doing nothing.
+    if (r.trigger === 'search_match' && a.type !== 'portal_note') continue;
     const act = { type: a.type };
     if (a.text) act.text = String(a.text).slice(0, 200);
     if (a.dueDays !== undefined) act.dueDays = Math.max(0, Math.min(30, parseInt(a.dueDays, 10) || 0));
@@ -3650,83 +3858,182 @@ function puCleanRule(r) {
   return {
     id: String(r.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || ('rule_' + randHex(6)),
     name: String(r.name || 'Untitled rule').slice(0, 80),
-    enabled: r.enabled !== false,
+    // Pack K (PU-02 #8): enabled is explicit-true only. Every writer
+    // (the portal form + toggles, the presets) always sends a real
+    // boolean, so a missing/garbled value now means OFF, never ON.
+    enabled: r.enabled === true,
     autoSend: r.autoSend === true, // Portal Brain 2: gate (b) of the agent email chain — default OFF, only Erfan flips it
     trigger: r.trigger, conditions: cond, actions: actions
   };
 }
+/* Pack K (PU-02 #4): config reads are strict now. ONLY an absent key
+   seeds the (disabled) presets — and persists them, so the seed is a
+   one-time event. A corrupt or unreadable config THROWS: the engine
+   answers {error} and the GET route 503s, instead of silently
+   running the presets as if they were the owner's rules. */
 async function puRulesGet(env) {
-  try {
-    const r = await env.LEADS.get('cfg:rules', { type: 'json' });
-    if (r && Array.isArray(r.rules)) return { rules: r.rules, seeded: false };
-  } catch (e) {}
-  return { rules: puRulePresets(), seeded: true };
+  const r = await env.LEADS.get('cfg:rules', { type: 'json' });
+  if (r === null || r === undefined) {
+    const seeded = { rules: puRulePresets(), updatedAt: new Date().toISOString() };
+    await env.LEADS.put('cfg:rules', JSON.stringify(seeded));
+    return { rules: seeded.rules, seeded: true, updatedAt: seeded.updatedAt };
+  }
+  if (typeof r !== 'object' || !Array.isArray(r.rules)) throw new Error('rules_config_invalid');
+  return { rules: r.rules.map(puCleanRule).filter(Boolean), seeded: false, updatedAt: r.updatedAt || null };
 }
-async function puRuleLog(env, entry) {
-  try {
-    const log = (await env.LEADS.get('rulelog', { type: 'json' })) || [];
-    log.unshift(entry);
-    await env.LEADS.put('rulelog', JSON.stringify(log.slice(0, 200)));
-  } catch (e) {}
+/* Pack K (PU-02 #9): ONE condition matcher for every lead-targeted
+   trigger — stage/source conditions used to be honoured by some
+   triggers and ignored by others. */
+function puRuleLeadMatch(rule, lead) {
+  const cond = rule.conditions || {};
+  if (cond.stage && lead.stage !== cond.stage) return false;
+  if (cond.source && lead.source !== cond.source) return false;
+  return true;
 }
 async function puEvaluateRules(env, autoCtx) {
-  const out = { fired: 0, skipped: 0, errors: 0, partial: false, ops: 0 };
   let cfg = null;
-  try { cfg = await puRulesGet(env); } catch (e) { return { error: 'rules_unreadable' }; }
+  try { cfg = await puRulesGet(env); }
+  catch (e) { console.error('puEvaluateRules: rules config unreadable: ' + (e && e.message || e)); return { error: 'rules_config' }; }
   const rules = (cfg.rules || []).filter(function (r) { return r.enabled; });
+  const out = { evaluated: rules.length, fired: 0, skipped: 0, errors: 0, partial: false, ops: 0, dedupeErrors: 0 };
   if (!rules.length) return out;
   const now = Date.now();
   const today = todayVancouver();
+  // Pack K (PU-02 #1): REAL op accounting — every KV call the engine
+  // makes goes through a counting proxy and the total is reported.
+  // Setup reads are not charged against the FIRING budget: the old
+  // fake counter let the viewing scan eat the whole budget, so once
+  // vidx passed ~68 entries no rule could ever fire.
   let ops = 0;
-  const BUDGET = 80, MAXFIRE = 25;
-  const sm = await puLeadScores(env); ops += 12;
-  const leadByEmail = {};
-  for (const l of sm.leads) { const ne = normEmail(l.email || ''); if (ne && !leadByEmail[ne]) leadByEmail[ne] = l; }
-  const viewings = [];
-  const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-  for (const id of vidx.slice(0, 200)) { const v = await env.LEADS.get('viewing:' + id, { type: 'json' }); if (v) viewings.push(v); ops++; }
-  async function wasFired(ruleId, target) { ops++; try { return !!(await env.LEADS.get('rulefire:' + ruleId + ':' + target)); } catch (e) { return false; } }
-  async function markFired(ruleId, target, ttl) { ops++; try { await env.LEADS.put('rulefire:' + ruleId + ':' + target, new Date().toISOString(), { expirationTtl: ttl || 172800 }); } catch (e) {} }
+  const ckv = {
+    get: function () { ops++; return env.LEADS.get.apply(env.LEADS, arguments); },
+    put: function () { ops++; return env.LEADS.put.apply(env.LEADS, arguments); },
+    delete: function () { ops++; return env.LEADS.delete.apply(env.LEADS, arguments); },
+    list: function () { ops++; return env.LEADS.list.apply(env.LEADS, arguments); }
+  };
+  const cenv = Object.assign({}, env, { LEADS: ckv });
+  const FIRE_BUDGET = 150, MAXFIRE = 25;
+  const triggers = {};
+  for (const r of rules) triggers[r.trigger] = true;
+  const sm = await puLeadScores(cenv);
+  const scoresById = sm.map || {};
+  // Pack K (PU-02 #5/#10): targets iterate NEWEST first, and the
+  // email map keeps the newest lead per address (the old plain-object
+  // map kept the first — the stalest — and could be prototype-polluted).
+  const leads = (sm.leads || []).slice().sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+  const leadByEmail = Object.create(null);
+  for (const l of leads) { const ne = normEmail(l.email || ''); if (ne && !leadByEmail[ne]) leadByEmail[ne] = l; }
+  // Viewings load ONLY when a viewing trigger is enabled (PU-02 #10).
+  let viewings = [];
+  if (triggers.viewing_booked || triggers.viewing_cancelled) {
+    const vidx = (await ckv.get('vidx', { type: 'json' })) || [];
+    const take = vidx.slice(0, 200);
+    for (let i = 0; i < take.length; i += 20) {
+      const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return ckv.get('viewing:' + id, { type: 'json' }).catch(function () { return null; }); }));
+      for (const v of batch) if (v) viewings.push(v);
+    }
+    if (vidx.length > take.length) out.viewingsTruncated = true;
+    viewings.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+  }
+  const fireBase = ops;
+  const budgetHit = function () { return (ops - fireBase) > FIRE_BUDGET; };
+  const ageH = function (iso) { const t = Date.parse(iso); return isFinite(t) ? (now - t) / 3600000 : Infinity; };
+  const logEntries = [];
+  async function markFired(ruleId, target, ttl) {
+    try { await ckv.put('rulefire:' + ruleId + ':' + target, new Date().toISOString(), { expirationTtl: ttl }); return true; }
+    catch (e) { console.error('puEvaluateRules: markFired failed for ' + ruleId + ': ' + (e && e.message || e)); return false; }
+  }
   async function runActions(rule, lead, viewing) {
-    const done = [];
+    const done = [], failed = [];
+    let skipped = 0;
     for (const a of rule.actions) {
       try {
         if (a.type === 'portal_note') {
-          await puAttentionAdd(env, 'rule', (a.text || rule.name) + (lead ? ' — ' + (lead.name || lead.email || '') : '') + (viewing ? ' — ' + viewing.date + ' ' + viewing.time : ''), lead ? lead.id : (viewing ? viewing.id : ''));
+          await puAttentionAdd(cenv, 'rule', (a.text || rule.name) + (lead ? ' — ' + (lead.name || lead.email || '') : '') + (viewing ? ' — ' + viewing.date + ' ' + viewing.time : ''), lead ? lead.id : (viewing ? viewing.id : ''));
           done.push(a.type);
-        } else if (!lead) { out.skipped++; continue; }
+        } else if (!lead) { skipped++; continue; }
         else if (a.type === 'create_followup') {
-          const tid = Date.now().toString(36) + '-' + randHex(6);
-          await env.LEADS.put('task:' + tid, JSON.stringify({ id: tid, email: lead.email || '', text: (a.text || 'Follow up') + ' — ' + (lead.name || lead.email || ''), due: addDaysYmd(today, a.dueDays || 1), done: false, created_at: new Date().toISOString(), rule: rule.id }));
-          await idxAdd(env, 'tasks', tid);
+          // Pack K (PU-02 #3/#10): the task id is DETERMINISTIC —
+          // derived from the dedupe target — so a retry after a
+          // partial failure can never duplicate the task, and
+          // dueDays 0 means due today (the old `|| 1` silently
+          // turned it into tomorrow).
+          const target = viewing ? 'viewing:' + viewing.id : (lead.id || normEmail(lead.email || ''));
+          const tid = 'rt-' + (await sha256hex(rule.id + '|' + target)).slice(0, 32);
+          let existing = null;
+          try { existing = await ckv.get('task:' + tid, { type: 'json' }); } catch (e) {}
+          if (!existing) {
+            const dd = (a.dueDays === undefined ? 1 : a.dueDays);
+            await ckv.put('task:' + tid, JSON.stringify({ id: tid, email: lead.email || '', text: (a.text || 'Follow up') + ' — ' + (lead.name || lead.email || ''), due: addDaysYmd(today, dd), done: false, created_at: new Date().toISOString(), rule: rule.id }));
+            await idxAdd(cenv, 'tasks', tid);
+          }
           done.push(a.type);
         } else if (a.type === 'queue_draft') {
-          if (lead.email && !(await isBanned(env, lead.email))) {
+          if (lead.email && !(await isBanned(cenv, lead.email))) {
             const lang = validLang(lead.lang || (sm.langByEmail && sm.langByEmail[normEmail(lead.email)]) || 'en');
-            await queueMail(env, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lead.id }, { key: 'rule:' + rule.id + ':' + lead.id + ':' + today });
+            // Pack K (PU-02 #7): a viewing-only contact has no lead
+            // id — the old key used '' for all of them, so two
+            // different contacts collided into one draft per day.
+            const qref = lead.id || (viewing ? 'v' + viewing.id : '');
+            await queueMail(cenv, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lead.id }, { key: 'rule:' + rule.id + ':' + qref + ':' + today });
             done.push(a.type);
-          } else out.skipped++;
+          } else skipped++;
         } else if (a.type === 'flag_hot') {
           const nk = normEmail(lead.email || '');
-          if (nk) { try { const meta = await getCMeta(env, nk); meta.hotFlag = true; meta.hotReason = rule.name; await saveCMeta(env, nk, meta); } catch (e) {} }
-          await puAttentionAdd(env, 'rule', '🔥 ' + rule.name + ' — ' + (lead.name || lead.email || ''), lead.id);
+          if (nk) { try { const meta = await getCMeta(cenv, nk); meta.hotFlag = true; meta.hotReason = rule.name; await saveCMeta(cenv, nk, meta); } catch (e) {} }
+          await puAttentionAdd(cenv, 'rule', '🔥 ' + rule.name + ' — ' + (lead.name || lead.email || ''), lead.id);
           done.push(a.type);
         }
-      } catch (e) { out.errors++; }
+      } catch (e) { failed.push(a.type); console.error('puEvaluateRules: action ' + a.type + ' failed for rule ' + rule.id + ': ' + (e && e.message || e)); }
     }
-    return done;
+    return { done: done, skipped: skipped, failed: failed };
   }
-  const ageH = function (iso) { const t = Date.parse(iso); return isFinite(t) ? (now - t) / 3600000 : Infinity; };
   for (const rule of rules) {
-    if (out.fired >= MAXFIRE || ops > BUDGET) { out.partial = true; break; }
+    if (out.fired >= MAXFIRE) { out.partial = true; break; }
+    // Pack K (PU-02 #3/#5): the rule's dedupe state is prefetched ONCE
+    // per run. A failed prefetch fails CLOSED — every target is
+    // treated as already fired and the rule is skipped — because the
+    // old per-target read failed OPEN and re-fired everything.
+    let firedSet = null;
+    try {
+      const page = await ckv.list({ prefix: 'rulefire:' + rule.id + ':', limit: 1000 });
+      const pfx = 'rulefire:' + rule.id + ':';
+      firedSet = new Set(((page && page.keys) || []).map(function (k) { return String(k.name).slice(pfx.length); }));
+    } catch (e) {
+      out.dedupeErrors++;
+      console.error('puEvaluateRules: dedupe prefetch failed for ' + rule.id + ': ' + (e && e.message || e));
+      continue;
+    }
+    const ttl = PU_RULE_TTLS[rule.trigger] || 3 * 86400;
     const cond = rule.conditions || {};
+    async function fire(target, lead, viewing) {
+      const res = await runActions(rule, lead, viewing);
+      if (res.failed.length) {
+        // Partial-action failure (PU-02 #3): NOT marked fired — the
+        // target retries on a later run (the successful actions are
+        // idempotent), and the failed action types land in the log.
+        out.errors += res.failed.length;
+        logEntries.push({ at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: res.done, failed: res.failed });
+        return;
+      }
+      const marked = await markFired(rule.id, target, ttl);
+      if (!marked) { out.partial = true; return; }
+      firedSet.add(target);
+      if (res.done.length) { out.fired++; logEntries.push({ at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: res.done }); }
+      else if (res.skipped) {
+        // All actions skipped (suppressed / no email): the target IS
+        // marked (PU-02 #3) so it is not re-evaluated every run.
+        out.skipped += res.skipped;
+        logEntries.push({ at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: [], result: 'skipped' });
+      }
+    }
     if (rule.trigger === 'search_match') {
       const nm = (autoCtx && autoCtx.alerts && autoCtx.alerts.newMatches) || 0;
       if (nm > 0) {
         const target = 'run:' + today;
-        if (!(await wasFired(rule.id, target))) {
-          const done = await runActions(rule, null, null);
-          if (done.length) { await markFired(rule.id, target, 172800); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: done }); out.fired++; }
+        if (!firedSet.has(target)) {
+          if (budgetHit()) out.partial = true;
+          else await fire(target, null, null);
         }
       }
       continue;
@@ -3734,29 +4041,62 @@ async function puEvaluateRules(env, autoCtx) {
     if (rule.trigger === 'viewing_booked' || rule.trigger === 'viewing_cancelled') {
       const wantCancelled = rule.trigger === 'viewing_cancelled';
       for (const v of viewings) {
-        if (out.fired >= MAXFIRE || ops > BUDGET) break;
-        if (wantCancelled ? v.status !== 'cancelled' : v.status === 'cancelled') continue;
-        if (ageH(v.created_at) > (wantCancelled ? 168 : 48)) continue;
+        if (out.fired >= MAXFIRE || budgetHit()) { out.partial = true; break; }
+        let hit = false;
+        if (wantCancelled) {
+          // The cancellation instant is stamped on the record from
+          // Pack K on; legacy records fall back to creation time.
+          hit = v.status === 'cancelled' && ageH(v.cancelledAt || v.created_at) <= 168;
+        } else {
+          // Booked = a live upcoming viewing (PU-02 #9): a completed
+          // or past viewing must not fire a "booked" rule late.
+          hit = (v.status === 'new' || v.status === 'confirmed') && v.date >= today && ageH(v.created_at) <= 48;
+        }
+        if (!hit) continue;
+        const lead = leadByEmail[normEmail(v.email || '')] || null;
+        if (lead && !puRuleLeadMatch(rule, lead)) continue;
+        if (!lead && (cond.stage || cond.source)) continue;
         const target = 'viewing:' + v.id;
-        if (await wasFired(rule.id, target)) continue;
-        const lead = leadByEmail[normEmail(v.email || '')] || (v.email ? { id: '', name: v.name || '', email: v.email, stage: '', source: 'viewing' } : null);
-        const done = await runActions(rule, lead, v);
-        if (done.length) { await markFired(rule.id, target, 172800); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: done }); out.fired++; }
+        if (firedSet.has(target)) continue;
+        const effLead = lead || (v.email ? { id: '', name: v.name || '', email: v.email, stage: '', source: 'viewing' } : null);
+        await fire(target, effLead, v);
       }
       continue;
     }
-    for (const l of sm.leads) {
-      if (out.fired >= MAXFIRE || ops > BUDGET) break;
-      let hit = false, target = l.id, ttl = 172800;
-      if (rule.trigger === 'lead_created') hit = ageH(l.created_at) <= 48 && (!cond.source || l.source === cond.source);
+    for (const l of leads) {
+      if (out.fired >= MAXFIRE || budgetHit()) { out.partial = true; break; }
+      if (l.stage === 'dropped') continue; // dropped leads never fire (PU-02 #9)
+      let hit = false, target = l.id;
+      if (rule.trigger === 'lead_created') hit = ageH(l.created_at) <= 48;
       else if (rule.trigger === 'valuation_submitted') hit = l.source === 'home-valuation' && ageH(l.created_at) <= 168;
-      else if (rule.trigger === 'stage_changed') { hit = !!l.stageAt && ageH(l.stageAt) <= 48 && (!cond.stage || l.stage === cond.stage); target = l.id + ':' + (l.stageAt || ''); }
-      else if (rule.trigger === 'lead_cold') { const d = cond.days || 7; hit = l.stage === 'contacted' && !!l.stageAt && isFinite(Date.parse(l.stageAt)) && (now - Date.parse(l.stageAt)) >= d * 86400000; target = l.id + ':' + (l.stageAt || ''); ttl = 604800; }
+      else if (rule.trigger === 'stage_changed') {
+        const st = Date.parse(l.stageAt || ''), ct = Date.parse(l.created_at || '');
+        // A stageAt stamped at creation is the INITIAL stage, not a
+        // change (PU-02 #9) — it must not fire a stage_changed rule.
+        hit = isFinite(st) && ageH(l.stageAt) <= 48 && !(isFinite(ct) && Math.abs(st - ct) < 120000);
+        target = l.id + ':' + (l.stageAt || '');
+      }
+      else if (rule.trigger === 'lead_cold') {
+        // Silence comes from the scorer's own measure (PU-02 #9).
+        const d = cond.days || 7;
+        const sd = scoresById[l.id] ? scoresById[l.id].silentDays : null;
+        hit = l.stage === 'contacted' && sd !== null && sd !== undefined && sd >= d;
+        target = l.id + ':' + (l.stageAt || '');
+      }
       if (!hit) continue;
-      if (await wasFired(rule.id, target)) continue;
-      const done = await runActions(rule, l, null);
-      if (done.length) { await markFired(rule.id, target, ttl); await puRuleLog(env, { at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: l.id, actions: done }); out.fired++; }
+      if (!puRuleLeadMatch(rule, l)) continue;
+      if (firedSet.has(target)) continue;
+      await fire(target, l, null);
     }
+  }
+  // Pack K (PU-02 #6): the run's log is collected in memory and
+  // flushed with ONE read + ONE write — the old code did a get+put
+  // of the whole log for every single firing.
+  if (logEntries.length) {
+    try {
+      const prev = (await ckv.get('rulelog', { type: 'json' })) || [];
+      await ckv.put('rulelog', JSON.stringify(logEntries.slice().reverse().concat(prev).slice(0, 200)));
+    } catch (e) { console.error('puEvaluateRules: rulelog flush failed: ' + (e && e.message || e)); }
   }
   out.ops = ops;
   return out;
@@ -3764,18 +4104,74 @@ async function puEvaluateRules(env, autoCtx) {
 
 /* ---- system 6a: uploaded files (owner documents per listing) ---- */
 const PU_FILE_MAX = 3 * 1024 * 1024;
+/* Pack K (PU-03 #6): upload type allowlist + magic-byte verification.
+   A renamed executable must not ride into storage as a "PDF": the
+   declared type has to be a document type AND the decoded prefix has
+   to carry that type's signature (text types: no NUL bytes). */
+const PU_FILE_TYPES = ['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'image/gif', 'text/plain', 'text/csv', 'application/msword', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'];
+function puFileMagicOk(type, b64) {
+  let head = '';
+  try { head = atob(String(b64 || '').replace(/\s/g, '').slice(0, 32)); } catch (e) { return false; }
+  if (!head) return false;
+  const b = function (i) { return head.charCodeAt(i); };
+  if (type === 'application/pdf') return head.slice(0, 4) === '%PDF';
+  if (type === 'image/png') return b(0) === 0x89 && b(1) === 0x50 && b(2) === 0x4e && b(3) === 0x47;
+  if (type === 'image/jpeg') return b(0) === 0xff && b(1) === 0xd8 && b(2) === 0xff;
+  if (type === 'image/webp') return head.slice(0, 4) === 'RIFF' && head.slice(8, 12) === 'WEBP';
+  if (type === 'image/gif') return head.slice(0, 4) === 'GIF8';
+  if (type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') return b(0) === 0x50 && b(1) === 0x4b && b(2) === 0x03 && b(3) === 0x04;
+  if (type === 'application/msword' || type === 'application/vnd.ms-excel') return b(0) === 0xd0 && b(1) === 0xcf && b(2) === 0x11 && b(3) === 0xe0;
+  if (type === 'text/plain' || type === 'text/csv') return head.indexOf('\0') === -1;
+  return false;
+}
 async function puFileMetas(env, mls) {
+  const mlsNorm = String(mls || '').trim().toUpperCase();
   const out = [];
+  // Pack K (PU-03 #1): list from KV metadata — uploads write the meta
+  // fields as KV metadata, so listing a listing's files no longer
+  // downloads (and JSON-parses) every file's base64 body. Two
+  // fallbacks keep old data readable: a record flagged hasAi takes
+  // ONE body read for its summary, and a record with no metadata at
+  // all (pre-Pack-K uploads) is read in full, once.
+  let listed = null;
+  try { const page = await kvList(env, { prefix: 'file:', limit: 1000 }); listed = (page && page.keys) || []; } catch (e) { listed = null; }
+  if (listed) {
+    for (const k of listed) {
+      if (out.length >= 200) break;
+      const fid = String(k.name || '').slice('file:'.length);
+      const md = k.metadata;
+      if (md && typeof md === 'object' && md.name !== undefined) {
+        const recMls = String(md.mls || '').trim().toUpperCase();
+        if (mlsNorm && recMls !== mlsNorm) continue;
+        const meta = { id: fid, name: String(md.name || 'file'), type: String(md.type || ''), size: Number(md.size) || 0, mls: recMls, at: md.at || null, aiSummary: null };
+        if (md.hasAi) {
+          try { const r = JSON.parse(await env.LEADS.get('file:' + fid)); meta.aiSummary = r.aiSummary || null; } catch (e) {}
+        }
+        out.push(meta);
+      } else {
+        try {
+          const raw = await env.LEADS.get('file:' + fid);
+          if (!raw) continue;
+          const r = JSON.parse(raw);
+          if (mlsNorm && String(r.mls || '').trim().toUpperCase() !== mlsNorm) continue;
+          out.push({ id: r.id || fid, name: r.name, type: r.type, size: r.size, mls: String(r.mls || '').trim().toUpperCase(), at: r.at, aiSummary: r.aiSummary || null });
+        } catch (e) {}
+      }
+    }
+    return out;
+  }
+  // List failed entirely: the legacy index path.
   for (const fid of await idxGet(env, 'files', 'file:')) {
+    if (out.length >= 200) break;
     const raw = await env.LEADS.get('file:' + fid);
     if (!raw) continue;
     try {
       const r = JSON.parse(raw);
-      if (mls && r.mls !== mls) continue;
-      out.push({ id: r.id, name: r.name, type: r.type, size: r.size, mls: r.mls || '', at: r.at, aiSummary: r.aiSummary || null });
+      if (mlsNorm && String(r.mls || '').trim().toUpperCase() !== mlsNorm) continue;
+      out.push({ id: r.id, name: r.name, type: r.type, size: r.size, mls: String(r.mls || '').trim().toUpperCase(), at: r.at, aiSummary: r.aiSummary || null });
     } catch (e) {}
   }
-  return out.slice(0, 200);
+  return out;
 }
 /* Full file records INCLUDING the base64 payload — only for the
    handbook-data includeFiles flag (phase 2, 2026-11-01), so the
@@ -3788,7 +4184,7 @@ async function puFilesFull(env, mls) {
     if (!raw) continue;
     try {
       const r = JSON.parse(raw);
-      if (mls && r.mls !== mls) continue;
+      if (mls && String(r.mls || '').trim().toUpperCase() !== String(mls).trim().toUpperCase()) continue;
       out.push({ id: r.id, name: r.name, type: r.type, size: r.size, mls: r.mls || '', at: r.at, aiSummary: r.aiSummary || null, data: r.data || '' });
     } catch (e) {}
     if (out.length >= 10) break;
@@ -3811,16 +4207,84 @@ function puRichListing(mls) {
    (embedded PR_SCHOOLS). Aggregate/official data only. */
 function puNeighbourhood(listing) {
   if (!listing) return null;
-  const fsa = String(listing.postal || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 3);
-  const row = (fsa && PR_CENSUS_FSA[fsa]) || null;
+  // Pack K (PU-03 #9): the FSA is validated AS an FSA and looked up
+  // with hasOwnProperty — the old code indexed the dataset with
+  // whatever the first three alphanumerics happened to be.
+  const rawPostal = String(listing.postal || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const fsa = /^[A-Z]\d[A-Z]$/.test(rawPostal.slice(0, 3)) ? rawPostal.slice(0, 3) : null;
+  const row = (fsa && Object.prototype.hasOwnProperty.call(PR_CENSUS_FSA, fsa)) ? PR_CENSUS_FSA[fsa] : null;
   const census = row ? { fsa: fsa, pop: row[0], dwellings: row[1], pctAge0to14: row[2], pctAge65plus: row[3], medianAge: row[4], pctSingleDetached: row[5], avgHouseholdSize: row[6], medianIncome: row[7], pctOwner: row[8], pctRenter: row[9], pctEnglishAtHome: row[10], pctNonOfficialAtHome: row[11] } : null;
-  const city = String(listing.city || '').toLowerCase();
+  const cityLabel = String(listing.city || '');
+  const city = cityLabel.toLowerCase();
   const schools = [];
-  for (const s of PR_SCHOOLS) {
-    if (String(s[1]).toLowerCase() === city) schools.push({ name: s[0], level: s[4], kind: s[5] });
-    if (schools.length >= 6) break;
+  let schoolsTotal = 0;
+  for (const sc of PR_SCHOOLS) {
+    if (String(sc[1]).toLowerCase() === city) {
+      schoolsTotal++;
+      if (schools.length < 6) schools.push({ name: sc[0], level: sc[4], kind: sc[5] });
+    }
   }
-  return { fsa: fsa || null, census: census, schools: schools };
+  return {
+    fsa: fsa, census: census,
+    censusSource: 'Statistics Canada, 2021 Census Profile (FSA geography)',
+    // The schools list is capped at 6 for display; schoolsTotal +
+    // schoolsCity say plainly that these are "schools in <city>"
+    // (a city match, not a distance radius), with the source named.
+    schools: schools, schoolsTotal: schoolsTotal, schoolsCity: cityLabel || null,
+    schoolsSource: 'BC Ministry of Education open data (BC Data Catalogue), 2025/26 school year',
+    reason: !rawPostal ? 'no_postal' : (!fsa ? 'bad_postal' : (!census ? 'fsa_not_covered' : null))
+  };
+}
+/* Pack K (PU-03 #4): report/handbook listing payloads are an
+   ALLOWLIST projection of the stored record — public listing fields
+   only, so an internal field that lands on a record tomorrow cannot
+   leak into a client document. Photos are deduplicated, string-only,
+   and travel ONLY in `photos` (the listing copy used to duplicate
+   them). dataSource names where the record came from; `thin` marks
+   the slim catalog fallback. */
+function puPublicListing(h, dataSource) {
+  if (!h) return null;
+  const photos = [];
+  const rawPhotos = [];
+  if (h.photo) rawPhotos.push(h.photo);
+  if (Array.isArray(h.photos)) for (const pp of h.photos) rawPhotos.push(pp);
+  for (const pp of rawPhotos) if (typeof pp === 'string' && pp && photos.indexOf(pp) === -1) photos.push(pp);
+  const num = function (v) { return (v === null || v === undefined) ? null : v; };
+  return {
+    listing: {
+      mls: h.mls || '', street: h.street || '', city: h.city || '', postal: h.postal || '',
+      price: (typeof h.price === 'number' && isFinite(h.price)) ? h.price : null,
+      beds: num(h.beds), baths: num(h.baths), sqft: num(h.sqft),
+      type: h.type || '', status: h.status || '',
+      desc: (h.desc && typeof h.desc === 'object') ? h.desc : (h.description ? { en: String(h.description) } : null),
+      features: Array.isArray(h.features) ? h.features.filter(function (f) { return typeof f === 'string'; }).slice(0, 30) : [],
+      year: num(h.year), strata: num(h.strata), tax: num(h.tax), parking: h.parking || '',
+      stalls: num(h.stalls), lot: num(h.lot), listed: h.listed || '', dom: num(h.dom),
+      dataSource: dataSource, thin: dataSource === 'catalog'
+    },
+    photos: photos.slice(0, 12)
+  };
+}
+function puListingPayload(mls) {
+  const c = customListings.find(function (r) { return r.mls === mls; });
+  if (c) return puPublicListing(c, 'portal');
+  const sd = SEED_LISTINGS.find(function (r) { return r.mls === mls; });
+  if (sd) return puPublicListing(sd, 'seed');
+  const t = catalogByMls(mls);
+  if (t) return puPublicListing(t, 'catalog');
+  return null;
+}
+/* Canadian mortgage math (PU-03 #3): nominal rates compound
+   SEMI-ANNUALLY, so the equivalent monthly rate is
+   (1 + j2/2)^(2/12) - 1. The old code divided by 12 (US-style
+   monthly compounding) and overstated every payment it printed. */
+function caMonthlyPayment(principal, annualRatePct, years) {
+  const n = Math.round(years * 12);
+  if (!(principal > 0) || !(n > 0)) return 0;
+  const i = Math.pow(1 + (annualRatePct / 100) / 2, 2 / 12) - 1;
+  if (!(i > 0)) return Math.round(principal / n);
+  const f = Math.pow(1 + i, n);
+  return Math.round(principal * i * f / (f - 1));
 }
 
 /* ================= portal brain (2026-11-01) =================
@@ -4151,7 +4615,9 @@ async function brainFileSummary(env, fileId, text) {
   const facts = (p && Array.isArray(p.facts) ? p.facts : []).map(function (x) { return brainStr(x, 200); }).filter(Boolean).slice(0, 10);
   if (!facts.length) return { ok: false, error: 'ai_parse' };
   rec.aiSummary = { facts: facts, at: new Date().toISOString(), via: r.via || '' };
-  await env.LEADS.put('file:' + fileId, JSON.stringify(rec));
+  // Pack K: the rewrite carries the KV metadata too (hasAi flips on),
+  // so metadata listings stay truthful after a summary lands.
+  await env.LEADS.put('file:' + fileId, JSON.stringify(rec), { metadata: { name: String(rec.name || 'file'), type: String(rec.type || ''), size: Number(rec.size) || 0, mls: String(rec.mls || '').trim().toUpperCase(), at: rec.at || null, hasAi: 1 } });
   return { ok: true, aiSummary: rec.aiSummary };
 }
 /* Showing brief (feature 7): one-screen brief for a viewing, cached
@@ -4472,8 +4938,11 @@ async function brainPrepareEmail(env, params) {
   const comp = brainCompliance(String(p.body).slice(0, 2400));
   const subject = String(p.subject || '').slice(0, 160) || 'Following up';
   const cfg = await brainCfg(env);
-  const rules = await puRulesGet(env);
-  const gov = (rules.rules || []).find(function (r) { return r.enabled !== false && (r.actions || []).some(function (a) { return a.type === 'queue_draft'; }); });
+  // Pack K: a corrupt rules config must not break the email chain —
+  // it fails CLOSED (no governing rule -> autoSend stays off).
+  let rules = { rules: [] };
+  try { rules = await puRulesGet(env); } catch (e) {}
+  const gov = (rules.rules || []).find(function (r) { return r.enabled === true && (r.actions || []).some(function (a) { return a.type === 'queue_draft'; }); });
   const autoSend = !!(gov && gov.autoSend === true);
   const senderOk = !!cfg.sender;
   const released = senderOk && autoSend;
@@ -4960,7 +5429,7 @@ async function handleRequest(request, env, ctx) {
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
     // the Content-Length check and the chunked-body check cannot drift.
-    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : 32768)); };
+    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/rules' ? 262144 : 32768))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -5842,6 +6311,7 @@ async function handleRequest(request, env, ctx) {
         if ((String(rec.date || '') + 'T' + String(rec.time || '00:00')) < vanNowParts().str) return json({ ok: false, error: 'past' }, 409, origin);
         if (uvm[2] === 'cancel') {
           rec.status = 'cancelled';
+          rec.cancelledAt = new Date().toISOString(); // Pack K (PU-02 #9): the viewing_cancelled rule anchors on the cancellation instant, not creation
           await env.LEADS.put('viewing:' + uvm[1], JSON.stringify(rec));
           await releaseSlot(env, rec.listingId, rec.date, rec.time, rec.id);
           if (ctx && ctx.waitUntil) ctx.waitUntil(gcalDeleteEvent(env, geid));
@@ -7419,19 +7889,30 @@ async function handleRequest(request, env, ctx) {
         // System 2: one-click follow-up draft in the lead's language,
         // queued as HELD mail (kind 'followup' — rendered by the mailer
         // from the existing template family). Never sent from here.
-        const lid2 = decodeURIComponent(path.slice('/api/admin/leads/'.length, -'/draft'.length)).slice(0, 64);
+        // Pack K (PU-01 #6): the id is decoded defensively (malformed
+        // escapes answer 400, never a 500) and never truncated onto
+        // another lead; every lookup uses the NORMALIZED email; the
+        // mail is queued first and the score lookup afterwards is
+        // non-fatal; a same-day duplicate reports its own state.
+        let lid2 = '';
+        try { lid2 = decodeURIComponent(path.slice('/api/admin/leads/'.length, -'/draft'.length)); } catch (e) { return json({ ok: false, error: 'bad_id' }, 400, origin); }
+        if (!lid2 || lid2.length > 64) return json({ ok: false, error: 'bad_id' }, 400, origin);
         const lead = await env.LEADS.get('lead:' + lid2, { type: 'json' });
         if (!lead) return json({ ok: false, error: 'not_found' }, 404, origin);
-        if (!lead.email) return json({ ok: false, error: 'no_email' }, 400, origin);
-        if (await isBanned(env, lead.email)) return json({ ok: false, error: 'suppressed' }, 403, origin);
+        const em = normEmail(lead.email || '');
+        if (!em) return json({ ok: false, error: 'no_email' }, 400, origin);
+        if (await isBanned(env, em)) return json({ ok: false, error: 'suppressed' }, 403, origin);
+        if (lead.stage === 'dropped') return json({ ok: false, error: 'lead_dropped' }, 409, origin);
         let lang = lead.lang || '';
         if (!lang) {
-          try { const u = await env.LEADS.get('user:' + lead.email, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {}
+          try { const u = await env.LEADS.get('user:' + em, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {}
         }
         lang = validLang(lang);
-        const sm = await puLeadScores(env);
-        const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lid2 }, { key: 'draft:' + lid2 + ':' + todayVancouver() });
-        return json({ ok: true, queued: !!mid, id: mid, lang: lang, score: sm.map[lid2] || null }, 200, origin);
+        const mid = await queueMail(env, { kind: 'followup', to: em, lang: lang, name: lead.name || '', ref: lid2 }, { key: 'draft:' + lid2 + ':' + todayVancouver() });
+        if (mid === null) return json({ ok: true, state: 'already_queued', queued: false, alreadyQueued: true, id: null, lang: lang, score: null }, 200, origin);
+        let score = null;
+        try { score = await env.LEADS.get('lscore:' + lid2, { type: 'json' }); } catch (e) {}
+        return json({ ok: true, state: 'queued', queued: true, id: mid, lang: lang, score: score }, 200, origin);
       }
 
       // ---- admin: portal brain (2026-11-01) ----
@@ -7633,19 +8114,32 @@ async function handleRequest(request, env, ctx) {
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
-        const name = String(d.name || 'file').replace(/[\u0000-\u001f<>:"/\\|?*]/g, ' ').trim().slice(0, 120) || 'file';
+        // Pack K (PU-03 #6): bidi-control characters are stripped from
+        // the stored name (they can spoof the displayed filename in
+        // the portal and in mail clients). U+200C (ZWNJ) is NOT in the
+        // strip set — Persian names legitimately need it.
+        const name = String(d.name || 'file').replace(/[\u0000-\u001f\u202a-\u202e\u2066-\u2069<>:"/\\|?*]/g, ' ').trim().slice(0, 100) || 'file';
         const type = String(d.type || 'application/octet-stream').slice(0, 80);
-        const mls = String(d.mls || '').slice(0, 40);
+        const mls = String(d.mls || '').trim().toUpperCase().slice(0, 40);
         const b64 = String(d.dataBase64 || '');
         if (!b64 || !/^[A-Za-z0-9+/=\s]+$/.test(b64)) return json({ ok: false, error: 'validation' }, 400, origin);
         const approxBytes = Math.floor(b64.replace(/\s/g, '').length * 3 / 4);
         if (approxBytes > PU_FILE_MAX) return json({ ok: false, error: 'too_large' }, 413, origin);
+        // Pack K (PU-03 #6): declared type must be allowlisted AND
+        // match the content's magic bytes.
+        if (PU_FILE_TYPES.indexOf(type) === -1) return json({ ok: false, error: 'bad_type' }, 400, origin);
+        if (!puFileMagicOk(type, b64)) return json({ ok: false, error: 'type_mismatch' }, 400, origin);
         let bytes = null;
         try { const bin = atob(b64.replace(/\s/g, '')); bytes = bin.length; } catch (e) { return json({ ok: false, error: 'validation' }, 400, origin); }
         if (bytes > PU_FILE_MAX) return json({ ok: false, error: 'too_large' }, 413, origin);
+        // Pack K (PU-03 #1): total-file cap — a document drawer, not
+        // an archive. (A failed count read does not block the upload.)
+        try { const existing = await kvList(env, { prefix: 'file:', limit: 1000 }); if (existing && existing.keys && existing.keys.length >= 200) return json({ ok: false, error: 'file_cap' }, 409, origin); } catch (e) {}
         const fid = Date.now().toString(36) + '-' + randHex(6);
         const rec = { id: fid, name: name, type: type, size: bytes, mls: mls, at: new Date().toISOString(), data: b64.replace(/\s/g, '') };
-        await env.LEADS.put('file:' + fid, JSON.stringify(rec));
+        // Pack K (PU-03 #1): meta fields ride as KV metadata so file
+        // listings never download bodies again.
+        await env.LEADS.put('file:' + fid, JSON.stringify(rec), { metadata: { name: name, type: type, size: bytes, mls: mls, at: rec.at, hasAi: 0 } });
         await idxAdd(env, 'files', fid);
         return json({ ok: true, file: { id: fid, name: name, type: type, size: bytes, mls: mls, at: rec.at } }, 200, origin);
       }
@@ -7653,7 +8147,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, files: await puFileMetas(env, String(url.searchParams.get('mls') || '')) }, 200, origin);
       }
       if (path.indexOf('/api/admin/files/') === 0 && request.method === 'GET') {
-        const fid = decodeURIComponent(path.slice('/api/admin/files/'.length)).slice(0, 64);
+        // Pack K (PU-03 #6): the id is validated, never decoded-then-
+        // truncated (a malformed escape used to 500; an over-long id
+        // could truncate onto another file).
+        let fid = '';
+        try { fid = decodeURIComponent(path.slice('/api/admin/files/'.length)); } catch (e) { return json({ ok: false, error: 'bad_id' }, 400, origin); }
+        if (!/^[a-z0-9-]{1,64}$/.test(fid)) return json({ ok: false, error: 'bad_id' }, 400, origin);
         const raw = await env.LEADS.get('file:' + fid);
         if (!raw) return json({ ok: false, error: 'not_found' }, 404, origin);
         let rec = null;
@@ -7662,72 +8161,141 @@ async function handleRequest(request, env, ctx) {
         let bin;
         try { const bs = atob(rec.data); bin = new Uint8Array(bs.length); for (let i = 0; i < bs.length; i++) bin[i] = bs.charCodeAt(i); }
         catch (e) { return json({ ok: false, error: 'not_found' }, 404, origin); }
-        return new Response(bin, { headers: { 'Content-Type': rec.type || 'application/octet-stream', 'Content-Disposition': 'attachment; filename="' + String(rec.name || 'file').replace(/"/g, '') + '"', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' } });
+        // RFC 5987 filename (UTF-8) + ASCII fallback, a sandboxed CSP
+        // so a stored file can never execute as a page, and the same
+        // CORS treatment json() gives every other response.
+        const dlName = String(rec.name || 'file');
+        const asciiName = dlName.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '') || 'file';
+        const hdrs = new Headers(cors(origin));
+        hdrs.set('Content-Type', rec.type || 'application/octet-stream');
+        hdrs.set('Content-Disposition', 'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + encodeURIComponent(dlName).replace(/'/g, '%27'));
+        hdrs.set('X-Content-Type-Options', 'nosniff');
+        hdrs.set('Cache-Control', 'no-store');
+        hdrs.set('Content-Security-Policy', "default-src 'none'; sandbox");
+        return new Response(bin, { headers: hdrs });
       }
       if (path.indexOf('/api/admin/files/') === 0 && request.method === 'DELETE') {
-        const fid = decodeURIComponent(path.slice('/api/admin/files/'.length)).slice(0, 64);
-        try { await env.LEADS.delete('file:' + fid); await idxRemove(env, 'files', fid); } catch (e) {}
+        let fid = '';
+        try { fid = decodeURIComponent(path.slice('/api/admin/files/'.length)); } catch (e) { return json({ ok: false, error: 'bad_id' }, 400, origin); }
+        if (!/^[a-z0-9-]{1,64}$/.test(fid)) return json({ ok: false, error: 'bad_id' }, 400, origin);
+        // Pack K (PU-03 #7): deletes report the truth — a storage
+        // failure is a 503 and a missing file a 404, never blanket ok.
+        let raw = null, readFailed = false;
+        try { raw = await env.LEADS.get('file:' + fid); } catch (e) { readFailed = true; }
+        if (readFailed) return json({ ok: false, error: 'delete_failed' }, 503, origin);
+        if (!raw) return json({ ok: false, error: 'not_found' }, 404, origin);
+        try { await env.LEADS.delete('file:' + fid); await idxRemove(env, 'files', fid); }
+        catch (e) { return json({ ok: false, error: 'delete_failed' }, 503, origin); }
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/search' && request.method === 'GET') {
         // Command-palette fallback for datasets the portal hasn't
-        // loaded yet; everything here is a bounded contains-match.
-        const q = String(url.searchParams.get('q') || '').trim().toLowerCase().slice(0, 80);
-        if (q.length < 2) return json({ ok: true, q: q, leads: [], listings: [], viewings: [], pairs: [] }, 200, origin);
-        const has = function () { for (let i = 0; i < arguments.length; i++) { if (String(arguments[i] || '').toLowerCase().indexOf(q) !== -1) return true; } return false; };
+        // loaded yet. Pack K (PU-03 #2/#8): matching runs over FOLDED
+        // text with exact > prefix > substring ranking; a digit-heavy
+        // query compares as a phone number; single-character queries
+        // are allowed for CJK scripts, where one character can be a
+        // whole word. Every source rides a generation cache (scores /
+        // viewing summary / a slim pairs index) — the old route
+        // rescanned viewings and market leads on every keystroke.
+        const rawQ = String(url.searchParams.get('q') || '').slice(0, 80);
+        const q = puFoldText(rawQ).trim();
+        const qDigits = q.replace(/\D/g, '');
+        const isPhoneQ = qDigits.length >= 7 && /^[+\d][\d\s().-]*$/.test(q);
+        const minLen = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(q) ? 1 : 2;
+        if (q.length < minLen) return json({ ok: true, q: rawQ.trim(), leads: [], listings: [], viewings: [], pairs: [] }, 200, origin);
+        const rank = function () {
+          let best = 0;
+          for (let i = 0; i < arguments.length; i++) {
+            const f = puFoldText(arguments[i]);
+            if (!f) continue;
+            if (f === q) best = Math.max(best, 3);
+            else if (f.indexOf(q) === 0) best = Math.max(best, 2);
+            else if (f.indexOf(q) !== -1) best = Math.max(best, 1);
+          }
+          return best;
+        };
+        const phoneRank = function (v) {
+          if (!isPhoneQ) return 0;
+          const d = String(v || '').replace(/\D/g, '');
+          if (!d) return 0;
+          if (d === qDigits || d.slice(-10) === qDigits.slice(-10)) return 3;
+          if (d.indexOf(qDigits) !== -1) return 1;
+          return 0;
+        };
+        const byRank = function (a, b) { return b._r - a._r; };
+        const strip = function (x) { const y = Object.assign({}, x); delete y._r; return y; };
         const sm = await puLeadScores(env);
-        const leads = sm.leads.filter(function (l) { return has(l.name, l.email, l.city, l.phone); }).slice(0, 8).map(function (l) { const s = sm.map[l.id]; return { id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, score: s ? s.score : null }; });
-        const listings = mergedCatalog().filter(function (h) { return has(h.street, h.city, h.mls); }).slice(0, 8).map(function (h) { return { mls: h.mls, street: h.street, city: h.city, price: h.price, status: h.status }; });
-        const viewings = [];
-        const vidx2 = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-        for (const id of vidx2.slice(0, 200)) {
-          const v = await env.LEADS.get('viewing:' + id, { type: 'json' });
-          if (v && has(v.name, v.email, v.listingId)) viewings.push({ id: v.id, name: v.name || '', email: v.email || '', date: v.date, time: v.time, listingId: v.listingId, status: v.status });
-          if (viewings.length >= 6) break;
-        }
-        const pairs = [];
-        const mkeys = await listAllKeys(env, 'mlead:', 2000);
-        for (const k of mkeys.slice(-300)) {
-          const r = await env.LEADS.get(k.name, { type: 'json' });
-          if (r && has(r.title, r.area)) pairs.push({ id: r.id, title: r.title || '', area: r.area || '', kind: r.kind || '' });
-          if (pairs.length >= 6) break;
-        }
-        return json({ ok: true, q: q, leads: leads, listings: listings, viewings: viewings, pairs: pairs }, 200, origin);
+        const leads = sm.leads.map(function (l) { const sc = sm.map[l.id]; const r = Math.max(rank(l.name, l.email, l.city), phoneRank(l.phone)); return r ? { _r: r, id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, score: sc ? sc.score : null } : null; }).filter(Boolean).sort(byRank).slice(0, 8).map(strip);
+        const listings = mergedCatalog().map(function (h) { const r = rank(h.street, h.city, h.mls); return r ? { _r: r, mls: h.mls, street: h.street, city: h.city, price: h.price, status: h.status } : null; }).filter(Boolean).sort(byRank).slice(0, 8).map(strip);
+        const vs = await puViewingSummary(env);
+        const viewings = vs.rows.map(function (v) { const r = Math.max(rank(v.name, v.email, v.listingId), phoneRank(v.phone)); return r ? { _r: r, id: v.id, name: v.name || '', email: v.email || '', date: v.date, time: v.time, listingId: v.listingId, status: v.status } : null; }).filter(Boolean).sort(byRank).slice(0, 6).map(strip);
+        const pairIdx = await adminCachedGen(env, 'searchpairs', async function () {
+          const keys = await listAllKeys(env, 'mlead:', 2000);
+          const slim = [];
+          for (const k of keys.slice(-300)) {
+            const r = await env.LEADS.get(k.name, { type: 'json' });
+            if (r) slim.push({ id: r.id, title: r.title || '', area: r.area || '', kind: r.kind || '' });
+          }
+          return slim;
+        });
+        const pairs = pairIdx.map(function (r) { const rk = rank(r.title, r.area); return rk ? { _r: rk, id: r.id, title: r.title, area: r.area, kind: r.kind } : null; }).filter(Boolean).sort(byRank).slice(0, 6).map(strip);
+        return json({ ok: true, q: rawQ.trim(), leads: leads, listings: listings, viewings: viewings, pairs: pairs }, 200, origin);
       }
       if (path === '/api/admin/reports/listing-performance' && request.method === 'GET') {
-        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
-        const h = puRichListing(mls);
-        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
+        // Pack K (PU-03 #5/#10): mls is normalized; an empty one is a
+        // 400, not a 404 hunt through an empty key. Untracked listings
+        // say tracked:false instead of dressing zeroes up as data,
+        // and the market block is labelled regional.
+        const mls = String(url.searchParams.get('mls') || '').trim().toUpperCase().slice(0, 40);
+        if (!mls) return json({ ok: false, error: 'mls_required' }, 400, origin);
+        const proj = puListingPayload(mls);
+        if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const totals = await perfRead(env);
-        const perf = (totals.listings && totals.listings[mls]) || { v: 0, s: 0, b: 0, l: 0 };
+        const perfRec = (totals.listings && totals.listings[mls]) || null;
+        const perf = perfRec || { v: 0, s: 0, b: 0, l: 0 };
         const ds = await mpReadStatsSafe(env);
-        return json({ ok: true, listing: h, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, since: totals.startedAt || null, sources: totals.sources || {} }, market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
+        const month0 = ((ds && ds.months) || [])[0] || null;
+        return json({ ok: true, listing: proj.listing, photos: proj.photos, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, since: totals.startedAt || null, sources: totals.sources || {}, tracked: !!perfRec, trackedLabel: perfRec ? 'tracked events' : 'not tracked yet' }, market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: await puFileMetas(env, mls) }, 200, origin);
       }
       if (path === '/api/admin/reports/property' && request.method === 'GET') {
-        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const mls = String(url.searchParams.get('mls') || '').trim().toUpperCase().slice(0, 40);
+        if (!mls) return json({ ok: false, error: 'mls_required' }, 400, origin);
+        const proj = puListingPayload(mls);
+        if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const h = puRichListing(mls);
-        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
         const ds = await mpReadStatsSafe(env);
-        return json({ ok: true, listing: h, neighbourhood: puNeighbourhood(h), market: ((ds && ds.months) || [])[0] || null, files: await puFileMetas(env, mls) }, 200, origin);
+        const month0 = ((ds && ds.months) || [])[0] || null;
+        return json({ ok: true, listing: proj.listing, photos: proj.photos, neighbourhood: puNeighbourhood(h), market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: await puFileMetas(env, mls) }, 200, origin);
       }
       if (path === '/api/admin/handbook-data' && request.method === 'GET') {
-        const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
+        const mls = String(url.searchParams.get('mls') || '').trim().toUpperCase().slice(0, 40);
+        if (!mls) return json({ ok: false, error: 'mls_required' }, 400, origin);
+        const proj = puListingPayload(mls);
+        if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const h = puRichListing(mls);
-        if (!h) return json({ ok: false, error: 'not_found' }, 404, origin);
         const leadId = String(url.searchParams.get('leadId') || '').slice(0, 64);
         let client = null, viewing = null;
         if (leadId) {
           const l = await env.LEADS.get('lead:' + leadId, { type: 'json' });
           if (l) {
             let lang = l.lang || '';
-            if (!lang && l.email) { try { const u = await env.LEADS.get('user:' + l.email, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {} }
+            if (!lang && l.email) { try { const u = await env.LEADS.get('user:' + normEmail(l.email), { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {} }
             client = { id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '', lang: validLang(lang) };
             if (l.email) {
-              const vidx3 = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-              for (const vid of vidx3.slice(0, 200)) {
-                const v = await env.LEADS.get('viewing:' + vid, { type: 'json' });
-                if (v && normEmail(v.email || '') === normEmail(l.email) && v.listingId === mls && v.status !== 'cancelled') { viewing = { date: v.date, time: v.time, status: v.status }; break; }
-              }
+              // Pack K (PU-03 #11): the viewing comes from the shared
+              // summary — the earliest today-or-later viewing, else
+              // the latest past one. The old code took whichever
+              // record the index surfaced first.
+              try {
+                const vs = await puViewingSummary(env);
+                const mine = vs.rows.filter(function (v) { return normEmail(v.email || '') === normEmail(l.email) && v.listingId === mls && v.status !== 'cancelled'; });
+                const today = todayVancouver();
+                const byDTa = function (a, b) { return String(a.date + ' ' + a.time).localeCompare(String(b.date + ' ' + b.time)); };
+                const future = mine.filter(function (v) { return v.date >= today; }).sort(byDTa);
+                const past = mine.filter(function (v) { return v.date < today; }).sort(byDTa).reverse();
+                const pick = future[0] || past[0] || null;
+                if (pick) viewing = { date: pick.date, time: pick.time, status: pick.status };
+              } catch (e) {}
             }
           }
         }
@@ -7738,35 +8306,63 @@ async function handleRequest(request, env, ctx) {
         const rateMonth = monthsArr.find(function (m) { return m && m.rates && typeof m.rates.bestFixed5 === 'number'; }) || null;
         let mortgage = null;
         const rate = rateMonth ? rateMonth.rates.bestFixed5 : null;
-        if (rate && h.price) {
-          const principal = Math.round(h.price * 0.8);
-          const r = rate / 100 / 12, n = 300;
-          const pmt = Math.round(principal * r / (1 - Math.pow(1 + r, -n)));
-          mortgage = { price: h.price, downPayment: h.price - principal, principal: principal, ratePct: rate, years: 25, monthly: pmt, rateMonth: rateMonth.month || '', rateSource: (rateMonth.rates.source || 'market dataset') + ' · ' + (rateMonth.rates.sourceDate || ''), estimate: true };
+        // Pack K (PU-03 #3): the price is validated as a number
+        // before any math, the payment uses Canadian semi-annual
+        // compounding, and the assumptions + rate staleness travel
+        // with the payload so a printed handbook can be audited.
+        const price = (typeof h.price === 'number' && isFinite(h.price) && h.price > 0) ? h.price : null;
+        if (rate && price) {
+          const principal = Math.round(price * 0.8);
+          const pmt = caMonthlyPayment(principal, rate, 25);
+          mortgage = { price: price, downPayment: price - principal, principal: principal, ratePct: rate, years: 25, monthly: pmt, rateMonth: rateMonth.month || '', rateSource: (rateMonth.rates.source || 'market dataset') + ' · ' + (rateMonth.rates.sourceDate || ''), estimate: true, rateStale: !!rateMonth.month && String(rateMonth.month) !== todayVancouver().slice(0, 7), assumptions: { compounding: 'semi-annual (Canada)', amortizationYears: 25, downPaymentPct: 20, paymentFrequency: 'monthly', rateBasis: 'best 5-year fixed from the market dataset' } };
         }
-        const photos = [];
-        if (h.photo) photos.push(h.photo);
-        if (Array.isArray(h.photos)) for (const p of h.photos) if (photos.indexOf(p) === -1) photos.push(p);
+        const photos = proj.photos;
         // Phase 2 (2026-11-01): ?includeFiles=1 returns the files'
         // content (base64) alongside the metas, so the handbook can
         // embed them; default (no flag) stays metas-only.
         const incFiles = url.searchParams.get('includeFiles') === '1';
-        return json({ ok: true, listing: h, photos: photos, client: client, viewing: viewing, brand: { name: settings.brand || '', email: settings.email || '', phone: settings.phone || '' }, neighbourhood: puNeighbourhood(h), mortgage: mortgage, files: incFiles ? await puFilesFull(env, mls) : await puFileMetas(env, mls), includeFiles: incFiles }, 200, origin);
+        return json({ ok: true, listing: proj.listing, photos: photos, client: client, viewing: viewing, brand: { name: settings.brand || '', email: settings.email || '', phone: settings.phone || '' }, neighbourhood: puNeighbourhood(h), mortgage: mortgage, mortgageNote: mortgage ? null : (rate ? 'price_unavailable' : 'rate_unavailable'), files: incFiles ? await puFilesFull(env, mls) : await puFileMetas(env, mls), includeFiles: incFiles }, 200, origin);
       }
 
       // ---- admin: portal upgrade — automation rules (system 5) ----
       if (path === '/api/admin/rules' && request.method === 'GET') {
-        const cfg = await puRulesGet(env);
-        return json({ ok: true, rules: cfg.rules, seeded: cfg.seeded, triggers: PU_RULE_TRIGGERS, actions: PU_RULE_ACTIONS }, 200, origin);
+        // Pack K (PU-02 #4): a corrupt config is a 503, never a
+        // silent preset list dressed up as the owner's rules.
+        let cfg = null;
+        try { cfg = await puRulesGet(env); } catch (e) { return json({ ok: false, error: 'rules_unavailable' }, 503, origin); }
+        return json({ ok: true, rules: cfg.rules, seeded: cfg.seeded, updatedAt: cfg.updatedAt || null, triggers: PU_RULE_TRIGGERS, actions: PU_RULE_ACTIONS }, 200, origin);
       }
       if (path === '/api/admin/rules' && request.method === 'PUT') {
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.rules)) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Pack K (PU-02 #8): cleaning reports what it dropped; a
+        // non-empty submission that cleans to nothing is a 400 (the
+        // old code stored an empty config and reported success).
+        // Duplicate ids are regenerated, never stored twice.
         const clean = [];
-        for (const r of d.rules.slice(0, 50)) { const c = puCleanRule(r); if (c) clean.push(c); }
-        await env.LEADS.put('cfg:rules', JSON.stringify({ rules: clean, updatedAt: new Date().toISOString() }));
-        return json({ ok: true, rules: clean }, 200, origin);
+        const seenIds = new Set();
+        let rejected = 0;
+        for (const r of d.rules.slice(0, 50)) {
+          const c = puCleanRule(r);
+          if (!c) { rejected++; continue; }
+          if (seenIds.has(c.id)) c.id = 'rule_' + randHex(6);
+          seenIds.add(c.id);
+          clean.push(c);
+        }
+        rejected += Math.max(0, d.rules.length - 50);
+        if (d.rules.length > 0 && clean.length === 0) return json({ ok: false, error: 'no_valid_rules', rejected: rejected }, 400, origin);
+        // Optimistic concurrency: when the client names the config
+        // version it based its edit on, a mismatch is a 409 instead
+        // of a silent overwrite of someone else's save.
+        if (d.baseUpdatedAt) {
+          let cur = null;
+          try { cur = await env.LEADS.get('cfg:rules', { type: 'json' }); } catch (e) {}
+          if (cur && cur.updatedAt && cur.updatedAt !== d.baseUpdatedAt) return json({ ok: false, error: 'conflict', updatedAt: cur.updatedAt }, 409, origin);
+        }
+        const updatedAt = new Date().toISOString();
+        await env.LEADS.put('cfg:rules', JSON.stringify({ rules: clean, updatedAt: updatedAt }));
+        return json({ ok: true, rules: clean, rejected: rejected, updatedAt: updatedAt }, 200, origin);
       }
       if (path === '/api/admin/rules/log' && request.method === 'GET') {
         let log = [];
