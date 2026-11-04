@@ -343,28 +343,34 @@ function flushPerf(env) {
   });
   return perfFlushChain;
 }
-const PERF_TIMER_MS = 20000;
-let perfTimerArmed = false;
+const PERF_TIMER_MS = 10000;
+let perfTimerArmedAt = 0;
 // Pack E (R-01 N1): trailing-edge flush. An isolate that goes idle
 // below the count/age thresholds used to lose its tail entirely (the
 // cron isolate's flushPerf sees an empty buffer; the request isolate
 // that buffered the events is gone). A bump that did not threshold-
-// flush arms a one-shot ~20s timer inside ctx.waitUntil instead; at
-// this site's volume the extra put per idle tail is worth not losing
-// most events pre-launch.
+// flush arms a one-shot timer inside ctx.waitUntil instead; at this
+// site's volume the extra put per idle tail is worth not losing most
+// events pre-launch.
+// Pack M (PE-01 M1/M2): the timer flushes ONLY — it used to also
+// fold, but perf:totals is a read-modify-write with no CAS, so
+// request-isolate folds raced the cron fold and silently lost
+// counters (and stamped perf:lastfold, masking a dead cron). The
+// fold stays single-writer in scheduled(); perfRead merges unfolded
+// deltas, so the portal still reflects flushed tails immediately.
+// The armed flag is a TIMESTAMP: if waitUntil cancels the timer
+// mid-sleep its cleanup never runs, so an arming older than ~35s
+// counts as dead and the next bump re-arms.
 function perfArm(env, ctx) {
-  if (perfTimerArmed || !ctx || !ctx.waitUntil) return;
-  perfTimerArmed = true;
+  if (!ctx || !ctx.waitUntil) return;
+  if (perfTimerArmedAt && Date.now() - perfTimerArmedAt < 35000) return;
+  perfTimerArmedAt = Date.now();
   const p = (async function () {
     try { await new Promise(function (r) { setTimeout(r, PERF_TIMER_MS); }); } catch (e) {}
-    perfTimerArmed = false;
-    // Flush AND fold: the delta alone only surfaces via perfRead's
-    // merge — the stored totals (the portal's aggregates) move only
-    // at a fold, and an idle isolate may never see a scheduled() tick.
+    perfTimerArmedAt = 0;
     await flushPerf(env);
-    await perfFold(env);
   })();
-  try { ctx.waitUntil(p); } catch (e) { perfTimerArmed = false; }
+  try { ctx.waitUntil(p); } catch (e) { perfTimerArmedAt = 0; }
 }
 async function perfBump(env, ctx, kind, key) {
   try {
@@ -1711,6 +1717,11 @@ async function getUwm(env, email, search, seedMatches) {
   // the user and writes nothing; the next run retries cleanly.
   const wm = await env.LEADS.get(key, { type: 'json' });
   if (wm && Array.isArray(wm.notified)) {
+    // Pack M (PE-06 M1): __seeded is a transient first-sight flag. A
+    // record persisted by the pre-Pack-M toggle path can carry it —
+    // strip it on read (before the TTL touch below re-writes the
+    // record) so the search's alerts are never suppressed by it.
+    delete wm.__seeded;
     // TTL touch: setUwm only runs when a run actually queues mail, so
     // a quiet search's 90-day TTL used to lapse and reseed the same
     // way. Refresh the key (same content, fresh TTL) once it is over
@@ -1741,14 +1752,20 @@ async function getUwm(env, email, search, seedMatches) {
   return ret;
 }
 async function setUwm(env, email, searchId, wm) {
-  try { await env.LEADS.put('uwm:' + email + ':' + searchId, JSON.stringify(wm), { expirationTtl: UWM_TTL }); } catch (e) {}
+  // Pack M (PE-06 M1): never persist the transient __seeded flag —
+  // the searches toggle path passes getUwm's flagged return straight
+  // here, and a stored flag made runSearchAlerts skip that search
+  // forever. Strip on a copy; the caller's object keeps its flag.
+  const clean = Object.assign({}, wm);
+  delete clean.__seeded;
+  try { await env.LEADS.put('uwm:' + email + ':' + searchId, JSON.stringify(clean), { expirationTtl: UWM_TTL }); } catch (e) {}
 }
 // Read-only variant for display paths (admin panel): never writes, and
 // falls back to the legacy on-record fields when no uwm key exists yet.
 async function peekUwm(env, email, search) {
   let wm = null;
   try { wm = await env.LEADS.get('uwm:' + email + ':' + search.id, { type: 'json' }); } catch (e) { wm = null; }
-  if (wm && Array.isArray(wm.notified)) return wm;
+  if (wm && Array.isArray(wm.notified)) { delete wm.__seeded; return wm; } // Pack M (PE-06 M1): never surface the transient flag
   return {
     notified: (Array.isArray(search.notified) ? search.notified : []),
     alertsQueued: search.alertsQueued || 0,
@@ -2879,7 +2896,7 @@ function countKvEnv(env, budget) {
 }
 function kvLeft(env) { return (env && typeof env.__kvLeft === 'function') ? env.__kvLeft() : Infinity; }
 async function runSearchAlerts(env) {
-  const out = { users: 0, searches: 0, queued: 0, newMatches: 0, errors: 0, partial: false };
+  const out = { users: 0, searches: 0, queued: 0, newMatches: 0, errors: 0, partial: false, seeded: 0 };
   const all = await idxGet(env, 'users', 'user:', 5000);
   // Batching (F-04 H3): at most 200 users per run. A cursor key
   // remembers where the last run stopped, so users past the first 200
@@ -2914,10 +2931,15 @@ async function runSearchAlerts(env) {
     let canMail = null, uname = '', ulang = 'en';
     for (const s of active) {
       if (!s.id) continue; // Pack E (R-03 N1): never key a watermark 'uwm:<email>:undefined'
+      // Pack M (PE-05 M1): the budget is checked INSIDE the search
+      // loop too — one user with many searches used to overshoot the
+      // whole budget before the between-user check ever ran. Bail
+      // out as unprocessed so the cursor stays behind this user.
+      if (kvLeft(env) <= 0) { out.partial = true; return false; }
       out.searches++;
       const matches = matchSearch(s.criteria || {});
       const wm = await getUwm(env, email, s, matches); // a read error throws → caught by the caller → user skipped, nothing written (N1)
-      if (wm.__seeded) continue; // first sight: seeded from current matches — NO alert this run (N1)
+      if (wm.__seeded) { out.seeded++; continue; } // first sight: seeded from current matches — NO alert this run (N1); Pack M (PE-05 M4): seeded runs are counted, not silent
       const seen = new Set(wm.notified);
       const fresh = matches.filter(function (mm) { return !seen.has(mm); });
       if (!fresh.length) continue;
@@ -3036,14 +3058,20 @@ async function runAutomations(env, source) {
     if (!fresh) {
       result.error = 'catalog_stale';
     } else {
-      // Pack E (R-03 N2): alerts + reminders share one ~40-op KV
-      // budget per run — the free plan's per-invocation subrequest
-      // budget is also shared with the backup, the perf fold and the
-      // reconcile, and an unbudgeted run used to blow through it and
-      // misreport the wreckage as per-user errors.
-      const benv = countKvEnv(env, 40);
-      try { result.alerts = await runSearchAlerts(benv); } catch (e) { result.alerts = { error: 'failed' }; }
-      try { result.reminders = await runViewingReminders(benv); } catch (e) { result.reminders = { error: 'failed' }; }
+      // Pack E (R-03 N2): alerts + reminders run under a KV budget —
+      // the free plan's per-invocation subrequest budget is also
+      // shared with the backup, the perf fold and the reconcile, and
+      // an unbudgeted run used to blow through it and misreport the
+      // wreckage as per-user errors.
+      // Pack M (PE-05 M1): the two no longer share ONE counter —
+      // alerts ran first and could spend the whole 40, starving the
+      // reminders behind them. Each side now holds its own budget
+      // (alerts 28, reminders 14; same ~42 total envelope), so the
+      // reminders' share is a reserve, not a leftover.
+      const benvA = countKvEnv(env, 28);
+      const benvR = countKvEnv(env, 14);
+      try { result.alerts = await runSearchAlerts(benvA); } catch (e) { result.alerts = { error: 'failed' }; }
+      try { result.reminders = await runViewingReminders(benvR); } catch (e) { result.reminders = { error: 'failed' }; }
       if ((result.alerts && result.alerts.partial) || (result.reminders && result.reminders.partial)) result.partial = true;
     }
     try { await env.LEADS.put('automation:last', JSON.stringify({ at: new Date().toISOString(), source: result.source, alerts: result.alerts, reminders: result.reminders, error: result.error || null })); } catch (e) {}
@@ -4888,7 +4916,10 @@ async function brainMemoryRefresh(env, leadId, why) {
 
 /* ---- the critic (second reviewer): one revision loop, never blocks ---- */
 async function brainCriticCheck(env, text, ctxJson) {
-  const sys = 'You are a strict second reviewer (critic) for a real-estate advisor AI. Reply with ONLY a JSON object: {"pass":true} or {"pass":false,"issues":["..."]}. FAIL the text if: it states any figure (price, %, count, date, size) that does NOT appear in the CONTEXT JSON; it claims anything the context does not support; the language is wrong or badly mixed; the tone is pushy or misleading; it presents the advisor as licensed or a brokerage member. Be strict about figures and claims, lenient about style.';
+  // Licensed-state (2026-11-03): the critic no longer fails text for
+  // presenting the advisor as licensed — it fails the opposite, and
+  // any brokerage name the context does not support.
+  const sys = 'You are a strict second reviewer (critic) for a real-estate advisor AI. Reply with ONLY a JSON object: {"pass":true} or {"pass":false,"issues":["..."]}. FAIL the text if: it states any figure (price, %, count, date, size) that does NOT appear in the CONTEXT JSON; it claims anything the context does not support; the language is wrong or badly mixed; the tone is pushy or misleading; it presents the advisor as NOT licensed, or names a brokerage other than the one in the CONTEXT. Be strict about figures and claims, lenient about style.';
   const r = await brainCall(env, { task: 'critic', system: sys, prompt: 'CONTEXT (JSON):\n' + String(ctxJson || '').slice(0, 5000) + '\n\nTEXT TO CHECK:\n' + String(text || '').slice(0, 3000), maxTokens: 400 });
   if (!r.ok) return { known: false, pass: false, issues: [] };
   const p = brainJson(r.text);
@@ -4910,13 +4941,12 @@ async function brainWithCritic(env, opts) {
 }
 
 /* ---- compliance pass (deterministic): BCFSA / not-licensed rules ---- */
-const BRAIN_NOT_LICENSED_LINE = 'Please note: I am not yet a licensed real estate professional in British Columbia, and this message is general information only, not real estate advice.';
+const BRAIN_LICENCE_LINE = '— Erfan Hakimian, licensed REALTOR® in British Columbia.';
 function brainCompliance(text) {
   const issues = [];
   let t = String(text || '');
-  if (/\bI am a (licensed )?(REALTOR|real estate agent|broker)\b/i.test(t) || /\blicensed REALTOR/i.test(t)) issues.push('presents the advisor as licensed');
   if (/\bguarantee(d|s)?\b[^.]{0,40}\b(return|profit|appreciation|growth)\b/i.test(t) || /\byou will (make|earn|profit)\b/i.test(t) || /\brisk[- ]free\b/i.test(t)) issues.push('contains a guarantee / financial-promise claim');
-  if (!/not yet a licensed|not a licensed|not currently licensed/i.test(t)) { t += '\n\n' + BRAIN_NOT_LICENSED_LINE; issues.push('licensing disclosure appended'); }
+  if (!/licensed REALTOR/i.test(t)) { t += '\n\n' + BRAIN_LICENCE_LINE; issues.push('licensing disclosure appended'); }
   return { text: t, issues: issues };
 }
 
@@ -6256,7 +6286,12 @@ async function handleRequest(request, env, ctx) {
           // watermark and never a bare 500.
           let wm = null;
           try { wm = await getUwm(env, email, rec); } catch (e) { return json({ ok: false, error: 'unavailable' }, 503, origin); }
-          wm.notified = matchSearch(rec.criteria || {}).slice(0, 1000);
+          // Pack M (PE-06 should-fix): same cap as the seed/merge
+          // paths (max(1000, matches + 200), keeping the tail) — the
+          // old slice(0, 1000) dropped ids on >1000-match searches
+          // and the next run re-alerted them.
+          const tms = matchSearch(rec.criteria || {});
+          wm.notified = tms.slice(-Math.max(1000, tms.length + 200));
           wm.updatedAt = new Date().toISOString();
           await setUwm(env, email, rec.id, wm);
         }
@@ -9003,6 +9038,10 @@ export default {
       // delta first, then fold every outstanding delta key into
       // perf:totals — scheduled() is the sole writer of perf:totals, so
       // the fold's read-modify-write has no rival writer.
+      // Pack M (PE-01 M4): refresh the catalog first so the fold's
+      // prune actually runs — a cold cron isolate otherwise folds
+      // with catalogIsFresh() false and the junk defence stays off.
+      try { await refreshCustomCatalog(env, false); } catch (e) {}
       try { await flushPerf(env); await perfFold(env); } catch (e) { console.error(e); }
       // Automations (feature build 2026-10-29; Pack A runner): queue
       // saved-search alerts + viewing reminders through the shared
