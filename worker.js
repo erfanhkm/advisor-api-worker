@@ -1367,9 +1367,9 @@ async function prPostLicense(env) {
    The Site Admin portal is the source of truth for the listings Erfan adds
    himself: records live in KV under listing:<mls> in the exact shape the
    site's LISTINGS array uses, uploaded photos under lphoto:<id> (data
-   URLs), and site-wide settings under site:settings. The six built-in
-   sample listings stay in code (CATALOG here, the baked array on the
-   site); a KV record with the same mls OVERRIDES the sample everywhere,
+   URLs), and site-wide settings under site:settings. The built-in
+   listings stay in code (CATALOG here, the baked array on the
+   site); a KV record with the same mls OVERRIDES the built-in everywhere,
    and a {_deleted:true} record removes it. mergedCatalog() above is what
    every consumer (booking, availability, saved-search matching, desk)
    reads. */
