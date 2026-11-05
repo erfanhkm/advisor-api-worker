@@ -537,6 +537,63 @@ async function sha256hex(s) {
 function normIkey(v) { return cleanText(v, 300).replace(/\s+/g, ' ').trim().toLowerCase(); }
 function normPoolPhone(v) { const s = String(v || '').replace(/[^0-9+]/g, ''); return ((s.charAt(0) === '+' ? '+' : '') + s.replace(/\+/g, '')).slice(0, 20); }
 function postedMs(v) { const s = String(v || '').trim(); if (!s) return null; const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00Z' : s); return isFinite(t) ? t : null; }
+
+// Pack PF (PF-01R2/PF-02): shared radar helpers. own() closes the
+// prototype hole in every plain-object map lookup below (a hostile
+// post could otherwise feed 'constructor'/'__proto__' as a source,
+// code or street token). canonSource* is THE canonicaliser for radar
+// source names: pool sources[], priceBySource keys, primarySource and
+// coverage cell keys all store the canonical display name; basis
+// rules key off the lowercase token. Unknown source -> null (fail
+// closed: the coverage verdict flags unknown_source).
+function own(map, k) { return Object.prototype.hasOwnProperty.call(map, k); }
+const SOURCE_DISPLAY = { craigslist: 'Craigslist', kijiji: 'Kijiji', usedeverywhere: 'UsedEverywhere', castanet: 'Castanet', propertyguys: 'PropertyGuys.com', forsalebyowner: 'ForSaleByOwner.ca', facebook: 'Facebook', reddit: 'Reddit', karrot: 'Karrot', vansky: 'Vansky', yorkbbs: 'YorkBBS' };
+function canonSourceToken(raw) {
+  const t = String(raw == null ? '' : raw).toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!t) return '';
+  if (t.indexOf('used') === 0) return 'usedeverywhere'; // UsedVictoria / UsedNanaimo / ... are one network
+  if (t === 'propertyguyscom') return 'propertyguys';
+  if (t === 'forsalebyownerca' || t === 'fsboca') return 'forsalebyowner';
+  return t;
+}
+function canonSource(raw) { const t = canonSourceToken(raw); return (t && own(SOURCE_DISPLAY, t)) ? SOURCE_DISPLAY[t] : null; }
+// Pack PF (PF-01 MF2): per-source ALLOWED count bases; index 0 is the
+// canonical proof channel. effectiveBasis returns { basis, reason,
+// blocks }: reason null = clean; 'overclaim'/'basis_downgraded' are
+// flag-only (persisted as cell.basisMismatch, verdict proceeds);
+// 'unknown_source'/'basis_mismatch' block (verdict 'short') — a
+// mapping problem must never read as quietly healthy 'unverifiable'.
+const BASIS_ALLOWED = { craigslist: ['feed', 'platform'], kijiji: ['platform', 'feed'], usedeverywhere: ['platform'], castanet: ['platform'], propertyguys: ['sitemap'], forsalebyowner: ['sitemap'], facebook: ['none'], reddit: ['none'], karrot: ['none'], vansky: ['none'], yorkbbs: ['none'] };
+function effectiveBasis(sourceTok, claimedRaw) {
+  const claimed = (claimedRaw === 'platform' || claimedRaw === 'feed' || claimedRaw === 'sitemap' || claimedRaw === 'none') ? claimedRaw : 'none';
+  if (!sourceTok || !own(BASIS_ALLOWED, sourceTok)) return { basis: 'none', reason: 'unknown_source', blocks: true };
+  const allowed = BASIS_ALLOWED[sourceTok];
+  if (allowed.indexOf(claimed) !== -1) {
+    if (claimed === allowed[0]) return { basis: claimed, reason: null, blocks: false };
+    return { basis: claimed, reason: 'basis_downgraded', blocks: false };
+  }
+  if (allowed.length === 1 && allowed[0] === 'none') return { basis: 'none', reason: 'overclaim', blocks: false };
+  return { basis: 'none', reason: 'basis_mismatch', blocks: true };
+}
+// Pack PF (PF-01 M3): fail-closed error detection — any non-empty
+// errors shape counts (a bare number 3 or an object used to pass as
+// clean). c.errors == null on an ok claim is its own proof gap
+// ('errors_field_missing', handled in the verdict chain).
+function errorsPresent(c) { const e = c ? c.errors : undefined; if (e === true) return true; if (typeof e === 'string') return e.trim().length > 0; if (Array.isArray(e)) return e.length > 0; if (typeof e === 'number') return e > 0; if (e && typeof e === 'object') return Object.keys(e).length > 0; return false; }
+// Pack PF (PF-03 C1): seen-reason codes. 'other' is the WEAKEST code:
+// an incoming recognised non-other beats any stored value; a stored
+// recognised non-other survives vague incoming text; when neither
+// side maps to a code, the stored reason is kept as-is.
+const SEEN_REASONS = { not_fsbo: 1, agent_listing: 1, scam: 1, out_of_area: 1, duplicate: 1, wholesaler: 1, sold: 1, other: 1 };
+function seenReasonCode(raw, stored) {
+  const norm = function (v) { return String(v == null ? '' : v).toLowerCase().replace(/[^a-z ]/g, ' ').replace(/\s+/g, ' ').trim().replace(/ /g, '_'); };
+  const inc = norm(raw);
+  if (inc && inc !== 'other' && own(SEEN_REASONS, inc)) return inc;
+  const sto = norm(stored);
+  if (sto && sto !== 'other' && own(SEEN_REASONS, sto)) return sto;
+  if (inc === 'other' || sto === 'other') return 'other';
+  return stored ? String(stored).slice(0, 40) : '';
+}
 // Pack F (RDR-02 H6): pool identity is canonicalised HERE, from raw
 // fields the agent sends — a model following prose rules cannot apply
 // normalisation or hashing identically each run, and a fabricated
@@ -554,21 +611,65 @@ const STREET_ABBR = { st: 'street', ave: 'avenue', av: 'avenue', rd: 'road', dr:
 function canonAddressParts(raw) {
   let s = ' ' + String(raw == null ? '' : raw).toLowerCase() + ' ';
   let unit = '';
-  s = s.replace(/(#|\bapt\.?\b|\bapartment\b|\bunit\b|\bste\.?\b|\bsuite\b)\s*([a-z0-9]{1,8})\b/, function (m, d, u) { unit = u; return ' '; }); // word-bounded designators: "Steveston" must not lose its "ste"
-  s = s.replace(/[a-z]\d[a-z][ -]?\d[a-z]\d/g, ' '); // postal code dropped
+  s = s.replace(/(#|\b(?:apt|apartment|unit|ste|suite)\b\.?\s*)([a-z0-9]{1,8})\b/, function (m, d, u) { unit = u; return ' '; }); // Pack PF (PF-02): grouped designators; word-bounded so "Steveston" keeps its "ste"
+  s = s.replace(/\b[a-z]\d[a-z][ -]?\d[a-z]\d\b/g, ' '); // postal code dropped (bounded both sides: "A1B2C3"-in-a-word survives)
   s = s.replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Pack PF (PF-02): BC hyphen-unit form ("305-1234 Main St") — after
+  // punctuation stripping the address leads with two numbers; the
+  // SMALLER leading number is the unit. Range addresses ("1200-1400
+  // Main") misread the same way on every sighting, so records stay
+  // consistent (documented limit).
+  if (!unit) { const hm = s.match(/^(\d{1,6}) (\d{1,6}) (.+)$/); if (hm && parseInt(hm[1], 10) < parseInt(hm[2], 10)) { unit = hm[1]; s = (hm[2] + ' ' + hm[3]).trim(); } }
   if (!s) return { addr: '', unit: unit };
-  return { addr: s.split(' ').map(function (t) { return STREET_ABBR[t] || t; }).join(' ').slice(0, 160), unit: unit };
+  return { addr: s.split(' ').map(function (t) { return own(STREET_ABBR, t) ? STREET_ABBR[t] : t; }).join(' ').slice(0, 160), unit: unit };
 }
+function canonCityToken(areaRaw) { const a = cleanText(areaRaw, 80).toLowerCase(); const m = a.match(/[a-z][a-z .'-]*/); return m ? m[0].replace(/[^a-z]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40) : ''; }
+// Pack PF (PF-02 T2): derive a post id from the URL when the agent
+// sends none — last path segment, or a whitelisted id query param —
+// and only when it carries a digit run of >=5 (a bare year in a slug
+// must never become an identity).
+function urlTailId(urlRaw) {
+  const u = String(urlRaw || '');
+  const qi = u.indexOf('?');
+  if (qi !== -1) {
+    const params = u.slice(qi + 1).split('#')[0].split('&');
+    for (const prm of params) { const kv = prm.split('='); const k = (kv[0] || '').toLowerCase(); if (['tid', 'id', 'ad_id', 'adid', 'aid', 'item'].indexOf(k) !== -1) { let v = ''; try { v = decodeURIComponent(kv[1] || ''); } catch (e) { v = kv[1] || ''; } v = v.toLowerCase().replace(/[^a-z0-9._-]/g, ''); if (/\d{5,}/.test(v)) return v; } }
+  }
+  const pathPart = u.split('?')[0].split('#')[0].replace(/\/+$/, '');
+  const seg = (pathPart.split('/').pop() || '').toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  return /\d{5,}/.test(seg) ? seg : '';
+}
+// Pack PF (PF-02 M4, fixture-corrected): BC city names matched
+// against the TAIL of the canonical address — classified posts carry
+// the city inside the address string ('7421 18th Ave, Burnaby'),
+// while `area` may hold only a region label. Longest names first.
+const BC_CITY_TAIL = ['north vancouver', 'west vancouver', 'new westminster', 'port coquitlam', 'port moody', 'maple ridge', 'white rock', 'campbell river', 'prince george', 'fort langley', 'pitt meadows', 'abbotsford', 'chilliwack', 'coquitlam', 'vancouver', 'burnaby', 'richmond', 'surrey', 'langley', 'kelowna', 'nanaimo', 'victoria', 'kamloops', 'cranbrook', 'penticton', 'vernon', 'mission', 'squamish', 'whistler', 'delta', 'ladner', 'tsawwassen', 'cloverdale', 'aldergrove'];
 function poolKeyFor(it) {
   const addrIn = cleanText(it && it.address, 200);
+  const srcTok = canonSourceToken(it && it.source);
+  const src = srcTok || cleanText(it && it.source, 40).toLowerCase().replace(/[^a-z0-9]+/g, '');
   if (addrIn) {
     const parts = canonAddressParts(addrIn);
     const unitIn = cleanText(it.unit, 20).toLowerCase().replace(/[^a-z0-9-]/g, '');
-    if (parts.addr) return 'v2|a|' + parts.addr + '|' + (unitIn || parts.unit);
+    // City resolution: (1) a BC city matched at the address tail is
+    // stripped out of the street part and becomes the city token;
+    // (2) else the `area` field's token. The city token is part of
+    // the address key — the same street address in two cities is two
+    // records. An addressed post with NO city from either source
+    // falls through to the post-id key, never to a bare address.
+    let city = '';
+    if (parts.addr) {
+      const toks = parts.addr.split(' ');
+      for (const cn of BC_CITY_TAIL) {
+        const ct = cn.split(' ');
+        if (toks.length > ct.length && toks.slice(toks.length - ct.length).join(' ') === cn) { city = cn; parts.addr = toks.slice(0, toks.length - ct.length).join(' '); break; }
+      }
+    }
+    if (!city) city = canonCityToken(it && it.area);
+    if (parts.addr && city) return 'v2|a|' + parts.addr + '|' + (unitIn || parts.unit) + '|' + city;
   }
-  const pid = cleanText(it && it.postId, 80).toLowerCase().replace(/[^a-z0-9._-]/g, '');
-  const src = cleanText(it && it.source, 40).toLowerCase().replace(/[^a-z0-9]+/g, '');
+  let pid = cleanText(it && it.postId, 80).toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  if (!pid) pid = urlTailId(it && it.url);
   if (pid && src) return 'v2|' + src + ':' + pid;
   return normIkey(it && it.identityKey);
 }
@@ -585,7 +686,7 @@ const MOTIVATION_CODES = { must_sell: 'must sell', relocating: 'relocating', div
 function motivationCodesIn(v) {
   if (!Array.isArray(v)) return [];
   const out = [];
-  for (const c of v) { const k = String(c || '').toLowerCase().replace(/[^a-z_]/g, ''); if (MOTIVATION_CODES[k] && out.indexOf(k) === -1) out.push(k); if (out.length >= 5) break; }
+  for (const c of v) { const k = String(c || '').toLowerCase().replace(/[^a-z_]/g, ''); if (own(MOTIVATION_CODES, k) && out.indexOf(k) === -1) out.push(k); if (out.length >= 5) break; }
   return out;
 }
 function computeMotivation(f) {
@@ -599,7 +700,7 @@ function computeMotivation(f) {
   if ((f.relistCount || 0) >= 1) { score += 10; signals.push('relisted ×' + f.relistCount); }
   const codes = f.codes || [];
   score += Math.min(3, codes.length) * 8; // language channel capped at +24 (the shipped rubric's max)
-  codes.forEach(function (c) { signals.push("'" + (MOTIVATION_CODES[c] || c) + "' in post"); });
+  codes.forEach(function (c) { signals.push("'" + (own(MOTIVATION_CODES, c) ? MOTIVATION_CODES[c] : c) + "' in post"); });
   return { score: Math.min(100, score), signals: signals.slice(0, 5), facts: { days: days, daysBasis: basis, priceCuts: cuts, relistCount: f.relistCount || 0, codes: codes } };
 }
 async function radarEnabled(env) { try { const s = await env.LEADS.get('radar:settings', { type: 'json' }); return !!(s && s.enabled === true); } catch (e) { return false; } }
@@ -3615,7 +3716,7 @@ async function puToday(env) {
       const r = await env.LEADS.get(k.name, { type: 'json' });
       if (r && (r.kind === 'pair' || (Array.isArray(r.matches) && r.matches.length))) {
         pairs++;
-        if ((r.matchScore || 0) >= 80 && (r.motivation || 0) >= 60) hot++;
+        if (r.kind === 'pair' && r.status === 'new' && (r.matchScore || 0) >= 80 && typeof r.motivation === 'number' && r.motivation >= 60 && r.motivationSource === 'computed') hot++; // Pack PF (PF-04 MF1): computed-only hot rule — SAME predicate as the portal's isHot (kind pair + status new + numeric thresholds + motivationSource 'computed'; null pair motivation -> 0 -> fails, never coerced)
       }
     }
     return { enabled: !!st.enabled, pairs: pairs, hotPairs: hot, sampled: Math.min(keys.length, 300), total: keys.length };
@@ -6738,7 +6839,7 @@ async function handleRequest(request, env, ctx) {
           // re-checked SERVER-side. A buggy or injected agent can no
           // longer pair items never pooled, same-side items, or stale
           // entries. Rejections are counted, never stored.
-          let pairIds = null, pairMot = null, pairMotSignals = null;
+          let pairIds = null, pairMot = null, pairMotSignals = null, pairMotFacts = null, pairMotAsOf = null;
           if (kind === 'pair') {
             const did = String(it.demandId || ''), sid = String(it.supplyId || '');
             let okPair = /^[0-9a-f]{64}$/.test(did) && /^[0-9a-f]{64}$/.test(sid) && did !== sid;
@@ -6763,6 +6864,12 @@ async function handleRequest(request, env, ctx) {
             // and hostile post text can't inflate the hot-pair rule.
             pairMot = (srec && typeof srec.motivation === 'number') ? srec.motivation : null;
             pairMotSignals = (srec && Array.isArray(srec.motivationSignals)) ? srec.motivationSignals.slice(0, 5) : [];
+            // Pack PF (PF-03 MF1): the pair inherits the supply
+            // record's motivation FACTS and its as-of (the record's
+            // lastSeen) alongside the score — a bare copied number
+            // with no provenance read as a live fact in the portal.
+            pairMotFacts = (srec && srec.motivationFacts) || null;
+            pairMotAsOf = (srec && srec.lastSeen) || null;
           }
           const conf = Math.max(0, Math.min(100, parseInt(it.confidence, 10) || 0));
           const cleanMatch = function (m) {
@@ -6801,8 +6908,11 @@ async function handleRequest(request, env, ctx) {
             marketNote: cleanText(it.marketNote, 300),
             priceNum: priceNum,
             confidence: conf,
-            motivation: pairIds ? pairMot : ((typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : null), // Pack F: pairs inherit the supply record's computed score; unpaired leads keep the legacy clamped claim
+            motivation: pairIds ? pairMot : ((typeof it.motivation === 'number' && isFinite(it.motivation)) ? Math.max(0, Math.min(100, Math.round(it.motivation))) : null), // Pack F + Pack PF (PF-03 MF1): a pair's motivation fields are a SNAPSHOT of the supply record taken at store time (idempotent re-ingest of the same demand URL is blocked by the murl: dedupe key, so the snapshot freezes at first store BY DESIGN); unpaired leads keep the legacy clamped claim
             motivationSignals: pairIds ? pairMotSignals : (Array.isArray(it.motivationSignals) ? it.motivationSignals.map(function (s) { return cleanText(s, 80); }).filter(Boolean).slice(0, 5) : []),
+            motivationFacts: pairIds ? pairMotFacts : null, // Pack PF (PF-03 MF1): the facts behind a computed pair score (days / cuts / relists / codes)
+            motivationAsOf: pairIds ? pairMotAsOf : null, // Pack PF (PF-03 MF1): the supply record's lastSeen at snapshot time
+            motivationSource: pairIds ? 'computed' : ((typeof it.motivation === 'number' && isFinite(it.motivation)) ? 'claimed' : null), // Pack PF (PF-03 MF1 + PF-04 MF1/MF2): 'computed' = worker snapshot, 'claimed' = agent number, null = none — the hot-pair rule reads ONLY 'computed'
             risk: cleanText(it.risk, 300),
             presale: (it.presale && typeof it.presale === 'object') ? {
               project: cleanText(it.presale.project, 80), developer: cleanText(it.presale.developer, 80),
@@ -6837,7 +6947,7 @@ async function handleRequest(request, env, ctx) {
             if (l && l.kind === 'pair' && l.supplyId) {
               try {
                 const srec = await env.LEADS.get('mpool:' + l.supplyId, { type: 'json' });
-                if (srec) l.poolCounters = { priceCuts: srec.priceCuts || 0, relistCount: srec.relistCount || 0, seenDays: srec.seenCount || 0, lastSeen: srec.lastSeen || null };
+                if (srec) l.poolCounters = { priceCuts: srec.priceCuts || 0, relistCount: srec.relistCount || 0, seenDays: srec.seenCount || 0, lastSeen: srec.lastSeen || null, phoneConflict: !!srec.phoneConflict, phoneAlt: srec.phoneAlt || null, priceBySource: srec.priceBySource || null }; // Pack PF (PF-04 MF5 + delta vi): per-source prices + the phone-conflict anti-scam signal ride the live join
               } catch (e) {}
             }
           }
@@ -6859,27 +6969,34 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.items)) return json({ ok: false, error: 'validation' }, 400, origin);
         const items = d.items.slice(0, 100);
-        let saved = 0;
+        let saved = 0, processed = 0;
+        let ops = 0; // Pack PF (PF-03): the pool POST's ~40-op budget + { processed, partial } resume contract — the per-item GET below is UNCONDITIONAL (PF-03 C2), so a full batch is ~20 items and the runner resends the remainder
         const nowS2 = Math.floor(Date.now() / 1000);
-        for (const it of items) {
+        const nowIsoS = new Date().toISOString();
+        for (let ix = 0; ix < items.length; ix++) {
+          if (ops >= 40) break;
+          processed = ix + 1;
+          const it = items[ix];
           if (!it || typeof it !== 'object') continue;
           const u = safeUrl(it.url, 600);
           if (!u) continue;
           const pn = (typeof it.priceNum === 'number' && isFinite(it.priceNum) && it.priceNum > 0) ? Math.round(it.priceNum) : null;
           const seenKey = 'seen:' + (await sha256hex(u));
-          let keepPn = pn;
-          let keepReason = cleanText(it.reason, 40);
+          ops++;
           const prevSeen = await env.LEADS.get(seenKey, { type: 'json' });
+          let keepPn = pn;
           if (keepPn === null && prevSeen && typeof prevSeen.priceNum === 'number') keepPn = prevSeen.priceNum; // an unparsed re-post must not erase the price baseline (cycle 28, Claude M10)
-          if (!keepReason && prevSeen && prevSeen.reason) keepReason = String(prevSeen.reason).slice(0, 40);
+          const keepReason = seenReasonCode(it.reason, prevSeen && prevSeen.reason); // Pack PF (PF-03 C1): reasons are CODES from the allowlist — 'other' is the weakest, a stored recognised code survives vague incoming text
+          const firstAt = (prevSeen && prevSeen.firstAt) || nowIsoS; // Pack PF (PF-03 C2): firstAt is PERMANENT — re-review cadence measures from the FIRST review, not the latest mark
           // Pack F (RDR-02 M8): a "reviewed, not stored" judgment
           // expires after ~14 days (was 61) — a post misjudged from
           // hostile text gets re-evaluated instead of being skipped
           // forever; the reason rides along for the audit sample.
-          await env.LEADS.put(seenKey, JSON.stringify({ url: u, priceNum: keepPn, reason: keepReason, at: new Date().toISOString() }), { expiration: nowS2 + 14 * 86400 });
+          ops++;
+          await env.LEADS.put(seenKey, JSON.stringify({ url: u, priceNum: keepPn, reason: keepReason, at: nowIsoS, firstAt: firstAt }), { expiration: nowS2 + 14 * 86400 });
           saved++;
         }
-        return json({ ok: true, saved: saved, dropped: Math.max(0, d.items.length - 100) }, 200, origin);
+        return json({ ok: true, saved: saved, processed: processed, partial: processed < items.length, dropped: Math.max(0, d.items.length - 100) }, 200, origin);
       }
 
       // ---- market radar v4: raw candidate pool (private — the portal
@@ -6936,8 +7053,44 @@ async function handleRequest(request, env, ctx) {
             const ptype = pick(cleanText(it.type, 30), prev && prev.type);
             const summary = pick(cleanText(it.summary, 1200), prev && prev.summary);
             const postedStr = pick(cleanText(it.posted_at, 60), prev && prev.posted_at);
+            // Pack PF (PF-02 M3): canonical source + primary ownership.
+            // The primary source owns url/title/summary/beds/type, the
+            // headline price and the phone; other sources update only
+            // sources[]/priceBySource/lastSeen/seenCount (+ photoUrl
+            // when empty). Handover: primary silent >14 days while
+            // another source is seen inside the window -> the most
+            // recently seen source becomes primary (prevPrimary
+            // records the old one); a 14-day hold after primarySince
+            // stops handover flapping.
+            const srcCanon = canonSource(source);
+            let primarySource = (prev && prev.primarySource) || srcCanon || null;
+            let primarySince = (prev && prev.primarySince) || null;
+            let prevPrimary = (prev && prev.prevPrimary) || null;
+            let primaryLastSeen = (prev && prev.primaryLastSeen) || (prev && prev.lastSeen) || null;
+            let isPrimary = !!srcCanon && srcCanon === primarySource;
+            let handedOver = false;
+            if (!prev && srcCanon) { primarySince = nowIso; primaryLastSeen = nowIso; isPrimary = true; }
+            if (prev && srcCanon && primarySource && srcCanon !== primarySource) {
+              const plsMs = Date.parse(primaryLastSeen || '');
+              const holdOk = !primarySince || (nowMs - (Date.parse(primarySince) || 0)) > 14 * 86400000;
+              if (isFinite(plsMs) && (nowMs - plsMs) > 14 * 86400000 && holdOk) { prevPrimary = primarySource; primarySource = srcCanon; primarySince = nowIso; isPrimary = true; handedOver = true; }
+            }
+            if (isPrimary) primaryLastSeen = nowIso;
             const phoneIn = cleanText(it.phone, 40);
-            const phone = phoneIn ? normPoolPhone(phoneIn) : ((prev && prev.phone) || ''); // L4: digits/+ only
+            const phoneNorm = phoneIn ? normPoolPhone(phoneIn) : ''; // L4: digits/+ only
+            // Pack PF (PF-02 M3): phone is primary-owned (both sides
+            // already normalised, so formatting variants never
+            // conflict). A secondary source's DIFFERENT number is
+            // kept as phoneAlt + phoneConflict (anti-scam signal) —
+            // never silently adopted, never lost.
+            let phone = (prev && prev.phone) || '';
+            let phoneAlt = (prev && prev.phoneAlt) || null;
+            let phoneConflict = !!((prev && prev.phoneConflict));
+            if (phoneNorm) {
+              if (!phone) phone = phoneNorm;
+              else if (isPrimary || !primarySource) phone = phoneNorm;
+              else if (phoneNorm !== phone && !phoneAlt) { phoneAlt = phoneNorm; phoneConflict = true; }
+            }
             // Pack F (RDR-02 M5): the agent's numeric motivation claim
             // and its free-text signals are NO LONGER stored — the
             // score is computed below from worker-held facts; the agent
@@ -6947,38 +7100,64 @@ async function handleRequest(request, env, ctx) {
             const motCodes = codesIn.length ? codesIn : ((prev && prev.motivationFacts && Array.isArray(prev.motivationFacts.codes)) ? prev.motivationFacts.codes : []);
             // Pack F (RDR-02 H6): cross-source presence is a stored
             // fact (anti-scam cross-checks), maintained here.
+            // Pack PF (PF-02 M3): sources[] stores canonical display
+            // names (Kijiji/kijiji collapse); unknown tokens stay raw
+            // for presence but never own prices (srcCanon null).
             const sources = (prev && Array.isArray(prev.sources)) ? prev.sources.slice(0) : [];
-            if (source && sources.indexOf(source) === -1) sources.push(source);
+            const srcEntry = srcCanon || source;
+            if (srcEntry && sources.indexOf(srcEntry) === -1) sources.push(srcEntry);
             const sourcesCapped = sources.slice(-10);
+            // Pack PF (PF-02 M3): scalar ownership — a non-primary
+            // sighting fills a primary-owned scalar ONLY when the
+            // record's is empty (fill-once); otherwise prev wins.
+            const ownUrl = (prev && primarySource && !isPrimary && prev.url) ? prev.url : url;
+            const ownTitle = (prev && primarySource && !isPrimary && prev.title) ? prev.title : title;
+            const ownSummary = (prev && primarySource && !isPrimary && prev.summary) ? prev.summary : summary;
+            const ownBeds = (prev && primarySource && !isPrimary && prev.beds) ? prev.beds : beds;
+            const ownType = (prev && primarySource && !isPrimary && prev.type) ? prev.type : ptype;
+            const ownPriceStr = (prev && primarySource && !isPrimary && prev.price) ? prev.price : priceStr;
             // Photo URL is a match-time linking attribute (H6): query
             // string stripped (signed URLs change every scan), never
             // part of the identity key.
             let photoUrl = (prev && prev.photoUrl) || '';
             const photoIn = cleanText(it.photoUrl, 600);
             if (photoIn) { const pq = photoIn.split('?')[0]; if (safeUrl(pq, 600)) photoUrl = pq; }
-            // Pack E (RDR-01 M5): price plausibility gate — a candidate
-            // outside 10k–1e9, or outside 0.4×–2.5× of the last price,
-            // is a scrape typo: keep the previous price, flag 'jump',
-            // and neither trail it nor count it as a cut.
+            // Pack PF (PF-02 M3): per-source price memory. priceBySource
+            // maps canonical source -> { p, at }; cuts and the trail are
+            // judged ONLY against the SAME source's last accepted price
+            // (cross-source deltas used to book cuts that never
+            // happened). Entries older than 60 days are ignored for
+            // cuts and re-seeded. The map loads into a null-prototype
+            // object, own keys only, capped at 10; legacy bare-number
+            // entries are wrapped. The 'unknown' bucket never books.
+            const pbs = Object.create(null);
+            if (prev && prev.priceBySource && typeof prev.priceBySource === 'object') {
+              for (const pk of Object.keys(prev.priceBySource).slice(0, 10)) {
+                const pe = prev.priceBySource[pk];
+                if (typeof pe === 'number' && isFinite(pe)) pbs[pk] = { p: pe, at: (prev && prev.lastSeen) || null };
+                else if (pe && typeof pe.p === 'number' && isFinite(pe.p)) pbs[pk] = { p: pe.p, at: pe.at || null };
+              }
+            }
+            // Pack E (RDR-01 M5) + Pack PF: the plausibility gate
+            // compares against THIS source's last accepted price when
+            // known (else the headline): outside 10k–1e9 or 0.4×–2.5×
+            // is a scrape typo — flag 'jump', trail nothing, count
+            // nothing. priceNum stays the HEADLINE (primary-owned);
+            // acceptedP is this sighting's accepted price.
             const rawPriceNum = (typeof it.priceNum === 'number' && isFinite(it.priceNum) && it.priceNum > 0) ? Math.round(it.priceNum) : null;
             let priceNum = (prev && typeof prev.priceNum === 'number') ? prev.priceNum : null;
             let priceFlag = (prev && prev.priceFlag) || null;
+            let acceptedP = null;
+            const ownEnt = (srcCanon && own(pbs, srcCanon)) ? pbs[srcCanon] : null;
+            const ownEntFresh = !!(ownEnt && (nowMs - (Date.parse(ownEnt.at || '') || 0)) <= 60 * 86400000);
+            const gateBase = ownEntFresh ? ownEnt.p : priceNum;
             if (rawPriceNum !== null) {
-              if (rawPriceNum < 10000 || rawPriceNum > 1000000000 || (priceNum !== null && (rawPriceNum < priceNum * 0.4 || rawPriceNum > priceNum * 2.5))) priceFlag = 'jump';
-              else { priceNum = rawPriceNum; priceFlag = null; }
+              if (rawPriceNum < 10000 || rawPriceNum > 1000000000 || (gateBase !== null && (rawPriceNum < gateBase * 0.4 || rawPriceNum > gateBase * 2.5))) priceFlag = 'jump';
+              else { acceptedP = rawPriceNum; priceFlag = null; }
             }
-            // Price trail: appends ONLY on an actual (accepted) price
-            // change, capped at 10 points for display; priceCuts is a
-            // LIFETIME monotonic counter (M5) — never recomputed from
-            // the capped window, and demand-side budget moves never
-            // count as cuts.
+            if (!prev && acceptedP !== null) priceNum = acceptedP;
             let hist = (prev && Array.isArray(prev.priceHistory)) ? prev.priceHistory.filter(function (h) { return h && typeof h.price === 'number'; }).slice(-10) : [];
-            let priceCuts = (prev && typeof prev.priceCuts === 'number') ? prev.priceCuts : 0;
-            if (priceNum !== null && (!hist.length || hist[hist.length - 1].price !== priceNum)) {
-              if (hist.length && priceNum < hist[hist.length - 1].price && side !== 'demand') priceCuts++;
-              hist.push({ at: nowIso, price: priceNum });
-              hist = hist.slice(-10);
-            }
+            let priceCuts = (prev && typeof prev.priceCuts === 'number') ? prev.priceCuts : 0; // LIFETIME monotonic (M5) — never recomputed from the capped trail; demand-side moves never count
             // Pack E (RDR-01 M1): relist detection follows the POST,
             // not the scan cadence — the post's own posted_at vs the
             // tombstone's lastSeen (or, for the delete+repost-inside-
@@ -6987,7 +7166,8 @@ async function handleRequest(request, env, ctx) {
             let relisted = !!((prev && prev.relisted));
             let relistBump = false;
             let tomb = null, tombRead = false;
-            const pMs = postedMs(postedStr);
+            const pMsRaw = postedMs(postedStr);
+            const pMs = (pMsRaw !== null && pMsRaw >= nowMs - 730 * 86400000 && pMsRaw <= nowMs + 86400000) ? pMsRaw : null; // Pack PF (PF-02): plausibility window [now-730d, now+1d] — negative ages and year-9999 stamps are data errors, not facts
             if (prev) {
               const prevMs = postedMs(prev.posted_at);
               if (pMs !== null && prevMs !== null && pMs > prevMs) { relistCount++; relisted = true; relistBump = true; }
@@ -6999,14 +7179,16 @@ async function handleRequest(request, env, ctx) {
                 if (pMs !== null && isFinite(tombSeen) && pMs > tombSeen) {
                   relistCount = (tomb.relistCount || 0) + 1; relisted = true; relistBump = true;
                   priceCuts = (tomb.priceCuts || 0);
-                  // A post-gap cut still registers (M1): the tombstone
-                  // carries the last price, so the trail survives the
-                  // live record's expiry.
-                  if (side !== 'demand' && priceNum !== null && typeof tomb.lastPrice === 'number') {
-                    if (!hist.length) hist = [{ at: tomb.lastSeen || nowIso, price: tomb.lastPrice }];
-                    if (priceNum < tomb.lastPrice) priceCuts++;
-                    if (hist[hist.length - 1].price !== priceNum) hist.push({ at: nowIso, price: priceNum });
-                    hist = hist.slice(-10);
+                  // Pack PF (PF-02): the tombstone seeds priceBySource
+                  // ONLY when its recorded source is THIS sighting's
+                  // source (legacy tombstones without lastSource never
+                  // seed) — a post-gap cut then flows through the
+                  // unified same-source rule below instead of the old
+                  // cross-source special case (M1's trail survives via
+                  // the seeded point).
+                  if (srcCanon && tomb.lastSource && tomb.lastSource === srcCanon && typeof tomb.lastPrice === 'number') {
+                    if (!own(pbs, srcCanon)) pbs[srcCanon] = { p: tomb.lastPrice, at: tomb.lastSeen || null };
+                    if (!hist.length) hist = [{ at: tomb.lastSeen || nowIso, price: tomb.lastPrice, src: srcCanon }];
                   }
                 } else {
                   relistCount = tomb.relistCount || 0; // same post re-sighted after TTL expiry — NOT a relist
@@ -7015,6 +7197,24 @@ async function handleRequest(request, env, ctx) {
               }
             }
             if (relistBump) relistedN++;
+            // Pack PF (PF-02 M3): unified same-source price accounting.
+            // A cut = this source's accepted price below ITS OWN last
+            // accepted price (fresh entry only); the trail gains a
+            // point (tagged with its source) only when this source's
+            // price actually moves; a handover moves the headline to
+            // the new primary's price WITHOUT counting a cut.
+            if (acceptedP !== null && srcCanon) {
+              const ent2 = own(pbs, srcCanon) ? pbs[srcCanon] : null;
+              const entFresh2 = !!(ent2 && (nowMs - (Date.parse(ent2.at || '') || 0)) <= 60 * 86400000);
+              if (entFresh2 && acceptedP < ent2.p && side !== 'demand') priceCuts++;
+              if (!ent2 || ent2.p !== acceptedP) { hist.push({ at: nowIso, price: acceptedP, src: srcCanon }); hist = hist.slice(-10); }
+              pbs[srcCanon] = { p: acceptedP, at: nowIso };
+            }
+            if (acceptedP !== null && handedOver && (!hist.length || hist[hist.length - 1].price !== acceptedP)) { hist.push({ at: nowIso, price: acceptedP, src: srcCanon }); hist = hist.slice(-10); }
+            if (acceptedP !== null && (isPrimary || !primarySource)) priceNum = acceptedP;
+            const pbsOut = {}; { const pks = Object.keys(pbs).slice(0, 10); for (const k2 of pks) pbsOut[k2] = pbs[k2]; }
+            const pbsPrices = {}; for (const k3 of Object.keys(pbsOut)) pbsPrices[k3] = pbsOut[k3].p;
+            const prevPbsPrices = {}; if (prev && prev.priceBySource && typeof prev.priceBySource === 'object') { for (const k4 of Object.keys(prev.priceBySource)) { const e4 = prev.priceBySource[k4]; prevPbsPrices[k4] = (typeof e4 === 'number') ? e4 : ((e4 && typeof e4.p === 'number') ? e4.p : null); } }
             // Pack E (RDR-01 H2): seenCount = DAYS seen, not sightings.
             const prevDay = (prev && prev.lastSeen) ? String(prev.lastSeen).slice(0, 10) : '';
             const seenCount = prev ? ((prev.seenCount || 1) + (prevDay !== todayDay ? 1 : 0)) : 1;
@@ -7027,22 +7227,26 @@ async function handleRequest(request, env, ctx) {
             const motivationFacts = motC ? motC.facts : null;
             // H2: an unchanged sighting <24h old writes NOTHING.
             const changed = !prev || priceNum !== prev.priceNum || priceFlag !== ((prev && prev.priceFlag) || null) ||
-              title !== (prev.title || '') || area !== (prev.area || '') || region !== (prev.region || '') || summary !== (prev.summary || '') ||
-              phone !== (prev.phone || '') || beds !== (prev.beds || '') || ptype !== (prev.type || '') || postedStr !== (prev.posted_at || '') ||
-              motivation !== (prev.motivation !== undefined ? prev.motivation : null) || kind !== prev.kind || url !== prev.url || relistBump ||
+              ownTitle !== (prev.title || '') || area !== (prev.area || '') || region !== (prev.region || '') || ownSummary !== (prev.summary || '') ||
+              phone !== (prev.phone || '') || ownBeds !== (prev.beds || '') || ownType !== (prev.type || '') || postedStr !== (prev.posted_at || '') ||
+              motivation !== (prev.motivation !== undefined ? prev.motivation : null) || kind !== prev.kind || ownUrl !== (prev.url || '') || relistBump ||
               JSON.stringify(motivationSignals) !== JSON.stringify(prev.motivationSignals || []) ||
+              JSON.stringify(motCodes) !== JSON.stringify((prev.motivationFacts && prev.motivationFacts.codes) || []) ||
+              JSON.stringify(pbsPrices) !== JSON.stringify(prevPbsPrices) ||
+              primarySource !== ((prev && prev.primarySource) || null) || phoneAlt !== ((prev && prev.phoneAlt) || null) || phoneConflict !== !!((prev && prev.phoneConflict)) ||
               JSON.stringify(sourcesCapped) !== JSON.stringify((prev && prev.sources) || []) || photoUrl !== ((prev && prev.photoUrl) || '');
             const prevSeenMs = prev ? Date.parse(prev.lastSeen || '') : NaN;
             if (prev && !changed && isFinite(prevSeenMs) && (nowMs - prevSeenMs) < 86400000) { unchanged++; continue; }
             const rec = {
               id: key.slice(6), identityKey: ikey, side: side, kind: kind,
-              title: title, area: area, region: region, source: source, category: category,
-              url: url, price: priceStr, priceNum: priceNum, priceFlag: priceFlag,
+              title: ownTitle, area: area, region: region, source: srcCanon || source, category: category,
+              url: ownUrl, price: ownPriceStr, priceNum: priceNum, priceFlag: priceFlag,
               priceHistory: hist, priceCuts: priceCuts,
+              priceBySource: pbsOut, primarySource: primarySource, primarySince: primarySince, prevPrimary: prevPrimary, primaryLastSeen: primaryLastSeen,
               relistCount: relistCount, relisted: relisted,
               motivation: motivation, motivationSignals: motivationSignals, motivationFacts: motivationFacts,
               sources: sourcesCapped, photoUrl: photoUrl,
-              beds: beds, type: ptype, phone: phone, summary: summary, posted_at: postedStr,
+              beds: ownBeds, type: ownType, phone: phone, phoneAlt: phoneAlt, phoneConflict: phoneConflict, summary: ownSummary, posted_at: postedStr,
               firstSeen: (prev && prev.firstSeen) || nowIso,
               lastSeen: nowIso,
               seenCount: seenCount
@@ -7060,9 +7264,9 @@ async function handleRequest(request, env, ctx) {
               const ta = tomb ? Date.parse(tomb.tombAt || '') : NaN;
               if (!tomb || !isFinite(ta) || (nowMs - ta) > 7 * 86400000) wantTomb = true;
             }
-            if (wantTomb) { ops++; try { await env.LEADS.put(xkey, JSON.stringify({ relistCount: relistCount, lastSeen: nowIso, lastPrice: priceNum, priceCuts: priceCuts, tombAt: nowIso }), { expirationTtl: 15552000 }); } catch (e) {} }
+            if (wantTomb) { ops++; try { await env.LEADS.put(xkey, JSON.stringify({ relistCount: relistCount, lastSeen: nowIso, lastPrice: priceNum, lastSource: primarySource || srcCanon || null, priceCuts: priceCuts, tombAt: nowIso }), { expirationTtl: 15552000 }); } catch (e) {} }
             if (prev) updated++; else added++;
-          } catch (e) { skipped++; } // Pack E (RDR-01 H2/L3): per-item isolation — one bad item never 500s the batch after partial writes
+          } catch (e) { curId = null; skipped++; } // Pack E (RDR-01 H2/L3): per-item isolation — one bad item never 500s the batch after partial writes. Pack PF (PF-02): a failed item reports a NULL id, never the key it died on
           finally { idsOut.push(curId); }
         }
         return json({ ok: true, added: added, updated: updated, skipped: skipped, unchanged: unchanged, relisted: relistedN, processed: processed, partial: processed < items.length, dropped: Math.max(0, d.items.length - 60), ids: idsOut }, 200, origin);
@@ -7150,7 +7354,9 @@ async function handleRequest(request, env, ctx) {
           const part = function (v, n) { return cleanText(v, n).replace(/\|/g, '/'); };
           const source = part(c.source, 40), region = part(c.region, 40), category = part(c.category, 40);
           if (!source || !region || !category) { skippedCells++; continue; }
-          const ck = source + '|' + region + '|' + category;
+          // Pack PF (PF-01): the cell key is built from the map's
+          // canonical display name (ledger starts empty; free now).
+          const ck = (canonSource(source) || source) + '|' + region + '|' + category;
           const isNew = !doc.cells[ck];
           // Pack E (RDR-01 M9): the ledger is capped at 500 cells —
           // overflow is dropped AND counted in the response, never
@@ -7162,35 +7368,45 @@ async function handleRequest(request, env, ctx) {
           const repIn = (typeof c.reported === 'number' && isFinite(c.reported) && c.reported >= 0) ? Math.min(100000, Math.round(c.reported)) : null; // values capped (M9)
           const fetIn = (typeof c.fetched === 'number' && isFinite(c.fetched) && c.fetched >= 0) ? Math.min(100000, Math.round(c.fetched)) : null;
           const stoIn = (typeof c.stored === 'number' && isFinite(c.stored) && c.stored >= 0) ? Math.min(100000, Math.round(c.stored)) : null;
-          if (repIn !== null) cell.reported = repIn;
-          if (fetIn !== null) cell.fetched = fetIn;
-          if (stoIn !== null) cell.stored = stoIn;
-          // Pack F (RDR-02 H4/H5): the agent sends counts, the WORKER
-          // decides the verdict. countBasis says what `reported`
-          // means; a 'none'-basis cell (Facebook/Reddit/Karrot/
-          // Vansky/YorkBBS — no platform total, no usable feed) can
-          // NEVER be proven covered: it records a scan (lastScanAt)
-          // but never advances lastOkAt or the watermark. A claimed ok
-          // is proven only when basis + all three counts are present
-          // and fetched >= reported and stored >= fetched with no
-          // errors — self-attested ok:true alone proves nothing.
-          const basisRaw = String(c.countBasis || '').toLowerCase();
-          const basis = (basisRaw === 'platform' || basisRaw === 'feed' || basisRaw === 'sitemap') ? basisRaw : 'none';
+          // Pack PF (PF-01 S3): counts are assigned UNCONDITIONALLY —
+          // a null clears the stored count (a stale count beside a
+          // fresh verdict misleads). For none-basis cells `reported`
+          // is meaningless (no platform total) and stored null.
+          // Pack PF (PF-01 M1/MF1/MF2 + PF-04 MF3): the claimed basis
+          // is NEVER trusted — effectiveBasis() maps (source, claim)
+          // through the server-side allowed-set with own-property
+          // lookups; the EFFECTIVE basis is what persists. A blocking
+          // reason (unknown_source / basis_mismatch) lands 'short'
+          // with cell.basisMismatch persisted — mapping problems must
+          // never read as quietly healthy 'unverifiable', which is
+          // reserved for genuine map-none sources. Flag-only reasons
+          // (overclaim / basis_downgraded) also persist as
+          // basisMismatch + flagged++ but the verdict proceeds.
+          const eb = effectiveBasis(canonSourceToken(source), String(c.countBasis || '').toLowerCase());
+          const basis = eb.basis;
           cell.countBasis = basis;
+          cell.reported = (basis === 'none' && !eb.blocks) ? null : repIn;
+          cell.fetched = fetIn;
+          cell.stored = stoIn;
           cell.lastScanAt = nowIso;
-          const hasErrors = c.errors === true || (typeof c.errors === 'string' && c.errors.trim().length > 0) || (Array.isArray(c.errors) && c.errors.length > 0);
+          if (eb.reason) { cell.basisMismatch = eb.reason; flagged++; } else delete cell.basisMismatch;
           let verdict, vReason = null;
-          // Precedence: a count-less ok claim is unproven on its face
-          // (counts_missing) BEFORE the basis question — a 'none'-basis
-          // cell that DID send complete counts is 'unverifiable'
-          // (scanned, unprovable), but a claim with no counts at all
-          // proves nothing about any basis and stays debt.
+          // Precedence (PF-01R/R2): reported_failed -> blocking basis
+          // reason -> counts_missing (basis-aware: none cells need
+          // only fetched+stored; reported ignored) ->
+          // errors_field_missing (an ok claim with NO errors field is
+          // unproven — PF-01R2 hardening, c.errors == null) -> errors
+          // -> short_fetch -> short_stored -> unverifiable -> ok.
+          // Errors and short_stored OUTRANK unverifiable: an erroring
+          // none source must not read healthy forever.
           if (c.ok !== true) { verdict = 'debt'; vReason = 'reported_failed'; }
-          else if (repIn === null || fetIn === null || stoIn === null) { verdict = 'short'; vReason = 'counts_missing'; }
-          else if (basis === 'none') verdict = 'unverifiable';
-          else if (hasErrors) { verdict = 'short'; vReason = 'errors_reported'; }
-          else if (fetIn < repIn) { verdict = 'short'; vReason = 'short_fetch'; } // Pack E M9's rule, kept inside the verdict
+          else if (eb.blocks) { verdict = 'short'; vReason = eb.reason; }
+          else if (basis === 'none' ? (fetIn === null || stoIn === null) : (repIn === null || fetIn === null || stoIn === null)) { verdict = 'short'; vReason = 'counts_missing'; }
+          else if (c.errors == null) { verdict = 'short'; vReason = 'errors_field_missing'; }
+          else if (errorsPresent(c)) { verdict = 'short'; vReason = 'errors_reported'; }
+          else if (basis !== 'none' && fetIn < repIn) { verdict = 'short'; vReason = 'short_fetch'; }
           else if (stoIn < fetIn) { verdict = 'short'; vReason = 'short_stored'; }
+          else if (basis === 'none') verdict = 'unverifiable';
           else verdict = 'ok';
           cell.verdict = verdict;
           // Watermark validation runs on ANY ok claim (Pack E M9: a
@@ -7214,8 +7430,11 @@ async function handleRequest(request, env, ctx) {
             // at this proven pass) — the next delta is "caught up"
             // only when it reaches one of these.
             if (Array.isArray(c.frontier)) cell.frontier = c.frontier.map(function (f) { return cleanText(f, 120); }).filter(Boolean).slice(0, 20);
+            else delete cell.frontier; // Pack PF (PF-01 S2): a stale frontier must not survive an ok pass that sends none
           } else if (verdict === 'unverifiable') {
-            cell.debt = false; delete cell.debtReason; // scanned but unprovable: not debt, never "covered" — lastOkAt/watermark untouched so staleness stays visible
+            cell.debt = false; delete cell.debtReason;
+            cell.failStreak = 0; // Pack PF (PF-01 S4): a completed scan is a successful scan — safe ONLY because errors/short_stored now outrank unverifiable in the chain
+            // scanned but unprovable: never "covered" — lastOkAt/watermark untouched so staleness stays visible
           } else {
             cell.debt = true; cell.debtReason = vReason; // watermark + lastOkAt untouched: the cell still owes coverage
             cell.failStreak = (typeof prev.failStreak === 'number' ? prev.failStreak : 0) + 1; // Pack F (RDR-02 M6): consecutive-failure tracking feeds the protocol's chronic-cell rule
@@ -7302,20 +7521,29 @@ async function handleRequest(request, env, ctx) {
           // ageHours null ("unknown"), never a confident 0.0.
           const okMs = c.lastOkAt ? Date.parse(c.lastOkAt) : NaN;
           const ageH = isFinite(okMs) ? Math.max(0, Math.round((nowMs - okMs) / 360000) / 10) : null;
-          // Pack E (RDR-01 M10): staleness is computed HERE — a cell
-          // nobody reports keeps debt:false forever in the ledger, so
-          // the view derives stale (ageHours null, or past the tier
-          // threshold: delta 36h / deep 240h) and folds it into
-          // debtCount.
-          const stale = ageH === null || ageH > (c.tier === 'deep' ? 240 : 36);
+          // Pack E (RDR-01 M10) + Pack PF (PF-04 MF3): staleness is
+          // computed HERE at the ONE worker-owned threshold set — the
+          // portal consumes these flags and keeps no thresholds of
+          // its own: stale = 6h past the delta cadence, measured from
+          // lastOkAt for provable cells and from lastScanAt for
+          // unverifiable ones (they never advance lastOkAt); deep
+          // overdue (deepStale) = 26h — the runner's 20h deep-due
+          // plus a documented 6h grace. The old 240h view branch is
+          // dropped.
+          const scanMs = c.lastScanAt ? Date.parse(c.lastScanAt) : NaN;
+          const scanAgeH = isFinite(scanMs) ? Math.max(0, Math.round((nowMs - scanMs) / 360000) / 10) : null;
+          const isUnv = c.verdict === 'unverifiable';
+          const stale = isUnv ? (scanAgeH === null || scanAgeH > 6) : (ageH === null || ageH > 6);
           const deepMs = c.lastDeepOkAt ? Date.parse(c.lastDeepOkAt) : NaN;
           const deepAgeH = isFinite(deepMs) ? Math.max(0, Math.round((nowMs - deepMs) / 360000) / 10) : null;
-          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null, verdict: c.verdict || null, countBasis: c.countBasis || null, stored: (typeof c.stored === 'number' ? c.stored : null), lastDeepOkAt: c.lastDeepOkAt || null, deepAgeHours: deepAgeH, lastScanAt: c.lastScanAt || null, failStreak: (typeof c.failStreak === 'number' ? c.failStreak : 0) }; // Pack F (RDR-02 H3/H4/H5/M6): worker verdict + basis + stored + deep cadence + scan recency + failure streak
+          const deepStale = (c.tier === 'deep') ? (deepAgeH === null || deepAgeH > 26) : false;
+          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, deepStale: deepStale, unverifiable: isUnv, scanAgeHours: scanAgeH, basisMismatch: c.basisMismatch || null, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null, verdict: c.verdict || null, countBasis: c.countBasis || null, stored: (typeof c.stored === 'number' ? c.stored : null), lastDeepOkAt: c.lastDeepOkAt || null, deepAgeHours: deepAgeH, lastScanAt: c.lastScanAt || null, failStreak: (typeof c.failStreak === 'number' ? c.failStreak : 0) }; // Pack F (RDR-02 H3/H4/H5/M6) + Pack PF (MF3 flags): worker verdict + basis + stored + deep cadence + scan recency + failure streak
         }).sort(function (a, b) { return ((b.debt ? 1 : 0) - (a.debt ? 1 : 0)) || String(a.key).localeCompare(String(b.key)); });
         // RDR-01 L2 (cheap version): the pool count is isolate-cached
         // instead of a 2000-key list on every portal load.
         const poolCount = await adminCached('mpool:count', async function () { return (await listAllKeys(env, 'mpool:', 2000)).length; });
-        return json({ ok: true, cells: cells, debtCount: cells.filter(function (c) { return c.debt || c.stale; }).length, staleCount: cells.filter(function (c) { return c.stale && !c.debt; }).length, pruned: pruned, poolCount: poolCount, updatedAt: doc.updatedAt || null }, 200, origin);
+        const rset = (await env.LEADS.get('radar:settings', { type: 'json' })) || {};
+        return json({ ok: true, cells: cells, debtCount: cells.filter(function (c) { return c.debt || c.stale; }).length, staleCount: cells.filter(function (c) { return c.stale && !c.debt; }).length, unverifiableCount: cells.filter(function (c) { return c.unverifiable; }).length, pruned: pruned, poolCount: poolCount, updatedAt: doc.updatedAt || null, enabledAt: rset.enabledAt || null }, 200, origin); // Pack PF (PF-01 S1 + PF-04): unverifiableCount separate from debt; enabledAt graces the portal's empty-ledger alarm
       }
 
       // ---- admin: listing performance counters (feature build 2026-10-29) ----
@@ -8983,7 +9211,8 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         if (!d || typeof d.enabled !== 'boolean') return json({ ok: false, error: 'validation' }, 400, origin); // malformed input must not silently switch the radar OFF (cycle 30, Claude Low)
         const enabled = d.enabled;
-        await env.LEADS.put('radar:settings', JSON.stringify({ enabled: enabled, updated_at: new Date().toISOString() }));
+        const prevSet = (await env.LEADS.get('radar:settings', { type: 'json' })) || {};
+        await env.LEADS.put('radar:settings', JSON.stringify({ enabled: enabled, enabledAt: enabled ? (prevSet.enabledAt || new Date().toISOString()) : null, updated_at: new Date().toISOString() })); // Pack PF (PF-04): enabledAt lets the portal grace the empty-ledger alarm for the first ~3h after switch-on
         return json({ ok: true, enabled: enabled }, 200, origin);
       }
 
