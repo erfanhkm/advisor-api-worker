@@ -7597,6 +7597,7 @@ async function handleRequest(request, env, ctx) {
         if (pruned) { try { await env.LEADS.put('radar:coverage', JSON.stringify(doc)); } catch (e) {} }
         const cells = Object.keys(doc.cells || {}).map(function (ck) {
           const c = doc.cells[ck] || {};
+          const tierV = (c.tier === 'deep' || c.tier === 'delta') ? c.tier : 'delta'; // Pack PF4 (PF series close): the view revalidates the STORED tier against the ingest allowlist before it can drive the deepStale flag or reach the portal — a pre-allowlist or foreign-written cell can no longer pose as deep
           const parts = ck.split('|');
           // Pack E (RDR-01 L5): an unparseable lastOkAt yields
           // ageHours null ("unknown"), never a confident 0.0.
@@ -7617,8 +7618,8 @@ async function handleRequest(request, env, ctx) {
           const stale = isUnv ? (scanAgeH === null || scanAgeH > 6) : (ageH === null || ageH > 6);
           const deepMs = c.lastDeepOkAt ? Date.parse(c.lastDeepOkAt) : NaN;
           const deepAgeH = isFinite(deepMs) ? Math.max(0, Math.round((nowMs - deepMs) / 360000) / 10) : null;
-          const deepStale = (c.tier === 'deep') ? (deepAgeH === null || deepAgeH > 26) : false;
-          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: c.tier || 'delta', lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, deepStale: deepStale, unverifiable: isUnv, scanAgeHours: scanAgeH, basisMismatch: c.basisMismatch || null, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null, verdict: c.verdict || null, countBasis: c.countBasis || null, stored: (typeof c.stored === 'number' ? c.stored : null), lastDeepOkAt: c.lastDeepOkAt || null, deepAgeHours: deepAgeH, lastScanAt: c.lastScanAt || null, failStreak: (typeof c.failStreak === 'number' ? c.failStreak : 0) }; // Pack F (RDR-02 H3/H4/H5/M6) + Pack PF (MF3 flags): worker verdict + basis + stored + deep cadence + scan recency + failure streak
+          const deepStale = (tierV === 'deep') ? (deepAgeH === null || deepAgeH > 26) : false;
+          return { key: ck, source: parts[0] || '', region: parts[1] || '', category: parts[2] || '', tier: tierV, lastOkAt: c.lastOkAt || null, ageHours: ageH, stale: stale, deepStale: deepStale, unverifiable: isUnv, scanAgeHours: scanAgeH, basisMismatch: c.basisMismatch || null, watermark: c.watermark || null, reported: (typeof c.reported === 'number' ? c.reported : null), fetched: (typeof c.fetched === 'number' ? c.fetched : null), debt: !!c.debt, debtReason: c.debtReason || null, updatedAt: c.updatedAt || null, verdict: c.verdict || null, countBasis: c.countBasis || null, stored: (typeof c.stored === 'number' ? c.stored : null), lastDeepOkAt: c.lastDeepOkAt || null, deepAgeHours: deepAgeH, lastScanAt: c.lastScanAt || null, failStreak: (typeof c.failStreak === 'number' ? c.failStreak : 0) }; // Pack F (RDR-02 H3/H4/H5/M6) + Pack PF (MF3 flags): worker verdict + basis + stored + deep cadence + scan recency + failure streak
         }).sort(function (a, b) { return ((b.debt ? 1 : 0) - (a.debt ? 1 : 0)) || String(a.key).localeCompare(String(b.key)); });
         // RDR-01 L2 (cheap version): the pool count is isolate-cached
         // instead of a 2000-key list on every portal load.
