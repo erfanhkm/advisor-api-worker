@@ -548,10 +548,11 @@ function postedMs(v) { const s = String(v || '').trim(); if (!s) return null; co
 // closed: the coverage verdict flags unknown_source).
 function own(map, k) { return Object.prototype.hasOwnProperty.call(map, k); }
 const SOURCE_DISPLAY = { craigslist: 'Craigslist', kijiji: 'Kijiji', usedeverywhere: 'UsedEverywhere', castanet: 'Castanet', propertyguys: 'PropertyGuys.com', forsalebyowner: 'ForSaleByOwner.ca', facebook: 'Facebook', reddit: 'Reddit', karrot: 'Karrot', vansky: 'Vansky', yorkbbs: 'YorkBBS' };
+const USED_BOARDS = { usedeverywhere: 1, usedvictoria: 1, usednanaimo: 1, usedcowichan: 1, usedcourtenay: 1, usedparksville: 1, usedportalberni: 1, usedkelowna: 1, usedkamloops: 1, usedprincegeorge: 1 }; // Pack PF2 (PF spot-check MF1): the UsedEverywhere network's BC boards, explicitly — an unknown used* token must fail closed as unknown_source, never inherit the network's platform basis by prefix
 function canonSourceToken(raw) {
   const t = String(raw == null ? '' : raw).toLowerCase().replace(/[^a-z0-9]/g, '');
   if (!t) return '';
-  if (t.indexOf('used') === 0) return 'usedeverywhere'; // UsedVictoria / UsedNanaimo / ... are one network
+  if (own(USED_BOARDS, t)) return 'usedeverywhere';
   if (t === 'propertyguyscom') return 'propertyguys';
   if (t === 'forsalebyownerca' || t === 'fsboca') return 'forsalebyowner';
   return t;
@@ -579,7 +580,10 @@ function effectiveBasis(sourceTok, claimedRaw) {
 // errors shape counts (a bare number 3 or an object used to pass as
 // clean). c.errors == null on an ok claim is its own proof gap
 // ('errors_field_missing', handled in the verdict chain).
-function errorsPresent(c) { const e = c ? c.errors : undefined; if (e === true) return true; if (typeof e === 'string') return e.trim().length > 0; if (Array.isArray(e)) return e.length > 0; if (typeof e === 'number') return e > 0; if (e && typeof e === 'object') return Object.keys(e).length > 0; return false; }
+// Pack PF2 (PF spot-check MF2): a numeric errors value is fail-closed
+// — ANY non-zero count (including a negative one) is an error report;
+// only exactly 0 is clean.
+function errorsPresent(c) { const e = c ? c.errors : undefined; if (e === true) return true; if (typeof e === 'string') return e.trim().length > 0; if (Array.isArray(e)) return e.length > 0; if (typeof e === 'number') return e !== 0; if (e && typeof e === 'object') return Object.keys(e).length > 0; return false; }
 // Pack PF (PF-03 C1): seen-reason codes. 'other' is the WEAKEST code:
 // an incoming recognised non-other beats any stored value; a stored
 // recognised non-other survives vague incoming text; when neither
@@ -592,7 +596,13 @@ function seenReasonCode(raw, stored) {
   const sto = norm(stored);
   if (sto && sto !== 'other' && own(SEEN_REASONS, sto)) return sto;
   if (inc === 'other' || sto === 'other') return 'other';
-  return stored ? String(stored).slice(0, 40) : '';
+  // Pack PF2 (PF spot-check SF5): unrecognised values NEVER pass
+  // through raw — a tiny legacy map covers the pre-code free-text
+  // era (PF-03's accepted list); everything else collapses to 'other'.
+  const LEGACY = { uncategorized: 'other', unknown: 'other', stale: 'other' };
+  if (inc && own(LEGACY, inc)) return LEGACY[inc];
+  if (sto && own(LEGACY, sto)) return LEGACY[sto];
+  return (inc || sto) ? 'other' : '';
 }
 // Pack F (RDR-02 H6): pool identity is canonicalised HERE, from raw
 // fields the agent sends — a model following prose rules cannot apply
@@ -644,6 +654,11 @@ function urlTailId(urlRaw) {
 // the city inside the address string ('7421 18th Ave, Burnaby'),
 // while `area` may hold only a region label. Longest names first.
 const BC_CITY_TAIL = ['north vancouver', 'west vancouver', 'new westminster', 'port coquitlam', 'port moody', 'maple ridge', 'white rock', 'campbell river', 'prince george', 'fort langley', 'pitt meadows', 'abbotsford', 'chilliwack', 'coquitlam', 'vancouver', 'burnaby', 'richmond', 'surrey', 'langley', 'kelowna', 'nanaimo', 'victoria', 'kamloops', 'cranbrook', 'penticton', 'vernon', 'mission', 'squamish', 'whistler', 'delta', 'ladner', 'tsawwassen', 'cloverdale', 'aldergrove'];
+// Pack PF2 (PF spot-check MF3): longest-first is enforced at load,
+// whatever order the literal above is edited in — a one-word city
+// must never win the tail match over a two-word city ('north
+// vancouver' is tried before 'vancouver').
+BC_CITY_TAIL.sort(function (a, b) { return (b.split(' ').length - a.split(' ').length) || (b.length - a.length); });
 function poolKeyFor(it) {
   const addrIn = cleanText(it && it.address, 200);
   const srcTok = canonSourceToken(it && it.source);
@@ -662,7 +677,14 @@ function poolKeyFor(it) {
       const toks = parts.addr.split(' ');
       for (const cn of BC_CITY_TAIL) {
         const ct = cn.split(' ');
-        if (toks.length > ct.length && toks.slice(toks.length - ct.length).join(' ') === cn) { city = cn; parts.addr = toks.slice(0, toks.length - ct.length).join(' '); break; }
+        if (toks.length > ct.length && toks.slice(toks.length - ct.length).join(' ') === cn) {
+          const rest = toks.slice(0, toks.length - ct.length);
+          // Pack PF2 (PF spot-check MF3): never strip the city when
+          // nothing but a house number would remain — '1234 Victoria'
+          // is a street named Victoria, not the city of Victoria.
+          if (!rest.some(function (tk) { return /[a-z]/.test(tk); })) continue;
+          city = cn; parts.addr = rest.join(' '); break;
+        }
       }
     }
     if (!city) city = canonCityToken(it && it.area);
@@ -670,7 +692,17 @@ function poolKeyFor(it) {
   }
   let pid = cleanText(it && it.postId, 80).toLowerCase().replace(/[^a-z0-9._-]/g, '');
   if (!pid) pid = urlTailId(it && it.url);
-  if (pid && src) return 'v2|' + src + ':' + pid;
+  if (pid && src) {
+    // Pack PF2 (PF spot-check MF1/SF6): the UsedEverywhere boards
+    // are storefronts of one platform, but if a board name ever
+    // reaches the key path it qualifies the postId namespace, so
+    // two boards can never collide on the same numeric id. The
+    // pinned runner token ('UsedEverywhere') adds no qualifier,
+    // so existing keys are unchanged.
+    const rawTok = String(it && it.source == null ? '' : it.source).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const qual = (srcTok === 'usedeverywhere' && rawTok && rawTok !== 'usedeverywhere') ? ('#' + rawTok) : '';
+    return 'v2|' + src + qual + ':' + pid;
+  }
   return normIkey(it && it.identityKey);
 }
 // Pack F (RDR-02 M5): motivation is computed by the WORKER from facts
@@ -3716,7 +3748,7 @@ async function puToday(env) {
       const r = await env.LEADS.get(k.name, { type: 'json' });
       if (r && (r.kind === 'pair' || (Array.isArray(r.matches) && r.matches.length))) {
         pairs++;
-        if (r.kind === 'pair' && r.status === 'new' && (r.matchScore || 0) >= 80 && typeof r.motivation === 'number' && r.motivation >= 60 && r.motivationSource === 'computed') hot++; // Pack PF (PF-04 MF1): computed-only hot rule — SAME predicate as the portal's isHot (kind pair + status new + numeric thresholds + motivationSource 'computed'; null pair motivation -> 0 -> fails, never coerced)
+        if (r.kind === 'pair' && r.status === 'new' && (r.matchScore || 0) >= 80 && typeof r.motivation === 'number' && r.motivation >= 60 && r.motivationSource === 'computed' && r.created_at && (Date.now() - Date.parse(r.created_at) < 14 * 86400000)) hot++; // Pack PF2 (PF spot-check MF4): + 14-day liveness bound on created_at — IDENTICAL to the portal's isHot so counter and badges can never disagree // Pack PF (PF-04 MF1): computed-only hot rule — SAME predicate as the portal's isHot (kind pair + status new + numeric thresholds + motivationSource 'computed'; null pair motivation -> 0 -> fails, never coerced)
       }
     }
     return { enabled: !!st.enabled, pairs: pairs, hotPairs: hot, sampled: Math.min(keys.length, 300), total: keys.length };
