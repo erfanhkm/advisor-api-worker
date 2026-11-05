@@ -673,6 +673,15 @@ function poolKeyFor(it) {
     // records. An addressed post with NO city from either source
     // falls through to the post-id key, never to a bare address.
     let city = '';
+    // Pack PF3 (PF final MF2): a trailing province token defeats the
+    // tail match ('7421 18th Ave, Burnaby, BC' ends in 'bc', not the
+    // city) — strip 'bc' / 'british columbia' from the tail first.
+    if (parts.addr) {
+      const ptoks = parts.addr.split(' ');
+      while (ptoks.length > 1 && ptoks[ptoks.length - 1] === 'bc') ptoks.pop();
+      if (ptoks.length > 2 && ptoks.slice(-2).join(' ') === 'british columbia') ptoks.length = ptoks.length - 2;
+      parts.addr = ptoks.join(' ');
+    }
     if (parts.addr) {
       const toks = parts.addr.split(' ');
       for (const cn of BC_CITY_TAIL) {
@@ -682,12 +691,23 @@ function poolKeyFor(it) {
           // Pack PF2 (PF spot-check MF3): never strip the city when
           // nothing but a house number would remain — '1234 Victoria'
           // is a street named Victoria, not the city of Victoria.
-          if (!rest.some(function (tk) { return /[a-z]/.test(tk); })) continue;
+          if (!rest.some(function (tk) { return /^[a-z]+$/.test(tk); })) continue; // Pack PF3 (PF final SF): alphabetic-ONLY — an ordinal like '5th' is not a street name ('880 5th, Victoria' must not strip)
           city = cn; parts.addr = rest.join(' '); break;
         }
       }
     }
-    if (!city) city = canonCityToken(it && it.area);
+    if (!city) {
+      // Pack PF3 (PF final MF2): the area fallback accepts the token
+      // ONLY when it is exactly a BC city — a bare region label
+      // ('Metro Vancouver') is not a city, and keying on it merged
+      // same-address homes across the region. Province tails on the
+      // area text are stripped before the comparison. Anything else
+      // falls through to the post-id key (a false split beats a
+      // false merge — the PF-02 M4 policy).
+      let at = canonCityToken(it && it.area);
+      if (at) { const atoks = at.split(' '); while (atoks.length > 1 && atoks[atoks.length - 1] === 'bc') atoks.pop(); if (atoks.length > 2 && atoks.slice(-2).join(' ') === 'british columbia') atoks.length = atoks.length - 2; at = atoks.join(' '); }
+      if (at && BC_CITY_TAIL.indexOf(at) !== -1) city = at;
+    }
     if (parts.addr && city) return 'v2|a|' + parts.addr + '|' + (unitIn || parts.unit) + '|' + city;
   }
   let pid = cleanText(it && it.postId, 80).toLowerCase().replace(/[^a-z0-9._-]/g, '');
@@ -6892,7 +6912,7 @@ async function handleRequest(request, env, ctx) {
             pairIds = { demandId: did, supplyId: sid };
             // Pack F (RDR-02 M5): a pair's motivation is the SUPPLY
             // record's worker-computed score — the agent's claim on
-            // the lead is ignored, so pool and pair can never diverge
+            // the lead is ignored, so the pair snapshots the pool record at store time and is never re-synced afterwards
             // and hostile post text can't inflate the hot-pair rule.
             pairMot = (srec && typeof srec.motivation === 'number') ? srec.motivation : null;
             pairMotSignals = (srec && Array.isArray(srec.motivationSignals)) ? srec.motivationSignals.slice(0, 5) : [];
@@ -7120,7 +7140,15 @@ async function handleRequest(request, env, ctx) {
             let phoneConflict = !!((prev && prev.phoneConflict));
             if (phoneNorm) {
               if (!phone) phone = phoneNorm;
-              else if (isPrimary || !primarySource) phone = phoneNorm;
+              else if (isPrimary || !primarySource) {
+                // Pack PF3 (PF final SF): a primary overwriting a
+                // DIFFERENT number on a multi-source record is the
+                // same anti-scam signal as a secondary conflict —
+                // keep the old number as phoneAlt and flag it; never
+                // silently replace.
+                if (phoneNorm !== phone && prev && Array.isArray(prev.sources) && prev.sources.length > 1) { if (!phoneAlt) phoneAlt = phone; phoneConflict = true; }
+                phone = phoneNorm;
+              }
               else if (phoneNorm !== phone && !phoneAlt) { phoneAlt = phoneNorm; phoneConflict = true; }
             }
             // Pack F (RDR-02 M5): the agent's numeric motivation claim
@@ -7148,6 +7176,14 @@ async function handleRequest(request, env, ctx) {
             const ownBeds = (prev && primarySource && !isPrimary && prev.beds) ? prev.beds : beds;
             const ownType = (prev && primarySource && !isPrimary && prev.type) ? prev.type : ptype;
             const ownPriceStr = (prev && primarySource && !isPrimary && prev.price) ? prev.price : priceStr;
+            // Pack PF3 (PF final MF1): posted_at, area and region join
+            // the primary-owned scalars. They were last-writer-wins:
+            // a home cross-posted on two sources flipped posted_at on
+            // every alternation (booking phantom relists and forcing
+            // a write per scan), and area/region flipped with it.
+            const ownArea = (prev && primarySource && !isPrimary && prev.area) ? prev.area : area;
+            const ownRegion = (prev && primarySource && !isPrimary && prev.region) ? prev.region : region;
+            const ownPostedStr = (prev && primarySource && !isPrimary && prev.posted_at) ? prev.posted_at : postedStr;
             // Photo URL is a match-time linking attribute (H6): query
             // string stripped (signed URLs change every scan), never
             // part of the identity key.
@@ -7184,8 +7220,16 @@ async function handleRequest(request, env, ctx) {
             const ownEntFresh = !!(ownEnt && (nowMs - (Date.parse(ownEnt.at || '') || 0)) <= 60 * 86400000);
             const gateBase = ownEntFresh ? ownEnt.p : priceNum;
             if (rawPriceNum !== null) {
-              if (rawPriceNum < 10000 || rawPriceNum > 1000000000 || (gateBase !== null && (rawPriceNum < gateBase * 0.4 || rawPriceNum > gateBase * 2.5))) priceFlag = 'jump';
-              else { acceptedP = rawPriceNum; priceFlag = null; }
+              // Pack PF3 (PF final MF1): the gate verdict is computed
+              // per sighting (it still decides acceptedP), but only a
+              // PRIMARY sighting — or an unowned record — may APPLY it
+              // to priceFlag. A secondary's 'jump' alternating with
+              // the primary's clean state flipped the flag every scan
+              // and forced a write each time.
+              let sightFlag = priceFlag;
+              if (rawPriceNum < 10000 || rawPriceNum > 1000000000 || (gateBase !== null && (rawPriceNum < gateBase * 0.4 || rawPriceNum > gateBase * 2.5))) sightFlag = 'jump';
+              else { acceptedP = rawPriceNum; sightFlag = null; }
+              if (isPrimary || !primarySource || !prev) priceFlag = sightFlag;
             }
             if (!prev && acceptedP !== null) priceNum = acceptedP;
             let hist = (prev && Array.isArray(prev.priceHistory)) ? prev.priceHistory.filter(function (h) { return h && typeof h.price === 'number'; }).slice(-10) : [];
@@ -7198,11 +7242,11 @@ async function handleRequest(request, env, ctx) {
             let relisted = !!((prev && prev.relisted));
             let relistBump = false;
             let tomb = null, tombRead = false;
-            const pMsRaw = postedMs(postedStr);
+            const pMsRaw = postedMs(ownPostedStr); // Pack PF3: the primary's posted_at is the relist/motivation baseline
             const pMs = (pMsRaw !== null && pMsRaw >= nowMs - 730 * 86400000 && pMsRaw <= nowMs + 86400000) ? pMsRaw : null; // Pack PF (PF-02): plausibility window [now-730d, now+1d] — negative ages and year-9999 stamps are data errors, not facts
             if (prev) {
               const prevMs = postedMs(prev.posted_at);
-              if (pMs !== null && prevMs !== null && pMs > prevMs) { relistCount++; relisted = true; relistBump = true; }
+              if (pMs !== null && prevMs !== null && pMs > prevMs && isPrimary && !handedOver) { relistCount++; relisted = true; relistBump = true; } // Pack PF3 (PF final MF1): relist detection is gated on the PRIMARY source — a secondary's newer posted_at is not a relist; and a handover resets the baseline to the new primary's posted_at WITHOUT booking one
             } else {
               ops++; tombRead = true;
               tomb = await env.LEADS.get(xkey, { type: 'json' });
@@ -7244,6 +7288,11 @@ async function handleRequest(request, env, ctx) {
             }
             if (acceptedP !== null && handedOver && (!hist.length || hist[hist.length - 1].price !== acceptedP)) { hist.push({ at: nowIso, price: acceptedP, src: srcCanon }); hist = hist.slice(-10); }
             if (acceptedP !== null && (isPrimary || !primarySource)) priceNum = acceptedP;
+            // Pack PF3 (PF final SF): on handover, a sighting carrying
+            // no accepted price of its own still moves the headline to
+            // the new primary's fresh per-source entry — otherwise the
+            // record keeps the old primary's stale price.
+            if (handedOver && acceptedP === null && srcCanon && own(pbs, srcCanon)) { const he = pbs[srcCanon]; if (he && typeof he.p === 'number' && (nowMs - (Date.parse(he.at || '') || 0)) <= 60 * 86400000) priceNum = he.p; }
             const pbsOut = {}; { const pks = Object.keys(pbs).slice(0, 10); for (const k2 of pks) pbsOut[k2] = pbs[k2]; }
             const pbsPrices = {}; for (const k3 of Object.keys(pbsOut)) pbsPrices[k3] = pbsOut[k3].p;
             const prevPbsPrices = {}; if (prev && prev.priceBySource && typeof prev.priceBySource === 'object') { for (const k4 of Object.keys(prev.priceBySource)) { const e4 = prev.priceBySource[k4]; prevPbsPrices[k4] = (typeof e4 === 'number') ? e4 : ((e4 && typeof e4.p === 'number') ? e4.p : null); } }
@@ -7259,8 +7308,8 @@ async function handleRequest(request, env, ctx) {
             const motivationFacts = motC ? motC.facts : null;
             // H2: an unchanged sighting <24h old writes NOTHING.
             const changed = !prev || priceNum !== prev.priceNum || priceFlag !== ((prev && prev.priceFlag) || null) ||
-              ownTitle !== (prev.title || '') || area !== (prev.area || '') || region !== (prev.region || '') || ownSummary !== (prev.summary || '') ||
-              phone !== (prev.phone || '') || ownBeds !== (prev.beds || '') || ownType !== (prev.type || '') || postedStr !== (prev.posted_at || '') ||
+              ownTitle !== (prev.title || '') || ownArea !== (prev.area || '') || ownRegion !== (prev.region || '') || ownSummary !== (prev.summary || '') ||
+              phone !== (prev.phone || '') || ownBeds !== (prev.beds || '') || ownType !== (prev.type || '') || ownPostedStr !== (prev.posted_at || '') ||
               motivation !== (prev.motivation !== undefined ? prev.motivation : null) || kind !== prev.kind || ownUrl !== (prev.url || '') || relistBump ||
               JSON.stringify(motivationSignals) !== JSON.stringify(prev.motivationSignals || []) ||
               JSON.stringify(motCodes) !== JSON.stringify((prev.motivationFacts && prev.motivationFacts.codes) || []) ||
@@ -7271,14 +7320,14 @@ async function handleRequest(request, env, ctx) {
             if (prev && !changed && isFinite(prevSeenMs) && (nowMs - prevSeenMs) < 86400000) { unchanged++; continue; }
             const rec = {
               id: key.slice(6), identityKey: ikey, side: side, kind: kind,
-              title: ownTitle, area: area, region: region, source: srcCanon || source, category: category,
+              title: ownTitle, area: ownArea, region: ownRegion, source: srcCanon || source, category: category,
               url: ownUrl, price: ownPriceStr, priceNum: priceNum, priceFlag: priceFlag,
               priceHistory: hist, priceCuts: priceCuts,
               priceBySource: pbsOut, primarySource: primarySource, primarySince: primarySince, prevPrimary: prevPrimary, primaryLastSeen: primaryLastSeen,
               relistCount: relistCount, relisted: relisted,
               motivation: motivation, motivationSignals: motivationSignals, motivationFacts: motivationFacts,
               sources: sourcesCapped, photoUrl: photoUrl,
-              beds: ownBeds, type: ownType, phone: phone, phoneAlt: phoneAlt, phoneConflict: phoneConflict, summary: ownSummary, posted_at: postedStr,
+              beds: ownBeds, type: ownType, phone: phone, phoneAlt: phoneAlt, phoneConflict: phoneConflict, summary: ownSummary, posted_at: ownPostedStr,
               firstSeen: (prev && prev.firstSeen) || nowIso,
               lastSeen: nowIso,
               seenCount: seenCount
@@ -7286,7 +7335,7 @@ async function handleRequest(request, env, ctx) {
             ops++;
             // Pack E (RDR-01 H1): write-time KV metadata powers the
             // paged GET — matching never needs a get per record again.
-            await env.LEADS.put(key, JSON.stringify(rec), { expirationTtl: 2592000, metadata: { s: side, k: kind, ls: nowIso, m: motivation, r: region, p: priceNum } }); // 30 days
+            await env.LEADS.put(key, JSON.stringify(rec), { expirationTtl: 2592000, metadata: { s: side, k: kind, ls: nowIso, m: motivation, r: ownRegion, p: priceNum } }); // 30 days
             // Tombstone (180d): written at creation, on a relist bump,
             // then at most every 7 days (H2) — carries lastPrice +
             // priceCuts so the trail survives expiry (M1).
@@ -7421,7 +7470,7 @@ async function handleRequest(request, env, ctx) {
           cell.fetched = fetIn;
           cell.stored = stoIn;
           cell.lastScanAt = nowIso;
-          if (eb.reason) { cell.basisMismatch = eb.reason; flagged++; } else delete cell.basisMismatch;
+          if (eb.reason && eb.reason !== 'basis_downgraded') { cell.basisMismatch = eb.reason; flagged++; } else delete cell.basisMismatch; // Pack PF3 (PF final SF): basis_downgraded is an ALLOWED alternate basis (e.g. Kijiji 'feed'), not a mismatch — persisting it flagged every Craigslist/Kijiji cell daily
           let verdict, vReason = null;
           // Precedence (PF-01R/R2): reported_failed -> blocking basis
           // reason -> counts_missing (basis-aware: none cells need
