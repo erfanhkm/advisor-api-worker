@@ -1281,6 +1281,12 @@ async function prKvJson(env, key) {
 async function prGeocode(env, query, byPostal) {
   // returns { geo, status } with status 'ok' | 'not_found' | 'unavailable'
   // (PR-01 M4) — the routes surface it in their sources block.
+  if (byPostal) { // PG-01 M5: a postal lookup is validated before it is
+    // cached or sent upstream, whatever the caller handed us
+    const np = prNormPostal(query);
+    if (!np) return { geo: null, status: 'not_found' };
+    query = np;
+  }
   const qn = String(query || '').toLowerCase().replace(/\s+/g, ' ').trim();
   const key = 'prgeo:' + (await sha256hex('geo|' + (byPostal ? 'pc|' : 'q|') + qn)); // key normalised (M2)
   const hit = await prKvJson(env, key);
@@ -1294,16 +1300,19 @@ async function prGeocode(env, query, byPostal) {
   // 1 req/s app-wide and the per-IP limiter can't bound it. This hourly
   // KV counter (race-tolerant by design) defers NEW lookups past a
   // conservative cap; cache hits never consume budget.
+  let budgetN = 0;
   try {
     const bk = 'prbudget:' + new Date().toISOString().slice(0, 13);
-    const n = Number(await env.LEADS.get(bk)) || 0;
-    if (n >= 300) return { geo: null, status: 'unavailable' };
-    await env.LEADS.put(bk, String(n + 1), { expirationTtl: 3700 });
+    budgetN = Number(await env.LEADS.get(bk)) || 0;
+    if (budgetN >= 300) return { geo: null, status: 'unavailable' };
   } catch (e) {}
   const u = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&countrycodes=ca&' +
     (byPostal ? 'postalcode=' : 'q=') + encodeURIComponent(query);
-  const t = await prFetchJsonT(u, { 'User-Agent': 'ErfanBCRealEstate/1.0 property-report (contact via real-estate-platform-0aei.onrender.com)', 'Accept': 'application/json' });
+  const t = await prFetchJsonT(u, { 'User-Agent': 'ErfanBCRealEstate/1.0 property-report (erfanbcrealestate@gmail.com)', 'Accept': 'application/json' });
   if (!t.ok) return { geo: null, status: 'unavailable' };
+  // PG-01 M2: the hourly budget is spent only by a successful upstream
+  // answer (a Nominatim outage must not burn the hour's allowance)
+  try { await env.LEADS.put('prbudget:' + new Date().toISOString().slice(0, 13), String(budgetN + 1), { expirationTtl: 3700 }); } catch (e) {}
   const r0 = Array.isArray(t.data) && t.data[0];
   const negCache = async () => { try { await env.LEADS.put(key, JSON.stringify({ none: 1 }), { expirationTtl: 21600 }); } catch (e) {} };
   if (!r0) { await negCache(); return { geo: null, status: 'not_found' }; } // negative cache ~6h (M2)
@@ -1335,12 +1344,18 @@ function prNearestSchools(lat, lng) {
 function prCensusBlock(fsa) {
   const a = PR_CENSUS_FSA[fsa];
   if (!a) return null;
+  // PG-01 L6: percentage sanity — a figure outside 0-100, or an
+  // owner+renter pair that does not sum to ~100, is a data defect and
+  // is shown as missing rather than published
+  const pct = (v) => (typeof v === 'number' && isFinite(v) && v >= 0 && v <= 100) ? v : null;
+  let po = pct(a[8]), pr = pct(a[9]);
+  if (po !== null && pr !== null && Math.abs(po + pr - 100) > 2) { po = null; pr = null; }
   return {
     // pop/dwellings/income can never legitimately be 0 for an FSA — a 0
     // there would be an encoded suppression, shown as null instead (L6)
-    pop: a[0] > 0 ? a[0] : null, dwellings: a[1] > 0 ? a[1] : null, pctUnder15: a[2], pct65plus: a[3], medianAge: a[4],
-    pctSingleDetached: a[5], avgHouseholdSize: a[6], medianHouseholdIncome: a[7] > 0 ? a[7] : null,
-    pctOwner: a[8], pctRenter: a[9], pctEnglishAtHome: a[10], pctNonOfficialAtHome: a[11],
+    pop: a[0] > 0 ? a[0] : null, dwellings: a[1] > 0 ? a[1] : null, pctUnder15: pct(a[2]), pct65plus: pct(a[3]), medianAge: a[4],
+    pctSingleDetached: pct(a[5]), avgHouseholdSize: a[6], medianHouseholdIncome: a[7] > 0 ? a[7] : null,
+    pctOwner: po, pctRenter: pr, pctEnglishAtHome: pct(a[10]), pctNonOfficialAtHome: pct(a[11]),
     source: 'Statistics Canada, 2021 Census Profile (forward sortation area)', year: 2021, incomeYear: 2020
   };
 }
@@ -1352,8 +1367,11 @@ async function prVpdCounts(env) {
   const where = encodeURIComponent("occ_date >= DATE '" + PR_CRIME_YEAR + "-01-01' AND occ_date < DATE '" + (PR_CRIME_YEAR + 1) + "-01-01'");
   const u = 'https://geodash.vpd.ca/arcgis/rest/services/VPD/VPD_PUBLIC_CrimeIncidents_276105/MapServer/0/query?where=' + where +
     '&outStatistics=' + stats + '&groupByFieldsForStatistics=neighbourhood&returnGeometry=false&f=json';
-  const d = await prFetchJson(u);
+  const t = await prFetchJsonT(u); // PG-01 L9: tri-state fetch
+  const d = t.ok ? t.data : null;
   if (!d || !Array.isArray(d.features)) return null;
+  if (d.exceededTransferLimit) return null; // PG-01 M3: a capped stats
+  // answer is a partial city — never cache it as the whole picture
   const map = {}; let total = 0;
   for (const f of d.features) {
     const nb = f && f.attributes && f.attributes.neighbourhood;
@@ -1364,10 +1382,11 @@ async function prVpdCounts(env) {
   try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {}
   return out;
 }
+function prVpdInBox(lat, lng) { return lat >= 49.19 && lat <= 49.33 && lng >= -123.27 && lng <= -122.99; }
 async function prVpdSafety(env, lat, lng, countsPromise) {
   // VPD data covers the City of Vancouver only (PR-01 M5): a point
   // outside a slightly generous city box never touches the service.
-  if (!(lat >= 49.19 && lat <= 49.33 && lng >= -123.27 && lng <= -122.99)) return null;
+  if (!prVpdInBox(lat, lng)) return null;
   // exact-point cache key (H3): the old ~1 km rounded cell served one
   // point's neighbourhood to every later point in the cell, across
   // neighbourhood boundaries. Negative results are cached too, so
@@ -1385,7 +1404,10 @@ async function prVpdSafety(env, lat, lng, countsPromise) {
     const d = t.ok ? t.data : null;
     nb = (d && d.features && d.features[0] && d.features[0].attributes && d.features[0].attributes.NBHD) || null;
     if (!nb) {
-      if (t.ok) { try { await env.LEADS.put(ptKey, JSON.stringify({ none: 1 }), { expirationTtl: 86400 }); } catch (e) {} }
+      // PG-01 M1: negative-cache ONLY on a well-formed features array —
+      // an ArcGIS 200-with-error payload (no features) must not poison
+      // this point for 24h
+      if (t.ok && d && Array.isArray(d.features)) { try { await env.LEADS.put(ptKey, JSON.stringify({ none: 1 }), { expirationTtl: 86400 }); } catch (e) {} }
       return null; /* outside the VPD neighbourhood map (not Vancouver) */
     }
     try { await env.LEADS.put(ptKey, JSON.stringify({ nb }), { expirationTtl: 86400 }); } catch (e) {}
@@ -1399,7 +1421,7 @@ async function prOdsFetch(dataset, where, maxPages, orderBy) {
   // until the full set is held; a partial set is reported honestly via
   // truncated:true instead of masquerading as complete.
   const rows = [];
-  let total = null, partial = false;
+  let total = null, partial = false, capped = false;
   for (let page = 0; page < (maxPages || 20); page++) {
     const u = 'https://opendata.vancouver.ca/api/explore/v2.1/catalog/datasets/' + dataset + '/records?limit=100&offset=' + (page * 100) +
       (orderBy ? '&order_by=' + encodeURIComponent(orderBy) : '') + '&where=' + encodeURIComponent(where);
@@ -1409,15 +1431,18 @@ async function prOdsFetch(dataset, where, maxPages, orderBy) {
     for (const r of t.data.results) rows.push(r);
     if (t.data.results.length < 100) break;
     if (total !== null && rows.length >= total) break;
+    if (page === (maxPages || 20) - 1) capped = true; // PG-02 M7: the
+    // page cap ended the walk with a full last page — with no
+    // total_count to prove completeness the set is truncated
   }
   if (!rows.length && partial) return { rows: null, total: null, status: 'unavailable', truncated: false, partial: true };
-  return { rows, total: total === null ? rows.length : total, status: 'ok', truncated: total !== null && rows.length < total, partial };
+  return { rows, total: total === null ? rows.length : total, status: 'ok', truncated: (total !== null && rows.length < total) || capped, partial };
 }
 function prSlimParcel(r) {
   // only the fields the report uses are cached (PR-01 L4) — raw rows
   // carry ~30 fields incl. legal narrative for every unit in a tower
   return {
-    pid: String(r.pid || ''), legal_type: String(r.legal_type || ''), street_name: String(r.street_name || ''),
+    pid: String(r.pid || ''), legal_type: String(r.legal_type || '').trim(), street_name: String(r.street_name || ''),
     from_civic_number: r.from_civic_number == null ? null : String(r.from_civic_number),
     to_civic_number: r.to_civic_number == null ? null : String(r.to_civic_number),
     property_postal_code: String(r.property_postal_code || ''),
@@ -1430,30 +1455,38 @@ function prSlimParcel(r) {
   };
 }
 async function prCovParcels(env, postal) {
-  const key = 'prcov2:' + postal; // v2: order_by-stable pagination (Pack G live fix, 2026-11-02)
+  // PG-02 H1: local shape guard (defence in depth — every caller
+  // already passes prNormPostal output)
+  if (!/^[A-Z]\d[A-Z] \d[A-Z]\d$/.test(String(postal || ''))) return { rows: [], total: 0, status: 'not_found', truncated: false, partial: false };
+  const key = 'prcov3:' + PR_TAX_YEAR + ':' + postal; // PG-02 M8: the
+  // report year rides in the key (v3) — a year rollover can no longer
+  // serve last year's rows from a warm cache
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.rows)) return hit;
   const f = await prOdsFetch('property-tax-report', 'property_postal_code="' + postal + '" and report_year="' + PR_TAX_YEAR + '"', 20, 'pid');
   if (f.status !== 'ok') return f;
-  const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated };
-  if (!f.partial) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} }
+  const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated, partial: !!f.partial }; // PG-02 H2: partial propagates
+  if (!f.partial && !f.truncated) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} } // PG-02 H2: incomplete sets are never cached
   return out;
 }
 async function prCovParcelsByCivic(env, streetKey, civic) {
   // primary parcel lookup (PR-01 M3): street + civic, server-side
   // equality on the civic fields; the postal-code set is only a
   // narrowing/range catch, never a hard requirement.
-  const key = 'prcovc2:' + streetKey + '|' + civic.raw; // v2: order_by-stable pagination (Pack G live fix, 2026-11-02)
+  // PG-02 H1: local shape guards (defence in depth)
+  if (!streetKey || String(streetKey).length > 60 || /["\\]/.test(String(streetKey)) || !civic || !/^\d{1,6}[A-Z]?$/.test(String(civic.raw || ''))) return { rows: [], total: 0, status: 'not_found', truncated: false, partial: false };
+  const key = 'prcovc3:' + PR_TAX_YEAR + ':' + streetKey + '|' + civic.raw; // PG-02 M8: year in the key (v3)
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.rows)) return hit;
   const where = 'street_name="' + streetKey + '" and report_year="' + PR_TAX_YEAR + '" and (to_civic_number="' + civic.raw + '" or from_civic_number="' + civic.raw + '")';
   const f = await prOdsFetch('property-tax-report', where, 20, 'pid');
   if (f.status !== 'ok') return f;
-  const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated };
-  if (!f.partial) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} }
+  const out = { rows: f.rows.map(prSlimParcel), total: f.total, status: 'ok', truncated: f.truncated, partial: !!f.partial }; // PG-02 H2: partial propagates
+  if (!f.partial && !f.truncated) { try { await env.LEADS.put(key, JSON.stringify(out), { expirationTtl: 86400 }); } catch (e) {} } // PG-02 H2: incomplete sets are never cached
   return out;
 }
 function prMatchParcels(rows, streetKey, civic) {
+  if (!Array.isArray(rows)) return { land: [], strata: [] }; // PG-02 L4
   // street-aware matching (PR-01 H2), grounded in the live dataset's
   // semantics (verified 2026-11-02): STRATA rows carry the BUILDING's
   // civic number in to_civic_number (their from_ field holds unit
@@ -1494,11 +1527,14 @@ function prPermitStreet(streetKey) {
   if (TYPE[last]) toks[toks.length - 1] = TYPE[last];
   return ((dir ? dir + ' ' : '') + toks.join(' ')).trim();
 }
-async function prCovPermits(env, civicNum, streetKey, postcodes) {
+async function prCovPermits(env, civicRaw, streetKey, postcodes) {
   // permits are queried ONLY for a matched parcel, by that parcel's
   // street (PR-01 H1) — never by the visitor's first street word.
   const pStreet = prPermitStreet(streetKey);
   if (!pStreet) return { permits: [], status: 'not_found' };
+  // PG-02 M5: the civic arrives WITH its suffix (PG-03 H2) and is
+  // shape-guarded before it is concatenated into the where clause
+  if (!/^\d{1,6}[A-Z]?$/.test(String(civicRaw || ''))) return { permits: [], status: 'not_found' };
   /* Acceptable postcodes = the MATCHED parcels' own property_postal_code
      values (the building's authoritative codes). The geocoder's postcode
      is only a fallback: live check 2026-11-02 (1665 W Broadway) — the
@@ -1506,10 +1542,15 @@ async function prCovPermits(env, civicNum, streetKey, postcodes) {
      V6J 1X1, its tax-record code; filtering on the geocoder's code
      dropped all 14 real permits. */
   const pcList = [...new Set((Array.isArray(postcodes) ? postcodes : [postcodes]).map(prNormPostal).filter(Boolean))];
-  const key = 'prperm:' + civicNum + ':' + (await sha256hex(pStreet + '|' + pcList.join(','))); // delimited + hashed, incl. postcode set (H1)
+  const key = 'prperm:' + civicRaw + ':' + (await sha256hex(pStreet + '|' + pcList.join(','))); // delimited + hashed, incl. postcode set (H1)
   const hit = await prKvJson(env, key);
   if (hit && Array.isArray(hit.permits)) return hit;
-  const f = await prOdsFetch('issued-building-permits', 'address like "' + civicNum + ' ' + pStreet + '%"', 1, 'permitnumbercreateddate desc');
+  // PG-03 H2: the like-prefix carries the suffix — "1234A …%" matches
+  // the suffixed property, never the unsuffixed neighbour (and vice
+  // versa). PG-02 M4: up to 3 pages are fetched BEFORE the
+  // client-side postcode filter + slice, so a busy building's permits
+  // are not lost behind 100 newer city-wide rows.
+  const f = await prOdsFetch('issued-building-permits', 'address like "' + civicRaw + ' ' + pStreet + '%"', 3, 'permitnumbercreateddate desc');
   if (f.status !== 'ok') return { permits: [], status: 'unavailable' };
   let rows = f.rows || [];
   /* a permit address that CARRIES a postal code must carry one of the
@@ -5773,10 +5814,10 @@ async function handleRequest(request, env, ctx) {
           // the geocoder's own postcode for the point can differ from the
           // requested one (a centroid across a boundary) — say so (M3)
           approximate: !!(geo && geo.postcode && geo.postcode !== pc),
-          census: prCensusBlock(fsa), schools, safety,
+          census: prCensusBlock(fsa), censusYear: 2021, schools, safety,
           // per-source status (M4): 'unavailable' never again looks
           // identical to 'not_found'
-          sources: { census: 'ok', geocode: g.status, schools: geo ? 'ok' : 'unavailable', safety: geo ? (safety ? 'ok' : 'not_found') : 'unavailable' },
+          sources: { census: 'ok', geocode: g.status, schools: geo ? 'ok' : 'unavailable', safety: geo ? (safety ? 'ok' : (prVpdInBox(geo.lat, geo.lng) ? 'not_found' : 'not_applicable')) : 'unavailable' }, // PG-03 M5: outside the VPD map is 'not_applicable', not a data miss
           schoolsSource: 'BC Ministry of Education open data (BC Data Catalogue), 2025/26',
           geocodeSource: 'OpenStreetMap / Nominatim',
           links: PR_LINKS
@@ -5809,29 +5850,41 @@ async function handleRequest(request, env, ctx) {
         if (address.length < 4) return json({ ok: false, error: 'validation', field: 'address' }, 400, origin);
         const slug = address.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
         const links = { bca: PR_LINKS.bca, parcel: PR_LINKS.parcel, ltsa: PR_LINKS.ltsa, walkscore: 'https://www.walkscore.com/score/' + slug + (cityIn ? '-' + cityIn.toLowerCase().replace(/[^a-z0-9]+/g, '-') : '') };
-        if (!/^vancouver$/i.test(cityIn)) {
+        const cityNorm = cityIn.replace(/,?\s+(bc|british columbia)\s*$/i, '').trim(); // PG-03 M6: "Vancouver, BC" is Vancouver
+        if (!/^vancouver$/i.test(cityNorm)) {
           // live property records are Vancouver-only (the verified source);
           // every other BC city gets the official records, never a guess
           return json({ ok: true, supported: false, reason: 'vancouver_only', address: prCleanEcho(address), city: prCleanEcho(cityIn), links }, 200, origin);
         }
         const parsed = prParseAddress(address); // unit carried separately, never the civic (M7)
+        if (parsed.civic && parsed.streetRaw) { // PG-03 M7
+          const pslug = (parsed.civic.raw + ' ' + parsed.streetRaw).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+          if (pslug) links.walkscore = 'https://www.walkscore.com/score/' + pslug + '-vancouver';
+        }
         const g = await prGeocode(env, address + ', Vancouver, BC, Canada', false);
         const geo = g.geo;
         if (!geo) { const miss = g.status === 'unavailable' ? 'unavailable' : 'not_found'; return json({ ok: true, supported: true, found: false, address: prCleanEcho(address), city: 'Vancouver', postcode: null, card: null, permits: [], sources: { geocode: g.status, parcels: miss, permits: miss }, links }, 200, origin); } // PH-03R M3: an outage must not pose as a genuine no-match
         let card = null, permits = [], parcelsStatus = 'not_found', permitsStatus = 'not_found';
-        // the street to match on: the geocoder's road name first, the
-        // visitor's own street text as fallback — both normalised to the
-        // tax report's format. No normalisable street = no match (H2).
-        const streetKey = prNormStreetDataset(geo.road) || prNormStreetDataset(parsed.streetRaw);
+        // the street to match on (PG-03 H1): the visitor's street and
+        // the geocoder's road, both normalised to the tax report's
+        // format, must AGREE — a fuzzy geocoder hit on a different
+        // street must never pair the visitor's civic with that
+        // street's parcels. One key only = that key; neither = no match.
+        const visitorKey = prNormStreetDataset(parsed.streetRaw);
+        const geoKey = prNormStreetDataset(geo.road);
+        if (visitorKey && geoKey && visitorKey !== geoKey) {
+          return json({ ok: true, supported: true, found: false, address: prCleanEcho(address), city: 'Vancouver', postcode: geo.postcode || null, card: null, permits: [], sources: { geocode: 'mismatch', parcels: 'ambiguous', permits: 'ambiguous' }, links }, 200, origin);
+        }
+        const streetKey = visitorKey || geoKey;
         if (parsed.civic && streetKey) {
           const byCivic = await prCovParcelsByCivic(env, streetKey, parsed.civic);
-          let cand = byCivic.rows || [], anyOk = byCivic.status === 'ok', truncated = !!byCivic.truncated;
+          let cand = byCivic.rows || [], anyOk = byCivic.status === 'ok', truncated = !!byCivic.truncated || !!byCivic.partial; // PG-02 H2: a partial set is an incomplete set
           if (geo.postcode) { // a valid postcode narrows/catches ranges; it is never required (M3)
             const byPc = await prCovParcels(env, geo.postcode);
-            if (byPc.status === 'ok') { anyOk = true; cand = cand.concat(byPc.rows || []); truncated = truncated || !!byPc.truncated; }
+            if (byPc.status === 'ok') { anyOk = true; cand = cand.concat(byPc.rows || []); truncated = truncated || !!byPc.truncated || !!byPc.partial; }
           }
           const seenPid = new Map();
-          for (const r of cand) { const k = r.pid || (r.street_name + '|' + r.from_civic_number + '|' + r.to_civic_number + '|' + r.legal_type); if (!seenPid.has(k)) seenPid.set(k, r); }
+          for (const r of cand) { const k = r.pid || (r.street_name + '|' + r.from_civic_number + '|' + r.to_civic_number + '|' + r.legal_type + '|' + (r.narrative_legal_line1 || '')); if (!seenPid.has(k)) seenPid.set(k, r); } // PG-03 M1: fuller fallback key
           const m = prMatchParcels([...seenPid.values()], streetKey, parsed.civic);
           const totalOf = p => { const l = prNumOrNull(p.current_land_value), b = prNumOrNull(p.current_improvement_value); return (l === null || b === null) ? null : l + b; };
           if (m.strata.length) {
@@ -5858,6 +5911,8 @@ async function handleRequest(request, env, ctx) {
             const landV = prNumOrNull(p.current_land_value), bldV = prNumOrNull(p.current_improvement_value);
             card = {
               kind: 'single', pid: String(p.pid || ''),
+              truncated: !!truncated, // PG-03 M8: a single match out of
+              // a truncated candidate set must not look authoritative
               legal: [p.narrative_legal_line1, p.narrative_legal_line2, p.narrative_legal_line3].filter(Boolean).join(' '),
               zoning: [p.zoning_district, p.zoning_classification].filter(Boolean).join(' '),
               yearBuilt: parseInt(p.year_built, 10) || null,
@@ -5875,7 +5930,7 @@ async function handleRequest(request, env, ctx) {
             try {
               const matchedRows = card.kind === 'strata' ? m.strata : m.land;
               const pcSet = [...new Set(matchedRows.map(p => prNormPostal(p.property_postal_code)).filter(Boolean))];
-              const pm = await prCovPermits(env, parsed.civic.num, streetKey, pcSet.length ? pcSet : geo.postcode);
+              const pm = await prCovPermits(env, parsed.civic.raw, streetKey, pcSet.length ? pcSet : geo.postcode);
               permits = pm.permits || [];
               permitsStatus = pm.status === 'ok' ? (permits.length ? 'ok' : 'not_found') : 'unavailable';
             } catch (e) { permits = []; permitsStatus = 'unavailable'; }
