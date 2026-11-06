@@ -79,6 +79,7 @@ function cors(origin) {
   const h = {
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '600',
     'Vary': 'Origin',
     'Cache-Control': 'no-store'
   };
@@ -1201,6 +1202,27 @@ function prCleanEcho(s) {
   // visitor/upstream strings echoed into a response (PR-01 L1): strip
   // control characters and angle brackets; renderers escape regardless.
   return String(s == null ? '' : s).replace(/[<>\u0000-\u001f\u007f]/g, '').trim();
+}
+function prNormDigits(s) {
+  // digit blocks a BC visitor may type (PH-03R M1): Arabic-Indic,
+  // Extended Arabic-Indic (Persian), Devanagari and full-width digits
+  // become ASCII before parsing/slug building — the slug regex and the
+  // civic parser only understand 0-9, so un-normalised digits silently
+  // rotted the Walk Score link and dropped the civic number.
+  return String(s == null ? '' : s).replace(/[٠-٩۰-۹०-९０-９]/g, function (ch) {
+    const c = ch.charCodeAt(0);
+    if (c >= 0x660 && c <= 0x669) return String(c - 0x660);
+    if (c >= 0x6f0 && c <= 0x6f9) return String(c - 0x6f0);
+    if (c >= 0x966 && c <= 0x96f) return String(c - 0x966);
+    return String(c - 0xff10);
+  });
+}
+function prCapStr(s, n) {
+  // code-point cap (PH-03R M2): String.slice counts UTF-16 units and
+  // can split a surrogate pair; toWellFormed() repairs lone surrogates
+  // first so the capped value is always well-formed.
+  const w = String(s == null ? '' : s).toWellFormed();
+  return [...w].slice(0, n).join('');
 }
 function prNumOrNull(v) {
   // money fields (PR-01 M5): a missing value stays null — never a
@@ -5629,7 +5651,7 @@ async function handleRequest(request, env, ctx) {
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
     // the Content-Length check and the chunked-body check cannot drift.
-    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/rules' ? 262144 : 32768))); };
+    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -5767,14 +5789,22 @@ async function handleRequest(request, env, ctx) {
         // with query params remains supported for compatibility.
         let address = '', cityIn = '';
         if (request.method === 'POST') {
+          // PH-03 M1/L1: a JSON content type is required — a text/plain
+          // no-cors simple request used to run the lookup (and burn the
+          // visitor's quota + upstream calls) without any preflight.
+          const ct = String(request.headers.get('Content-Type') || '').toLowerCase();
+          if (ct.indexOf('application/json') !== 0) return json({ ok: false, error: 'content_type' }, 415, origin);
           let d = null;
           try { d = await request.json(); } catch (e) {}
           d = d || {};
-          address = String(d.address || '').slice(0, 140).trim();
-          cityIn = String(d.city || '').slice(0, 60).trim();
+          // PH-03R M1/L1: non-string fields drop to '' (String(obj)
+          // produced "[object Object]", which passed the length check);
+          // digits are normalised and caps count code points (M2).
+          address = prCapStr(prNormDigits(typeof d.address === 'string' ? d.address : ''), 140).trim();
+          cityIn = prCapStr(prNormDigits(typeof d.city === 'string' ? d.city : ''), 60).trim();
         } else {
-          address = String(url.searchParams.get('address') || '').slice(0, 140).trim();
-          cityIn = String(url.searchParams.get('city') || '').slice(0, 60).trim();
+          address = prCapStr(prNormDigits(url.searchParams.get('address') || ''), 140).trim();
+          cityIn = prCapStr(prNormDigits(url.searchParams.get('city') || ''), 60).trim();
         }
         if (address.length < 4) return json({ ok: false, error: 'validation', field: 'address' }, 400, origin);
         const slug = address.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -5787,7 +5817,7 @@ async function handleRequest(request, env, ctx) {
         const parsed = prParseAddress(address); // unit carried separately, never the civic (M7)
         const g = await prGeocode(env, address + ', Vancouver, BC, Canada', false);
         const geo = g.geo;
-        if (!geo) return json({ ok: true, supported: true, found: false, address: prCleanEcho(address), city: 'Vancouver', postcode: null, card: null, permits: [], sources: { geocode: g.status, parcels: 'not_found', permits: 'not_found' }, links }, 200, origin);
+        if (!geo) { const miss = g.status === 'unavailable' ? 'unavailable' : 'not_found'; return json({ ok: true, supported: true, found: false, address: prCleanEcho(address), city: 'Vancouver', postcode: null, card: null, permits: [], sources: { geocode: g.status, parcels: miss, permits: miss }, links }, 200, origin); } // PH-03R M3: an outage must not pose as a genuine no-match
         let card = null, permits = [], parcelsStatus = 'not_found', permitsStatus = 'not_found';
         // the street to match on: the geocoder's road name first, the
         // visitor's own street text as fallback — both normalised to the
@@ -9314,10 +9344,13 @@ export default {
     // cold-cleared every admin cache. It now fires only after a mutating
     // request actually succeeded (status < 400, /api/track excluded as before;
     // cycle 30: 5xx bumps too — a write may have landed before the failure).
+    // Pack PH (PH-03R H1): /api/report/ POSTs are contractually
+    // side-effect-free (the gated stubs write nothing) — bumping on them
+    // burned a KV write + a full admin-cache clear per public report.
     try {
       const m = request.method;
       const p = new URL(request.url).pathname;
-      if (m !== 'GET' && m !== 'OPTIONS' && m !== 'HEAD' && p !== '/api/track' && (resp.status < 400 || resp.status >= 500)) {
+      if (m !== 'GET' && m !== 'OPTIONS' && m !== 'HEAD' && p !== '/api/track' && !p.startsWith('/api/report/') && (resp.status < 400 || resp.status >= 500)) {
         adminCache.clear();
         genMemo = { t: 0, v: null };
         if (ctx && ctx.waitUntil) { try { ctx.waitUntil(env.LEADS.put('admin:gen', String(Date.now())).catch(function () {})); } catch (e) {} }
