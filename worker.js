@@ -5485,7 +5485,9 @@ let mpInflight = null, mpFailUntil = 0, mpMem = null, mpMemAt = 0;
 
 function mpSeriesShapeOk(s, nullable) {
   if (s === null) return !!nullable;
-  return !!s && typeof s === 'object' && typeof s.value === 'number' && isFinite(s.value) && typeof s.date === 'string';
+  // Pack PI2 (PI-verify M1): the date must PARSE — a string that is not
+  // a date used to pass here and then fail open in the serve-age check.
+  return !!s && typeof s === 'object' && typeof s.value === 'number' && isFinite(s.value) && typeof s.date === 'string' && isFinite(Date.parse(s.date));
 }
 /* Pack PI (PI-01 H2): the shape check now covers the WHOLE payload —
    the chart series and the missing list included — and requires the
@@ -5519,12 +5521,18 @@ function mpCacheShapeOk(c) {
 function mpServeApply(p, stale) {
   if (!p) return null;
   const now = Date.now();
-  const age = function (s) { return s ? (now - Date.parse(s.date)) / 86400000 : Infinity; };
-  if (age(p.policy) > MP_SERIES_MAX_AGE.policy) return null;
+  /* Pack PI2 (PI-verify M1): "not provably within cap" counts as over
+     cap — the old age() returned NaN for an unparseable date and
+     NaN > cap is false, so a corrupted entry served as fresh. */
+  const ageOk = function (s, cap) { const t = s ? Date.parse(s.date) : NaN; return isFinite(t) && (now - t) / 86400000 <= cap; };
+  if (!ageOk(p.policy, MP_SERIES_MAX_AGE.policy)) return null;
   const out = Object.assign({}, p, { ok: true, stale: !!stale });
+  // Pack PI2 (PI-verify L5): the chart series leaves as a copy, not a
+  // reference into the in-memory cache entry.
+  if (Array.isArray(p.policySeries)) out.policySeries = p.policySeries.slice();
   const missing = Array.isArray(p.missing) ? p.missing.slice() : [];
-  if (out.prime && age(out.prime) > MP_SERIES_MAX_AGE.prime) { out.prime = null; if (missing.indexOf('prime') === -1) missing.push('prime'); }
-  if (out.bond5 && age(out.bond5) > MP_SERIES_MAX_AGE.bond5) { out.bond5 = null; if (missing.indexOf('bond5') === -1) missing.push('bond5'); }
+  if (out.prime && !ageOk(out.prime, MP_SERIES_MAX_AGE.prime)) { out.prime = null; if (missing.indexOf('prime') === -1) missing.push('prime'); }
+  if (out.bond5 && !ageOk(out.bond5, MP_SERIES_MAX_AGE.bond5)) { out.bond5 = null; if (missing.indexOf('bond5') === -1) missing.push('bond5'); }
   out.missing = missing;
   return out;
 }
@@ -9486,13 +9494,23 @@ async function handleRequest(request, env, ctx) {
           if (!(mm && typeof mm === 'object' && typeof mm.month === 'string' && MP_MONTH_RE.test(mm.month))) { purged++; return false; }
           if (seenM[mm.month]) { purged++; return false; }
           seenM[mm.month] = 1;
-          if (mpValidateMonth(mm).length) { purged++; return false; }
+          // Pack PI2 (PI-verify L2): only STRUCTURAL garbage is
+          // purged. A month that merely fails today's validator
+          // stays stored — the serve path hides it and counts it in
+          // `skipped` — so a future validator tightening can never
+          // silently delete cited history on the next write.
           return true;
         });
         const ix = ds.months.findIndex(function (mm) { return mm.month === d.month; });
-        if (ix >= 0 && !backupOk && !confirm) return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
+        // Pack PI2 (PI-verify L1): the backup override is its OWN
+        // parameter (?force=1) — ?confirm=1 is only the jump gate's.
+        if (ix >= 0 && !backupOk && url.searchParams.get('force') !== '1') return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
         // Pack PI (PI-02 M4): sources are stored trimmed.
         for (const b of MP_BLOCK_NAMES) if (d[b] && typeof d[b].source === 'string') d[b].source = d[b].source.trim();
+        // Pack PI2 (PI-verify M2): sourceUrl is stored in its parsed
+        // href form, so the value a future renderer puts into an href
+        // is the canonical one the validator actually checked.
+        for (const b of MP_BLOCK_NAMES) if (d[b] && typeof d[b].sourceUrl === 'string') { try { d[b].sourceUrl = new URL(d[b].sourceUrl).href; } catch (e) {} }
         // Pack I (MP-01 M2): block-level merge by default — a partial
         // PUT (one board's block) no longer deletes the month's other
         // blocks. ?replace=1 restores full replacement and the answer
@@ -9560,7 +9578,7 @@ async function handleRequest(request, env, ctx) {
         // only rollback for the removed month.
         let backupOk = true;
         if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) backupOk = await mpBackupStats(env, ds);
-        if (!backupOk && url.searchParams.get('confirm') !== '1') return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
+        if (!backupOk && url.searchParams.get('force') !== '1') return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
         // Pack PI (PI-03 M6): every entry for the month goes
         // (duplicates included; the old findIndex removed only one).
         ds.months = ds.months.filter(function (mm) { return !(mm && mm.month === month); });
