@@ -4800,11 +4800,12 @@ async function brainFollowupDrafts(env) {
    brain:brief:latest and appended to the attention feed. */
 async function brainMarketBrief(env, opts) {
   opts = opts || {};
-  const ds = await mpReadStatsSafe(env);
+  const ds = (opts && opts.ds) || await mpReadStatsSafe(env); // Pack PI (PI-03 M7): writers pass the just-written dataset
   const months = (ds && ds.months) || [];
   const cur = months[0] || null, prev = months[1] || null;
   if (!cur) return { ok: false, error: 'no_stats' };
   if (opts.auto) {
+    if (opts.month && cur.month !== opts.month) return { ok: true, skipped: 'not_latest' };
     let prevBrief = null;
     try { prevBrief = await env.LEADS.get('brain:brief:latest', { type: 'json' }); } catch (e) {}
     if (prevBrief && prevBrief.month === cur.month) return { ok: true, skipped: 'already_briefed' };
@@ -5400,6 +5401,9 @@ async function brainVoiceProposal(env, transcript, leadId) {
      number is never served silently. */
 const MP_SERIES = { policy: 'V39079', prime: 'V80691311', bond5: 'BD.CDN.5YR.DQ.YLD' };
 const MP_RATES_TTL_MS = 24 * 3600 * 1000;
+/* Pack PI (PI-01 M1): a degraded payload (a series missing) re-checks
+   upstream after ~2h instead of blanking that series for a full day. */
+const MP_RATES_DEGRADED_TTL_MS = 2 * 3600 * 1000;
 
 /* Pack I (MP-01 M3): per-series freshness caps in days. The policy
    rate is daily and the hub cannot do without it; prime is a WEEKLY
@@ -5425,17 +5429,19 @@ async function mpFetchValet() {
     const n = Number(s);
     return (n >= 0 && n <= 25) ? n : NaN;
   }
+  const now = Date.now();
   function lastOf(series) {
     let best = null;
     for (const o of obs) {
       const cell = o[series];
       const v = cell ? parseV(cell.v) : NaN;
       const t = Date.parse(o.d);
-      if (isFinite(v) && isFinite(t) && (!best || t > best.t)) best = { value: v, date: o.d, series: series, t: t };
+      // Pack PI (PI-01 M5): a future-dated observation must not win
+      // "newest by date" (a day of clock slack is allowed).
+      if (isFinite(v) && isFinite(t) && t <= now + 86400000 && (!best || t > best.t)) best = { value: v, date: o.d, series: series, t: t };
     }
     return best;
   }
-  const now = Date.now();
   const ageDays = function (o) { return o ? (now - o.t) / 86400000 : Infinity; };
   const policy = lastOf(MP_SERIES.policy), prime = lastOf(MP_SERIES.prime), bond5 = lastOf(MP_SERIES.bond5);
   // Pack I (MP-01 M3): a missing or over-age POLICY series fails the
@@ -5456,7 +5462,7 @@ async function mpFetchValet() {
     const cell = o[MP_SERIES.policy];
     const v = cell ? parseV(cell.v) : NaN;
     const t = Date.parse(o.d);
-    if (isFinite(v) && isFinite(t) && t >= cutoff) policyObs.push([o.d, v, t]);
+    if (isFinite(v) && isFinite(t) && t >= cutoff && t <= now + 86400000) policyObs.push([o.d, v, t]);
   }
   policyObs.sort(function (a, b) { return a[2] - b[2]; });
   const policySeries = policyObs.map(function (p) { return [p[0], p[1]]; });
@@ -5481,48 +5487,103 @@ function mpSeriesShapeOk(s, nullable) {
   if (s === null) return !!nullable;
   return !!s && typeof s === 'object' && typeof s.value === 'number' && isFinite(s.value) && typeof s.date === 'string';
 }
+/* Pack PI (PI-01 H2): the shape check now covers the WHOLE payload —
+   the chart series and the missing list included — and requires the
+   v:2 schema marker, so a pre-Pack-PI cache entry (no missing field,
+   weaker validation) can never be served as fresh again. */
 function mpCacheShapeOk(c) {
   if (!c || typeof c !== 'object') return false;
+  if (c.v !== 2) return false;
   const t = Date.parse(c.fetchedAt);
   if (!isFinite(t)) return false;
   if (Date.now() - t < 0) return false; // a future fetchedAt is corrupt, not fresh (L1)
-  return mpSeriesShapeOk(c.policy, false) && mpSeriesShapeOk(c.prime, true) && mpSeriesShapeOk(c.bond5, true);
+  if (!Array.isArray(c.policySeries)) return false;
+  for (const row of c.policySeries) {
+    if (!Array.isArray(row) || row.length !== 2 || typeof row[0] !== 'string' || typeof row[1] !== 'number' || !isFinite(row[1])) return false;
+  }
+  if (!Array.isArray(c.missing)) return false;
+  for (const m of c.missing) if (m !== 'prime' && m !== 'bond5') return false;
+  if (!mpSeriesShapeOk(c.policy, false)) return false;
+  if ((c.prime === null) !== (c.missing.indexOf('prime') !== -1)) return false;
+  if ((c.bond5 === null) !== (c.missing.indexOf('bond5') !== -1)) return false;
+  return mpSeriesShapeOk(c.prime, true) && mpSeriesShapeOk(c.bond5, true);
+}
+/* Pack PI (PI-01 H1): freshness is re-derived from each series' own
+   observation date on EVERY serve path, not only at fetch time — the
+   stale flag used to describe fetch age, so a payload fetched with a
+   9.9-day-old policy observation could be served "fresh" and then
+   "stale" for a week past its 10-day cap. An over-cap prime/bond
+   degrades to null + missing on the served copy; an over-cap policy
+   makes the payload unservable (null) so the caller falls through to
+   a refetch or the unavailable state. */
+function mpServeApply(p, stale) {
+  if (!p) return null;
+  const now = Date.now();
+  const age = function (s) { return s ? (now - Date.parse(s.date)) / 86400000 : Infinity; };
+  if (age(p.policy) > MP_SERIES_MAX_AGE.policy) return null;
+  const out = Object.assign({}, p, { ok: true, stale: !!stale });
+  const missing = Array.isArray(p.missing) ? p.missing.slice() : [];
+  if (out.prime && age(out.prime) > MP_SERIES_MAX_AGE.prime) { out.prime = null; if (missing.indexOf('prime') === -1) missing.push('prime'); }
+  if (out.bond5 && age(out.bond5) > MP_SERIES_MAX_AGE.bond5) { out.bond5 = null; if (missing.indexOf('bond5') === -1) missing.push('bond5'); }
+  out.missing = missing;
+  return out;
 }
 function mpStaleServe(cache) {
   let best = null, bestAt = -1;
   if (cache && mpCacheShapeOk(cache)) { best = cache; bestAt = Date.parse(cache.fetchedAt); }
   if (mpMem && mpMemAt > bestAt) { best = mpMem; bestAt = mpMemAt; }
-  if (best && (Date.now() - bestAt) <= MP_RATES_MAX_STALE_MS) return Object.assign({}, best, { ok: true, stale: true });
+  if (best && (Date.now() - bestAt) <= MP_RATES_MAX_STALE_MS) {
+    const served = mpServeApply(best, true);
+    if (served) return served;
+  }
   return { ok: false, state: 'unavailable', source: 'Bank of Canada Valet API' };
 }
-async function mpRates(env) {
+/* Pack PI (PI-01 M6): the last rates failure is recorded best-effort,
+   so "Valet down" can be told apart from "policy series stale" and
+   "KV broken" after the fact. */
+async function mpRatesDiag(env, kind, msg) {
+  try { await env.LEADS.put('market:rates:diag', JSON.stringify({ at: new Date().toISOString(), kind: kind, error: String(msg || '').slice(0, 200) })); } catch (e) {}
+}
+async function mpRates(env, ctx) {
   let cache = null;
   try { cache = await env.LEADS.get('market:rates', { type: 'json' }); } catch (e) { cache = null; }
-  if (cache && mpCacheShapeOk(cache) && (Date.now() - Date.parse(cache.fetchedAt)) < MP_RATES_TTL_MS) {
-    return Object.assign({}, cache, { ok: true, stale: false });
+  if (cache && mpCacheShapeOk(cache)) {
+    const ttl = (cache.missing && cache.missing.length) ? MP_RATES_DEGRADED_TTL_MS : MP_RATES_TTL_MS;
+    if ((Date.now() - Date.parse(cache.fetchedAt)) < ttl) {
+      const served = mpServeApply(cache, false);
+      if (served) return served;
+    }
   }
-  if (mpMem && (Date.now() - mpMemAt) < MP_MEM_TTL_MS) return Object.assign({}, mpMem, { ok: true, stale: false });
+  if (mpMem && (Date.now() - mpMemAt) < MP_MEM_TTL_MS) {
+    const servedM = mpServeApply(mpMem, false);
+    if (servedM) return servedM;
+  }
   if (Date.now() < mpFailUntil) return mpStaleServe(cache);
   if (!mpInflight) {
     mpInflight = (async function () {
       try {
         const fresh = await mpFetchValet();
-        const payload = { source: 'Bank of Canada Valet API', fetchedAt: new Date().toISOString(),
+        const payload = { v: 2, source: 'Bank of Canada Valet API', fetchedAt: new Date().toISOString(),
           policy: fresh.policy, prime: fresh.prime, bond5: fresh.bond5, policySeries: fresh.policySeries, missing: fresh.missing };
         mpMem = payload; mpMemAt = Date.now();
-        try { await env.LEADS.put('market:rates', JSON.stringify(payload)); } catch (e) {}
+        /* Pack PI (PI-01 M2/M3): the KV write leaves the shared
+           promise — a hung put can no longer wedge every request on
+           the isolate behind the single-flight, and a cancelled
+           starter request no longer fails the fetch for everyone. */
+        const putP = env.LEADS.put('market:rates', JSON.stringify(payload)).catch(function () {});
+        if (ctx && ctx.waitUntil) { try { ctx.waitUntil(putP); } catch (e) {} }
         return payload;
       } catch (e) {
         mpFailUntil = Date.now() + MP_FAIL_BACKOFF_MS;
+        mpRatesDiag(env, 'fetch', e && e.message);
         return null;
       } finally { mpInflight = null; }
     })();
   }
   const payload = await mpInflight;
-  if (payload) return Object.assign({}, payload, { ok: true, stale: false });
+  if (payload) { const s = mpServeApply(payload, false); if (s) return s; }
   return mpStaleServe(cache);
 }
-
 /* ---- market stats dataset: validation + read ----
    A month entry: { month:'YYYY-MM', canada?, bc?, gvr?, fvreb?, rates? }.
    Pack I (MP-01 H1/H2): validation is an ALLOWLIST, not a pass-through
@@ -5564,7 +5625,7 @@ function mpBoundsFor(block, f) {
   if (f === 'dom') return [0, 365];
   if (f.slice(-7) === 'VolumeB') return [0, 1000];
   if (f.slice(-3) === 'Pct') return [-100, 500];
-  return [0, Infinity]; // plain counts: non-negative
+  return [0, 10000000]; // plain counts: non-negative, capped, whole (Pack PI, PI-02 M3)
 }
 function mpNumFields(obj, fields, path, errs, block) {
   let n = 0;
@@ -5572,6 +5633,7 @@ function mpNumFields(obj, fields, path, errs, block) {
     if (obj[f] === undefined) continue;
     if (typeof obj[f] !== 'number' || !isFinite(obj[f])) { errs.push(path + '.' + f + ' must be a number'); continue; }
     const b = mpBoundsFor(block, f);
+    if (b[1] === 10000000 && !Number.isInteger(obj[f])) { errs.push(path + '.' + f + ' must be a whole number'); continue; }
     if (obj[f] < b[0] || obj[f] > b[1]) { errs.push(path + '.' + f + ' is outside the plausible range ' + b[0] + '..' + (isFinite(b[1]) ? b[1] : 'no cap')); continue; }
     n++;
   }
@@ -5612,9 +5674,29 @@ function mpValidateMonth(d) {
     for (const k of Object.keys(blk)) if (!mpHas(allowed, k)) errs.push(b + ': unknown field: ' + k);
     if (typeof blk.source !== 'string' || blk.source.trim().length < 3 || blk.source.length > 120) errs.push(b + '.source must name the publisher (3-120 chars)');
     if (typeof blk.sourceDate !== 'string' || !mpDateOk(blk.sourceDate)) errs.push(b + '.sourceDate must be a real YYYY-MM-DD or YYYY-MM date, not in the future');
-    if (blk.sourceUrl !== undefined && (typeof blk.sourceUrl !== 'string' || blk.sourceUrl.indexOf('https://') !== 0 || blk.sourceUrl.length > 300)) errs.push(b + '.sourceUrl must be an https URL of at most 300 chars');
+    if (blk.sourceUrl !== undefined) {
+      // Pack PI (PI-02 M4): a prefix test accepted https://x" onmouseover=... — parse it properly.
+      let urlOk = typeof blk.sourceUrl === 'string' && blk.sourceUrl.length <= 300 && !/[\s"'<>]/.test(blk.sourceUrl);
+      if (urlOk) { try { const u = new URL(blk.sourceUrl); urlOk = u.protocol === 'https:' && !!u.hostname; } catch (e) { urlOk = false; } }
+      if (!urlOk) errs.push(b + '.sourceUrl must be a valid https URL of at most 300 chars');
+    }
+    // Pack PI (PI-02 M5): a block's source cannot predate the month it reports.
+    if (typeof blk.sourceDate === 'string' && mpDateOk(blk.sourceDate) && typeof d.month === 'string' && MP_MONTH_RE.test(d.month) && blk.sourceDate.slice(0, 7) < d.month) errs.push(b + '.sourceDate cannot predate the statistics month');
     for (const f of MP_META[b]) {
       if (blk[f] !== undefined && (typeof blk[f] !== 'string' || blk[f].length > 300)) errs.push(b + '.' + f + ' must be a string of at most 300 chars');
+    }
+    if (b === 'rates') {
+      // Pack PI (PI-02 H2): per-figure provenance — a rate figure is
+      // only as good as its own date/source, and a provenance field
+      // with no figure is rejected so the two never drift apart.
+      const hasF = function (f) { return blk[f] !== undefined; };
+      const dateOkF = function (f) { return typeof blk[f] === 'string' && mpDateOk(blk[f]); };
+      if ((hasF('policyRate') || hasF('bankRate') || hasF('depositRate')) && !dateOkF('policyDate')) errs.push('rates.policyDate is required (a real date) when a policy/bank/deposit rate is present');
+      if (!hasF('policyRate') && !hasF('bankRate') && !hasF('depositRate') && hasF('policyDate')) errs.push('rates.policyDate has no matching rate figure');
+      if (hasF('prime') && !dateOkF('primeDate')) errs.push('rates.primeDate is required (a real date) when prime is present');
+      if (!hasF('prime') && hasF('primeDate')) errs.push('rates.primeDate has no matching rate figure');
+      if ((hasF('bestFixed5') || hasF('bestVariable5')) && (!dateOkF('bestRatesDate') || typeof blk.bestSource !== 'string' || blk.bestSource.trim().length < 3)) errs.push('rates.bestRatesDate and rates.bestSource are required when a best rate is present');
+      if (!hasF('bestFixed5') && !hasF('bestVariable5') && (hasF('bestRatesDate') || hasF('bestSource'))) errs.push('rates.bestRatesDate/bestSource have no matching rate figure');
     }
     let figures = mpNumFields(blk, MP_BLOCK_FIELDS[b], b, errs, b);
     if (blk.types !== undefined) {
@@ -5640,18 +5722,54 @@ function mpValidateMonth(d) {
    the caller re-sends with ?confirm=1. The comparison runs against
    the latest stored month EARLIER than the incoming one, so a
    same-month correction never trips on itself and the first month
-   ever stored has nothing to trip on. */
-function mpJumpCheck(prev, d) {
+   ever stored has nothing to trip on. (Superseded in shape by Pack
+   PI: mpJumpDetails + mpPctGate below.) */
+/* Pack PI (PI-03 M4 / PI-02 M3): the jump gate now selects the
+   previous month PER BLOCK (the latest earlier month that carries
+   the block — a month lacking gvr used to skip the gvr check
+   entirely) and covers the fields the slips actually hit: type
+   prices, ytdAvgPrice and forecastAvgPrice join avgPrice/benchmark. */
+function mpJumpDetails(ds, d) {
   const out = [];
-  for (const b of MP_BLOCK_NAMES) {
-    if (!d[b] || !prev[b]) continue;
-    for (const f of ['avgPrice', 'benchmark']) {
-      const a = prev[b][f], n = d[b][f];
-      if (typeof a === 'number' && typeof n === 'number' && a > 0) {
-        const pct = Math.abs(n - a) / a * 100;
-        if (pct > 15) out.push(b + '.' + f + ' moved ' + pct.toFixed(1) + '% vs ' + prev.month + ' (' + a + ' -> ' + n + ')');
-      }
+  const chk = function (path, a, n, prevMonth) {
+    if (typeof a === 'number' && typeof n === 'number' && a > 0) {
+      const pct = Math.abs(n - a) / a * 100;
+      if (pct > 15) out.push(path + ' moved ' + pct.toFixed(1) + '% vs ' + prevMonth + ' (' + a + ' -> ' + n + ')');
     }
+  };
+  for (const b of MP_BLOCK_NAMES) {
+    if (!d[b]) continue;
+    const prev = ds.months.filter(function (mm) { return mm && typeof mm.month === 'string' && mm.month < d.month && mm[b]; })
+      .sort(function (x, y) { return String(y.month).localeCompare(String(x.month)); })[0] || null;
+    if (!prev) continue;
+    const pb = prev[b], nb = d[b];
+    for (const f of ['avgPrice', 'benchmark', 'ytdAvgPrice', 'forecastAvgPrice']) chk(b + '.' + f, pb[f], nb[f], prev.month);
+    if (pb.types && nb.types) for (const t of Object.keys(nb.types)) {
+      if (pb.types[t] && nb.types[t]) chk(b + '.types.' + t + '.price', pb.types[t].price, nb.types[t].price, prev.month);
+    }
+  }
+  return out;
+}
+/* Pack PI (PI-02 M3): percentage fields share one hard range in the
+   validator, which a x10 slip (52 for 5.2) passes. Values beyond a
+   per-kind plausibility band (MoM ±30, everything else ±100) are not
+   rejected outright — they join the jump gate's 409 confirm flow, so
+   a human (or the job's source re-check) confirms them deliberately. */
+function mpPctGate(d) {
+  const out = [];
+  const scan = function (blk, path) {
+    if (!blk || typeof blk !== 'object') return;
+    for (const f of Object.keys(blk)) {
+      if (f.slice(-3) !== 'Pct') continue;
+      const v = blk[f];
+      if (typeof v !== 'number' || !isFinite(v)) continue;
+      const lim = /Mom/.test(f) ? 30 : 100;
+      if (Math.abs(v) > lim) out.push(path + '.' + f + ' is ' + v + '% (beyond the ±' + lim + '% plausibility gate)');
+    }
+  };
+  for (const b of MP_BLOCK_NAMES) {
+    scan(d[b], b);
+    if (d[b] && d[b].types) for (const t of Object.keys(d[b].types)) scan(d[b].types[t], b + '.types.' + t);
   }
   return out;
 }
@@ -5667,6 +5785,9 @@ async function mpReadStats(env) {
   let ds = null;
   try { ds = JSON.parse(raw); } catch (e) { throw new Error('market:stats is not valid JSON'); }
   if (!ds || typeof ds !== 'object' || Array.isArray(ds) || !Array.isArray(ds.months)) throw new Error('market:stats document is malformed');
+  // Pack PI (PI-03 M1): a non-integer rev corrupts every consumer of
+  // it (backup keys, the ?rev= comparison, curRev + 1) — malformed.
+  if (ds.rev !== undefined && !(Number.isInteger(ds.rev) && ds.rev >= 0)) throw new Error('market:stats revision is malformed');
   return ds;
 }
 async function mpReadStatsSafe(env) {
@@ -5676,8 +5797,13 @@ async function mpReadStatsSafe(env) {
    document is preserved under market:stats:bak:<rev> (90-day TTL), so
    a bad write can be rolled back by hand. Best-effort by design: a
    backup failure never blocks the write it protects. */
+/* Pack PI (PI-03 M1/M3): the backup key gains a timestamp (two
+   writers at the same rev used to overwrite one key) and the call
+   reports success — a failed backup is no longer silent. Rollback
+   rule: a restore must stamp rev = (current max rev) + 1, never the
+   backed-up value, so a stale client's ?rev= can never pass (ABA). */
 async function mpBackupStats(env, ds) {
-  try { await env.LEADS.put('market:stats:bak:' + (ds.rev || 0), JSON.stringify(ds), { expirationTtl: 7776000 }); } catch (e) {}
+  try { await env.LEADS.put('market:stats:bak:' + (ds.rev || 0) + ':' + Date.now(), JSON.stringify(ds), { expirationTtl: 7776000 }); return true; } catch (e) { return false; }
 }
 
 async function handleRequest(request, env, ctx) {
@@ -5976,15 +6102,35 @@ async function handleRequest(request, env, ctx) {
         try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
         let lim = parseInt(url.searchParams.get('limit') || '', 10);
         if (!isFinite(lim) || lim < 1) lim = 24; if (lim > 120) lim = 120;
-        const months = ds.months.filter(function (m) { return m && typeof m === 'object' && typeof m.month === 'string' && MP_MONTH_RE.test(m.month); })
+        // Pack PI (PI-03 H2 = PI-02 H1 at the serve path): stored
+        // months are validated on the way out — a pre-Pack-I entry
+        // with a source-less block or an out-of-range month is
+        // dropped and counted, never published as-is.
+        const curMonth = new Date().toISOString().slice(0, 7);
+        let skipped = 0;
+        const months = ds.months.filter(function (m) {
+            if (!(m && typeof m === 'object' && typeof m.month === 'string' && MP_MONTH_RE.test(m.month) && m.month >= '2015-01' && m.month <= curMonth)) { skipped++; return false; }
+            if (mpValidateMonth(m).length) { skipped++; return false; }
+            return true;
+          })
           .sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); }).slice(0, lim);
-        const resp = json({ ok: true, version: ds.version || 1, rev: ds.rev || 0, months: months, updatedAt: ds.updatedAt || null }, 200, origin);
+        const resp = json({ ok: true, version: ds.version || 1, rev: ds.rev || 0, months: months, skipped: skipped, updatedAt: ds.updatedAt || null }, 200, origin);
         resp.headers.set('Cache-Control', 'public, max-age=300');
         return resp;
       }
       if (path === '/api/market/rates' && request.method === 'GET') {
         if (limited('mpr:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        return json(await mpRates(env), 200, origin);
+        // Pack PI (PI-03 M8): the handler passes ctx (the single-
+        // flight's KV write rides waitUntil), and "unavailable" is an
+        // honest 503, not a 200 a status-keyed client reads as success.
+        const rates = await mpRates(env, ctx);
+        if (!rates.ok) {
+          const respR = json(rates, 503, origin);
+          respR.headers.set('Retry-After', '300');
+          respR.headers.set('Cache-Control', 'no-store');
+          return respR;
+        }
+        return json(rates, 200, origin);
       }
 
       if (path === '/api/valuation' && request.method === 'POST') {
@@ -9307,31 +9453,68 @@ async function handleRequest(request, env, ctx) {
         let ds = null;
         try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
         const curRev = ds.rev || 0;
-        // Pack I (MP-01 M1): optimistic concurrency — a caller echoing
-        // ?rev= must have based its write on the current revision.
+        // Pack PI (PI-03 M2): the revision echo is now REQUIRED — a
+        // writer that omits ?rev= no longer gets silent last-write-
+        // wins. Parsed strictly (PI-03 M1): Number('') is 0 and
+        // Number('0x1') is 1, so only plain digits are accepted.
         const revQ = url.searchParams.get('rev');
-        if (revQ !== null && Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
-        // Pack I (MP-01 H2): the >15% headline-price jump gate.
-        if (url.searchParams.get('confirm') !== '1') {
-          const prev = ds.months.filter(function (mm) { return mm && typeof mm.month === 'string' && mm.month < d.month; })
-            .sort(function (a, b) { return String(b.month).localeCompare(String(a.month)); })[0] || null;
-          if (prev) { const jumps = mpJumpCheck(prev, d); if (jumps.length) return json({ ok: false, error: 'confirm_jump', details: jumps }, 409, origin); }
+        if (revQ === null) return json({ ok: false, error: 'rev_required', rev: curRev }, 428, origin);
+        if (!/^\d+$/.test(revQ) || Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
+        const confirm = url.searchParams.get('confirm') === '1';
+        // Pack I (MP-01 H2) + Pack PI (PI-03 M4 / PI-02 M3): the jump
+        // gate compares each block against the latest earlier month
+        // THAT CARRIES THE BLOCK, covers type prices and the other
+        // headline fields, and shares the 409 with the Pct
+        // plausibility gate.
+        if (!confirm) {
+          const jumps = mpJumpDetails(ds, d).concat(mpPctGate(d));
+          if (jumps.length) return json({ ok: false, error: 'confirm_jump', details: jumps }, 409, origin);
         }
-        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) await mpBackupStats(env, ds);
+        // Pack PI (PI-03 M3): the pre-write backup reports its own
+        // success; overwriting an existing month with no backup and
+        // no explicit confirm fails closed instead of silently
+        // losing the only rollback copy.
+        let backupOk = true;
+        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) backupOk = await mpBackupStats(env, ds);
+        // Pack PI (PI-03 H1 + PI-02 H1): stored entries that are not
+        // valid month objects, duplicate a month, or fail validation
+        // are purged on write — the old final sort crashed on a
+        // single null entry and locked every later PUT out.
+        let purged = 0;
+        const seenM = {};
+        ds.months = ds.months.filter(function (mm) {
+          if (!(mm && typeof mm === 'object' && typeof mm.month === 'string' && MP_MONTH_RE.test(mm.month))) { purged++; return false; }
+          if (seenM[mm.month]) { purged++; return false; }
+          seenM[mm.month] = 1;
+          if (mpValidateMonth(mm).length) { purged++; return false; }
+          return true;
+        });
+        const ix = ds.months.findIndex(function (mm) { return mm.month === d.month; });
+        if (ix >= 0 && !backupOk && !confirm) return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
+        // Pack PI (PI-02 M4): sources are stored trimmed.
+        for (const b of MP_BLOCK_NAMES) if (d[b] && typeof d[b].source === 'string') d[b].source = d[b].source.trim();
         // Pack I (MP-01 M2): block-level merge by default — a partial
         // PUT (one board's block) no longer deletes the month's other
         // blocks. ?replace=1 restores full replacement and the answer
         // names the blocks it dropped.
         const replace = url.searchParams.get('replace') === '1';
-        const ix = ds.months.findIndex(function (mm) { return mm && mm.month === d.month; });
-        let dropped = [], merged = false;
+        const written = MP_BLOCK_NAMES.filter(function (b) { return d[b] !== undefined; });
+        let dropped = [], merged = false, droppedFields = [];
+        const prevStoredJson = ix >= 0 ? JSON.stringify(ds.months[ix]) : null;
         if (ix >= 0) {
           if (replace) {
             dropped = MP_BLOCK_NAMES.filter(function (b) { return ds.months[ix][b] !== undefined && d[b] === undefined; });
             ds.months[ix] = d;
           } else {
             const mrg = Object.assign({}, ds.months[ix]);
-            for (const b of MP_BLOCK_NAMES) if (d[b] !== undefined) mrg[b] = d[b];
+            for (const b of written) {
+              // Pack PI (PI-03 M5): in-block loss is reported, not silent.
+              const old = ds.months[ix][b] || {};
+              for (const f of Object.keys(old)) if (d[b][f] === undefined && f !== 'source' && f !== 'sourceDate' && f !== 'types') droppedFields.push(b + '.' + f);
+              if (old.types && !d[b].types) droppedFields.push(b + '.types');
+              if (old.types && d[b].types) for (const t of Object.keys(old.types)) if (d[b].types[t] === undefined) droppedFields.push(b + '.types.' + t);
+              mrg[b] = d[b];
+            }
             ds.months[ix] = mrg; merged = true;
           }
         } else ds.months.push(d);
@@ -9339,11 +9522,21 @@ async function handleRequest(request, env, ctx) {
         ds.rev = curRev + 1;
         ds.version = ds.version || 1; // Pack I (MP-01 M1): never hard-reset the schema version
         ds.updatedAt = new Date().toISOString();
-        await env.LEADS.put('market:stats', JSON.stringify(ds));
-        // Portal brain (2026-11-01): a fresh month of board stats gets
-        // an automatic Persian market brief in the attention feed.
-        try { ctx.waitUntil(brainMarketBrief(env, { auto: true })); } catch (e) {}
-        return json({ ok: true, month: d.month, months: ds.months.length, rev: ds.rev, merged: merged, dropped: dropped }, 200, origin);
+        // Pack PI (PI-03 L5): a failed write says so (and whether the
+        // backup exists) instead of surfacing as a generic 500.
+        try { await env.LEADS.put('market:stats', JSON.stringify(ds)); }
+        catch (e) { return json({ ok: false, error: 'write_failed', backup: backupOk }, 500, origin); }
+        // Pack PI (PI-03 M7): the automatic market brief fires only
+        // when the written month is the dataset's latest AND its
+        // content actually changed, and it receives the written
+        // dataset instead of re-reading KV (a stale cross-location
+        // read could brief from the pre-write document).
+        const ixNow = ds.months.findIndex(function (mm) { return mm.month === d.month; });
+        const monthChanged = ix < 0 || JSON.stringify(ds.months[ixNow]) !== prevStoredJson;
+        if (ds.months[0] && ds.months[0].month === d.month && monthChanged) {
+          try { ctx.waitUntil(brainMarketBrief(env, { auto: true, ds: ds, month: d.month })); } catch (e) {}
+        }
+        return json({ ok: true, month: d.month, months: ds.months.length, rev: ds.rev, merged: merged, dropped: dropped, written: written, droppedFields: droppedFields, purged: purged, backup: backupOk }, 200, origin);
       }
       // Pack I (MP-01 L5): remove a wrongly entered month. Same auth,
       // same revision guard and the same pre-write backup as the PUT —
@@ -9355,19 +9548,29 @@ async function handleRequest(request, env, ctx) {
         let ds = null;
         try { ds = await mpReadStats(env); } catch (e) { return json({ ok: false, error: 'store_unavailable' }, 503, origin); }
         const curRev = ds.rev || 0;
+        // Pack PI (PI-03 M2/M1): the same required, strictly-parsed
+        // revision contract as the PUT.
         const revQ = url.searchParams.get('rev');
-        if (revQ !== null && Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
-        const ix = ds.months.findIndex(function (mm) { return mm && mm.month === month; });
-        if (ix < 0) return json({ ok: false, error: 'not_found', month: month }, 404, origin);
-        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) await mpBackupStats(env, ds);
-        ds.months.splice(ix, 1);
+        if (revQ === null) return json({ ok: false, error: 'rev_required', rev: curRev }, 428, origin);
+        if (!/^\d+$/.test(revQ) || Number(revQ) !== curRev) return json({ ok: false, error: 'conflict', rev: curRev }, 409, origin);
+        const matches = ds.months.filter(function (mm) { return mm && mm.month === month; }).length;
+        if (!matches) return json({ ok: false, error: 'not_found', month: month }, 404, origin);
+        // Pack PI (PI-03 M3): a delete whose backup failed fails
+        // closed unless explicitly confirmed — the backup is the
+        // only rollback for the removed month.
+        let backupOk = true;
+        if (curRev > 0 || ds.months.length > 0 || !!ds.updatedAt) backupOk = await mpBackupStats(env, ds);
+        if (!backupOk && url.searchParams.get('confirm') !== '1') return json({ ok: false, error: 'backup_failed', rev: curRev }, 409, origin);
+        // Pack PI (PI-03 M6): every entry for the month goes
+        // (duplicates included; the old findIndex removed only one).
+        ds.months = ds.months.filter(function (mm) { return !(mm && mm.month === month); });
         ds.rev = curRev + 1;
         ds.version = ds.version || 1;
         ds.updatedAt = new Date().toISOString();
-        await env.LEADS.put('market:stats', JSON.stringify(ds));
-        return json({ ok: true, month: month, months: ds.months.length, rev: ds.rev }, 200, origin);
+        try { await env.LEADS.put('market:stats', JSON.stringify(ds)); }
+        catch (e) { return json({ ok: false, error: 'write_failed', backup: backupOk }, 500, origin); }
+        return json({ ok: true, month: month, months: ds.months.length, rev: ds.rev, removed: matches, backup: backupOk, warning: 'derived content (auto briefs, cached pages) may still reference this month' }, 200, origin);
       }
-
       // ---- market radar on/off switch (portal toggle; the daily scan checks this first) ----
       if (path === '/api/radar-settings' && request.method === 'GET') {
         const s = await env.LEADS.get('radar:settings', { type: 'json' });
