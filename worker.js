@@ -1684,6 +1684,15 @@ let catalogFailedAt = 0;
 // mutation). A snapshot OLDER than this is an eventual-consistency
 // straggler and is never adopted over newer local state.
 let catalogDataAt = 0;
+// Pack PK3 (supp3 C1, close round 2 B2): true ONLY once this isolate
+// has actually LOADED a catalog — a successful snapshot adopt or
+// rebuild inside doRefreshCustomCatalog. The local mutators may
+// stamp freshness only then: the refresh FAILURE path backdates
+// customCatalogAt to now-90s, which is also > 0, so testing
+// `customCatalogAt > 0` could not tell "loaded" from "failed" — a
+// failed first load plus one admin write made a 1-of-N partial
+// catalog read as fresh (the original P6 failure).
+let catalogLoaded = false;
 async function refreshCustomCatalog(env, force) {
   if (!force && customCatalogAt > 0 && Date.now() - customCatalogAt < 120000) return;
   if (!force && catalogRefreshing) return catalogRefreshing;
@@ -1789,6 +1798,7 @@ async function doRefreshCustomCatalog(env) {
     customSlim = snap.listings.map(slimOf);
     deletedSeedMls = Array.isArray(snap.deleted) ? snap.deleted : [];
     customCatalogAt = Date.now();
+    catalogLoaded = true; // Pack PK3 (B2): a successful adopt is a load
     if (snap.at) catalogDataAt = Math.max(catalogDataAt, Number(snap.at) || 0);
     return;
   }
@@ -1797,6 +1807,7 @@ async function doRefreshCustomCatalog(env) {
   customSlim = built.full.map(slimOf);
   deletedSeedMls = built.deleted;
   customCatalogAt = Date.now();
+  catalogLoaded = true; // Pack PK3 (B2): a successful rebuild is a load
 }
 function mergedCatalog() {
   const over = Object.create(null), del = Object.create(null); // Pack PK (supp3 C6): null-prototype maps keyed by mls
@@ -1816,14 +1827,14 @@ function upsertLocalListing(rec) {
   // refresh really loads; the mutation itself is newer than any
   // snapshot, so record it as the data watermark.
   catalogDataAt = Date.now();
-  if (customCatalogAt > 0) customCatalogAt = Date.now();
+  if (catalogLoaded) customCatalogAt = Date.now(); // Pack PK3 (B2): stamp only a LOADED catalog (see catalogLoaded)
 }
 function removeLocalListing(mls, tombstone) {
   customListings = customListings.filter(function (r) { return r.mls !== mls; });
   customSlim = customSlim.filter(function (r) { return r.mls !== mls; });
   if (tombstone && deletedSeedMls.indexOf(mls) === -1) deletedSeedMls.push(mls);
   catalogDataAt = Date.now(); // Pack PK (supp3 C1/C2): see upsertLocalListing
-  if (customCatalogAt > 0) customCatalogAt = Date.now();
+  if (catalogLoaded) customCatalogAt = Date.now(); // Pack PK3 (B2): stamp only a LOADED catalog (see catalogLoaded)
 }
 const LISTING_TYPES = ['condo', 'townhouse', 'house', 'duplex', 'apartment', 'land'];
 function cleanHttpsUrl(v, max) {
@@ -4085,7 +4096,10 @@ async function puPipeline(env) {
   // them, and the payload must not present a capped/partial board as
   // complete): `total` counts only the leads the aggregation read.
   out.degraded = !!sm.degraded;
-  out.sources = sm.sources || {};
+  // Pack PK3: COPY the sources map — sharing the reference let a
+  // mutation of this payload's sources corrupt the cached
+  // aggregation's map (and vice versa).
+  out.sources = Object.assign({}, sm.sources || {});
   out.leadsTruncated = !!sm.leadsTruncated;
   out.viewingsTruncated = !!sm.viewingsTruncated;
   out.columnsTruncated = columnsTruncated;
@@ -4219,7 +4233,14 @@ async function puDemand(env) {
             // Pack PK (03-P1): the type key is canonicalised
             // (lowercase / trim / collapse / capped) — raw user text
             // used to mint unbounded near-duplicate aggregate keys.
-            const t = String((s.criteria && s.criteria.type) || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 40);
+            const tCanon = String((s.criteria && s.criteria.type) || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 40);
+            // Pack PK3 (03-P1, close round 2 B1): the canonicalised
+            // type is ALLOWLISTED against LISTING_TYPES before it
+            // can bucket — free text that is not a real listing type
+            // lands in the shared 'other' bucket, never under its
+            // own key (canonicalisation alone still let arbitrary
+            // user text mint aggregate keys).
+            const t = tCanon ? (LISTING_TYPES.indexOf(tCanon) !== -1 ? tCanon : 'other') : '';
             if (t) mine.types.add(t);
           }
           searchBuckets.set(em, mine);
@@ -4244,7 +4265,11 @@ async function puDemand(env) {
     for (const t of Object.keys(typePeople)) byTypeP[t] = typePeople[t].size;
     for (const c of Object.keys(cityPeopleS)) byCityP[c] = cityPeopleS[c].size;
     const sc2 = puSuppressSmall(byCityP, 3);
-    out.searchDemand = { searches: searches, byCity: sc2.map, byType: byTypeP, usersScanned: sample.length, usersTotal: uids.length, suppressedCells: sc2.suppressed, truncated: uids.length > sample.length, degraded: userErrors > 0 };
+    // Pack PK3 (03-P1, close round 2 B1): byType passes through the
+    // same small-cell suppression as byCity — a type named by one
+    // or two searchers used to publish as its own small cell.
+    const st2 = puSuppressSmall(byTypeP, 3);
+    out.searchDemand = { searches: searches, byCity: sc2.map, byType: st2.map, usersScanned: sample.length, usersTotal: uids.length, suppressedCells: sc2.suppressed + st2.suppressed, truncated: uids.length > sample.length, degraded: userErrors > 0 };
     if (userErrors) out.searchDemand.userErrors = userErrors;
     out.sources.searchDemand = 'ok';
   } catch (e) { out.searchDemand = null; out.sources.searchDemand = 'error'; }
@@ -4267,7 +4292,12 @@ async function puDemand(env) {
       else byRegion.unknown = (byRegion.unknown || 0) + 1; // Pack PK (03-P7): the no-region bucket is labelled, not silently dropped
       if (r.side === 'demand' || r.side === 'supply') bySide[r.side]++;
     }
-    out.pool = { total: keys.length, sampled: sampled, byRegion: byRegion, bySide: bySide, truncated: keys.length >= 200 };
+    // Pack PK3 (03-P1, close round 2 B1): byRegion passes through
+    // the same small-cell suppression as the other demand maps — a
+    // region named by one or two pool records used to publish as
+    // its own small cell.
+    const sr = puSuppressSmall(byRegion, 3);
+    out.pool = { total: keys.length, sampled: sampled, byRegion: sr.map, bySide: bySide, truncated: keys.length >= 200, suppressedCells: sr.suppressed };
     out.sources.pool = 'ok';
   } catch (e) { out.pool = null; out.sources.pool = 'error'; }
   // supply: active catalog by city (guarded like every other section —
@@ -4601,8 +4631,13 @@ async function puEvaluateRules(env, autoCtx) {
       for (let page_i = 0; page_i < 20 && !complete; page_i++) {
         const page = await ckv.list({ prefix: pfx, limit: 1000, cursor: cursor });
         for (const k of ((page && page.keys) || [])) firedSet.add(String(k.name).slice(pfx.length));
-        complete = !page || page.list_complete !== false;
-        cursor = complete ? undefined : page.cursor;
+        // Pack PK3 (02-M3 tail): a page proves completeness only
+        // by SAYING so — a missing list_complete (or a missing
+        // page) used to pass as complete (`!== false`), so an
+        // unenumerated tail read as un-fired and re-fired.
+        complete = !!(page && page.list_complete === true);
+        cursor = complete ? undefined : (page ? page.cursor : undefined);
+        if (!page) break;
       }
       if (!complete) throw new Error('dedupe_prefetch_incomplete');
     } catch (e) {
