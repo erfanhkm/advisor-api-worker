@@ -58,8 +58,13 @@ const ALLOWED_ORIGINS = [
   'https://muse.ai',
   // APP (2026-11-02): the Capacitor apps' WebView origins — Android serves
   // the bundled site from https://localhost, iOS from capacitor://localhost.
-  // Only an app installed on the device can present these origins; every
-  // route keeps its own auth, ban and rate-limit checks.
+  // Pack APP (APP-03 H2): this list is a CORS / convenience filter ONLY —
+  // it decides which browser origins may read responses and pre-filters
+  // the rest (403 in handleRequest). An Origin header is trivially
+  // settable by any non-browser client, so it is NOT an auth boundary
+  // and no route relies on it for one: admin + ingest routes sit behind
+  // the session/scoped-token gate, and every public route carries its
+  // own Turnstile, credential, signature, ban and rate-limit checks.
   'https://localhost',
   'capacitor://localhost'
 ];
@@ -6832,8 +6837,19 @@ async function handleRequest(request, env, ctx) {
       // cfg:apppush credentials. The raw token is never a KV key: the
       // record lives under app:push:<sha256(token)>, which also makes
       // re-registration naturally idempotent (same key, stamps merge).
+      // Pack APP (APP-03 H1): the token itself is stored in the record
+      // VALUE — keyed by hash, never echoed in a response or logged —
+      // because the send side must be able to recover it; a hash-only
+      // record could never be sent to. Records carry no owner/binding
+      // field yet: binding a token to an account lands with the
+      // accounts work on plug-in day.
       if (path === '/api/app/push-token' && request.method === 'POST') {
         if (limited('apppush:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        // Pack APP (APP-03 M4): reject an oversized body on its declared
+        // length BEFORE parsing it (the global cap above is 32 KB; a
+        // registration body is a few hundred bytes).
+        const pcl = parseInt(request.headers.get('Content-Length') || '0', 10);
+        if (pcl > 8192) return json({ ok: false, error: 'too_large' }, 413, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
@@ -6847,7 +6863,20 @@ async function handleRequest(request, env, ctx) {
         const pnow = Date.now();
         let prec = null;
         try { prec = await env.LEADS.get(pkey, { type: 'json' }); } catch (e) {}
-        await env.LEADS.put(pkey, JSON.stringify({ platform: pplatform, lang: plang, createdAt: (prec && prec.createdAt) || pnow, lastSeen: pnow }));
+        // Pack APP (APP-03 M3): a re-registration inside 5 minutes writes
+        // nothing — the bridge re-posts on token refresh and on app
+        // resume, and each write burns the account's daily KV budget.
+        if (prec && typeof prec.lastSeen === 'number' && pnow - prec.lastSeen < 300000) return json({ ok: true }, 200, origin);
+        // Pack APP (APP-03 H1/M1/M3): the token rides in the VALUE (the
+        // send side reads it back on plug-in day); a 270-day TTL,
+        // refreshed by every write, reaps tokens from uninstalled apps;
+        // the put is guarded so a KV failure is this route's clean 500,
+        // never an unhandled throw.
+        try {
+          await env.LEADS.put(pkey, JSON.stringify({ token: ptoken, platform: pplatform, lang: plang, createdAt: (prec && prec.createdAt) || pnow, lastSeen: pnow }), { expirationTtl: 23328000 });
+        } catch (e) {
+          return json({ ok: false, error: 'server' }, 500, origin);
+        }
         return json({ ok: true }, 200, origin);
       }
 
