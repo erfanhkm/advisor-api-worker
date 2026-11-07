@@ -2707,6 +2707,27 @@ async function idxReconcile(env) {
     return true;
   } catch (e) { return false; }
 }
+// Periodic catalog snapshot rebuild (Pack PK4, PK close residual):
+// updateCatalogSnap is a read-modify-write on catalog:snap, so a
+// concurrent or stale-colo save can drop a listing from the snapshot,
+// and until now the snapshot was only rebuilt when ABSENT — the drop
+// was permanent. buildCatalogSnap re-derives the snapshot from the
+// listing: records (the ground truth) with no new storage primitive;
+// this wrapper just gives it a cadence. The cadence hangs off its own
+// guard key (claimed BEFORE the work, idxReconcile pattern), NOT off
+// the snapshot's `at`: every updateCatalogSnap write refreshes `at`,
+// so an age check on the snapshot itself would read "fresh" forever
+// in an active portal and never detect the drift it exists to fix.
+// One listing: list per ~day — the same cost class as idxReconcile.
+async function catalogSnapRebuild(env) {
+  try {
+    const last = Number(await env.LEADS.get('catalogrebuild:at')) || 0;
+    if (Date.now() - last < 23 * 3600000) return false;
+    await env.LEADS.put('catalogrebuild:at', String(Date.now()));
+    await buildCatalogSnap(env);
+    return true;
+  } catch (e) { console.error('catalog snapshot rebuild failed: ' + (e && e.message || e)); return false; }
+}
 async function listAllKeys(env, prefix, cap) {
   const keys = [];
   let cursor;
@@ -3841,7 +3862,17 @@ async function puLeadScores(env) {
     const viewByEmail = vs ? vs.byEmail : Object.create(null);
     const lids = await idxGet(env, 'leads', 'lead:');
     const leadsTruncated = lids.length > 1000;
-    const take = lids.slice(0, 1000);
+    // Pack PK4 (01-M7, PK close-record defect): idx: arrays are
+    // OLDEST-first (idxAdd appends; idxGet returns the stored order
+    // as-is), so slice(0, 1000) took the OLDEST 1000 and the newest
+    // leads silently dropped out of scoring/pipeline/Today/search/
+    // demand/rules once the book passed the cap. Take the newest
+    // end instead: slice preserves the ascending order INSIDE the
+    // window, so consumers keep their iteration order (pipeline
+    // columns, the first-wins email dedupe, the lscore mirror pass)
+    // — only the window moved. leadsTruncated still reads the full
+    // index length.
+    const take = lids.slice(-1000);
     const leads = [];
     for (let i = 0; i < take.length; i += 20) {
       const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return env.LEADS.get('lead:' + id, { type: 'json' }).catch(function () { return null; }); }));
@@ -4031,7 +4062,10 @@ async function puToday(env) {
     // Object.prototype members.
     const byLang = Object.create(null); // dynamic keys — no fixed language list (ES-ready)
     const nids = await idxGet(env, 'nlsubs', 'nlsub:');
-    const take = nids.slice(0, 1000);
+    // Pack PK4 (01-M7): newest end, like every capped idx scan —
+    // the segment only counts total/byLang (order-insensitive);
+    // sampled/subscribersTotal still read the full length.
+    const take = nids.slice(-1000);
     // Pack PK (01-M4): batched 20-wide (was up to 1000 serial reads).
     for (let i = 0; i < take.length; i += 20) {
       const batch = await Promise.all(take.slice(i, i + 20).map(function (nid) { return env.LEADS.get('nlsub:' + nid).catch(function () { return null; }); }));
@@ -4215,7 +4249,12 @@ async function puDemand(env) {
   // saved-search demand (bounded user sample, coverage labelled)
   try {
     const uids = await idxGet(env, 'users', 'user:', 5000);
-    const sample = uids.slice(0, 300);
+    // Pack PK4 (01-M7): newest-end sample — idx: arrays are
+    // oldest-first, so slice(0, 300) sampled the OLDEST 300 users
+    // and froze out everyone newer. The section only aggregates
+    // per-user sets (order-insensitive); usersTotal / truncated
+    // still read the FULL index length.
+    const sample = uids.slice(-300);
     const searchBuckets = new Map(); // Pack PK (03-P2): per-user bucket sets for the distinct-people counts below
     let searches = 0, userErrors = 0;
     for (let i = 0; i < sample.length; i += 20) {
@@ -10259,6 +10298,10 @@ export default {
       // update dropped back into their indexes — at most once a day
       // (the guard key lives inside idxReconcile).
       if (heavyOk) { try { await idxReconcile(env); } catch (e) { console.error(e); } }
+      // Pack PK4: periodic catalog snapshot rebuild (23h guard
+      // inside catalogSnapRebuild) — heals a listing an RMW race
+      // dropped from catalog:snap.
+      if (heavyOk) { try { await catalogSnapRebuild(env); } catch (e) { console.error(e); } }
     })());
   }
 };
