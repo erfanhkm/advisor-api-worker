@@ -43,7 +43,9 @@
 //                                          the Capacitor apps register their FCM/APNs device token
 //                                          for saved-search + viewing alerts; stored hashed at
 //                                          app:push:<sha256(token)>; REGISTRATION ONLY — sends are
-//                                          gated on cfg:apppush credentials, plug-in day work)
+//                                          gated on cfg:apppush credentials, plug-in day work;
+//                                          Pack APP3 kill switch: 503 push_not_configured until
+//                                          cfg:apppush exists — no legitimate caller exists yet)
 //   PATCH /api/user/searches/:id {notify} -> {ok, search}       (visitor — alerts on/off for a saved search)
 //   GET  /api/admin/perf                -> {ok, startedAt, listings, sources, dropped} (auth — aggregate
 //                                          counters; ok:false + stale when the counters are unreadable)
@@ -6843,7 +6845,22 @@ async function handleRequest(request, env, ctx) {
       // record could never be sent to. Records carry no owner/binding
       // field yet: binding a token to an account lands with the
       // accounts work on plug-in day.
+      // Pack APP3 (APP close round 2, M3): KILL SWITCH — until
+      // cfg:apppush exists the route refuses with 503
+      // push_not_configured. No legitimate caller exists before
+      // plug-in day (the bridge's native path is flag-off and no
+      // app has shipped), so the anonymous write surface — cap
+      // and all — stays closed; provisioning the credentials on
+      // plug-in day opens it. The check is the route's first
+      // statement: the cheapest refusal, before the rate limiter
+      // and any body handling.
       if (path === '/api/app/push-token' && request.method === 'POST') {
+        // Pack APP3 kill switch (see the block comment above):
+        // an existence read — ANY stored cfg:apppush content
+        // opens the route on plug-in day; until then, 503.
+        let apppushCfg = null;
+        try { apppushCfg = await env.LEADS.get('cfg:apppush'); } catch (e) {}
+        if (!apppushCfg) return json({ ok: false, error: 'push_not_configured' }, 503, origin);
         if (limited('apppush:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         // Pack APP (APP-03 M4): reject an oversized body on its declared
         // length BEFORE parsing it (the global cap above is 32 KB; a
@@ -6884,6 +6901,15 @@ async function handleRequest(request, env, ctx) {
         // put over-counts by one — fail-closed by design. (A failed
         // record read above lands here too: prec is null, so the write
         // counts against the cap rather than bypassing it.)
+        // Pack APP3 (APP close round 2, M1): the cap is a SOFT bound,
+        // not an exact count — it is a read-modify-write on ONE KV
+        // key (KV effectively allows ~1 write/second/key, so
+        // increments can be lost under a burst) and KV reads can be
+        // stale for up to ~60s across locations. It bounds the
+        // namespace's growth, which is the harm it exists to stop;
+        // a hard count would need a Durable Object or the Workers
+        // Rate Limiting binding (plug-in-day evaluation, see the
+        // activation list).
         if (!prec) {
           const capKey = 'app:pushcap:' + new Date(pnow).toISOString().slice(0, 10);
           let capN = 0;
