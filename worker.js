@@ -177,10 +177,25 @@ async function adminCachedGen(env, name, loader) {
   const g = await currentGen(env);
   const hit = adminCache.get(key);
   if (hit && hit.gen !== undefined) {
-    if (g !== null && hit.gen === g && Date.now() - hit.t < GEN_CACHE_MAX_AGE) return hit.promise;
-    if (g === null && Date.now() - hit.t < ADMIN_CACHE_TTL) return hit.promise;
+    // Pack PK (01-M1): a DEGRADED entry serves briefly instead of
+    // being evicted the instant it lands — instant eviction made
+    // every request during an outage pay the full aggregation cost
+    // (evict/recompute churn). Inside its short window the degraded
+    // payload is served (labelled as such by its own sources); past
+    // it, the entry is dropped and the next load recomputes.
+    if (hit.degradedUntil) {
+      if (Date.now() < hit.degradedUntil) return hit.promise;
+      adminCache.delete(key);
+    } else {
+      if (g !== null && hit.gen === g && Date.now() - hit.t < GEN_CACHE_MAX_AGE) return hit.promise;
+      if (g === null && Date.now() - hit.t < ADMIN_CACHE_TTL) return hit.promise;
+    }
   }
   const promise = Promise.resolve().then(loader);
+  // Pack PK (01-L1): a new entry for a name sweeps the same name's
+  // stale-date entries — the date-keyed cache otherwise accumulates
+  // one dead entry per name per day for the isolate's whole life.
+  for (const k of Array.from(adminCache.keys())) { if (k !== key && k.indexOf(name + '@') === 0) adminCache.delete(k); }
   adminCache.set(key, { t: Date.now(), gen: g === null ? '__unknown__' : g, promise: promise });
   promise.catch(function () {
     const c = adminCache.get(key);
@@ -193,12 +208,15 @@ async function adminCachedGen(env, name, loader) {
   // GEN_CACHE_MAX_AGE.
   promise.then(function (result) {
     if (result && typeof result === 'object' && (result.degraded === true || (result.sources && typeof result.sources === 'object' && Object.keys(result.sources).some(function (k) { return result.sources[k] === 'error'; })))) {
+      // Pack PK (01-M1): stamp the short degraded window instead of
+      // deleting outright (see the hit path above).
       const c = adminCache.get(key);
-      if (c && c.promise === promise) adminCache.delete(key);
+      if (c && c.promise === promise) c.degradedUntil = Date.now() + DEGRADED_CACHE_TTL;
     }
   }, function () {});
   return promise;
 }
+const DEGRADED_CACHE_TTL = 45000; // Pack PK (01-M1): how long a degraded admin payload may serve before recompute
 const SESS_CACHE_TTL = 60000;
 const sessCache = new Map(); // 'usess:<token>' -> { t, email|null }
 const BAN_CACHE_TTL = 60000;
@@ -460,12 +478,40 @@ async function perfFold(env) {
     // The old unconditional prune ran against whatever catalog the
     // cron isolate happened to hold — seed-only there permanently
     // deleted portal-listing counters.
+    // Pack PK (supp3 C3): the prune is SOFT now. "Fresh" means
+    // recently loaded, not PROVEN complete — a snapshot that is
+    // silently missing a live listing (C2) used to delete its
+    // counters in a single fold, permanently. A listing's counters
+    // are deleted only after THREE consecutive fresh-catalog folds
+    // agree it is absent (totals.absent carries the streak).
+    const absentMap = Object.create(null);
+    if (raw && typeof raw === 'object' && raw.absent && typeof raw.absent === 'object' && !Array.isArray(raw.absent)) {
+      for (const ak of Object.keys(raw.absent)) { const n = Number(raw.absent[ak]); if (isFinite(n) && n > 0) absentMap[ak] = Math.floor(n); }
+    }
     if (catalogIsFresh()) {
       const ids = Object.create(null);
       mergedCatalog().forEach(function (c) { ids[c.mls] = 1; });
-      for (const k of Object.keys(totals.listings)) if (!Object.hasOwn(ids, k)) delete totals.listings[k];
+      for (const k of Object.keys(totals.listings)) {
+        if (Object.hasOwn(ids, k)) { delete absentMap[k]; continue; }
+        absentMap[k] = (absentMap[k] || 0) + 1;
+        if (absentMap[k] >= 3) { delete totals.listings[k]; delete absentMap[k]; }
+      }
+      for (const ak of Object.keys(absentMap)) if (!Object.hasOwn(totals.listings, ak)) delete absentMap[ak];
     }
+    totals.absent = absentMap;
     totals.startedAt = startedAt || new Date().toISOString();
+    // Pack PK (supp3 N3): fold sequence guard. The totals write is a
+    // read-modify-write with no CAS: before writing, re-read the
+    // doc's sequence — if another fold landed while this one worked,
+    // abort WITHOUT writing or deleting (the deltas stay outstanding
+    // and the next fold redoes them; the fold is idempotent, so an
+    // abort loses nothing).
+    const mySeq = (raw && typeof raw === 'object' && Number(raw.foldSeq)) || 0;
+    let seqNow = mySeq;
+    try { const chk = await env.LEADS.get('perf:totals', { type: 'json' }); seqNow = (chk && typeof chk === 'object' && Number(chk.foldSeq)) || 0; } catch (e) { return { ok: false }; }
+    if (seqNow !== mySeq) return { ok: false, aborted: 'fold_overlap' };
+    totals.foldSeq = mySeq + 1;
+    totals.foldedAt = new Date().toISOString();
     // Bound the folded map so the totals doc cannot grow forever:
     // entries are re-derivable from a still-listed key, and delta
     // keys themselves expire after 7 days.
@@ -496,11 +542,18 @@ async function perfRead(env) {
   const foldedMap = (raw && typeof raw === 'object' && raw.folded && typeof raw.folded === 'object' && !Array.isArray(raw.folded)) ? raw.folded : {};
   let stale = false;
   let cursor;
+  let deltaReads = 0;
   try {
     do {
       const page = await kvList(env, { prefix: 'perf:d:', limit: 1000, cursor: cursor });
       for (const k of page.keys) {
         if (Object.hasOwn(foldedMap, k.name)) continue;
+        // Pack PK (supp3 N2): cap the delta reads — if the fold has
+        // been dead for days, a week of deltas must not make the
+        // dashboard slower exactly when it is needed most. Anything
+        // past the cap is a partial read and says so via stale.
+        if (deltaReads >= 200) { stale = true; break; }
+        deltaReads++;
         let draw = null, getFailed = false;
         try { draw = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) { getFailed = true; }
         if (getFailed) { stale = true; continue; } // Pack E (R-01 N4): a partial read SAYS so — a silent undercount presented as complete breaks the never-fabricated rule; the route maps this to stale:true (the portal banner exists for exactly this)
@@ -509,6 +562,7 @@ async function perfRead(env) {
           if (typeof draw.at === 'string' && draw.at && (!startedAt || draw.at < startedAt)) startedAt = draw.at;
         }
       }
+      if (stale && deltaReads >= 200) break;
       cursor = page.list_complete ? undefined : page.cursor;
     } while (cursor);
   } catch (e) { return null; } // Pack E (R-01 N4): a failed list is a failed read — the ok:false path, not a bare 500 from the catch-all
@@ -1621,20 +1675,39 @@ let customSlim = [];
 let deletedSeedMls = [];
 let customCatalogAt = 0;
 let catalogRefreshing = null;
+// Pack PK (supp3 C2): the newest catalog-data timestamp this isolate
+// has seen or applied (snapshot `at`, rebuild time, or a local
+// mutation). A snapshot OLDER than this is an eventual-consistency
+// straggler and is never adopted over newer local state.
+let catalogDataAt = 0;
 async function refreshCustomCatalog(env, force) {
   if (!force && customCatalogAt > 0 && Date.now() - customCatalogAt < 120000) return;
   if (!force && catalogRefreshing) return catalogRefreshing;
-  catalogRefreshing = (async function () {
+  // Pack PK (supp3 C5): the finally clears the slot ONLY if it still
+  // holds THIS refresh — a forced refresh starting while one is in
+  // flight must not lose its handle to the older one's finally.
+  let mine = null;
+  mine = (async function () {
     try {
       await doRefreshCustomCatalog(env);
     } catch (e) {
       console.error('catalog refresh failed', e && e.message);
       customCatalogAt = Date.now() - 90000;
     } finally {
-      catalogRefreshing = null;
+      if (catalogRefreshing === mine) catalogRefreshing = null;
     }
   })();
+  catalogRefreshing = mine;
   return catalogRefreshing;
+}
+// Pack PK (supp3 P6, catalog hydration): paths that answer from the
+// catalog (demand, reports, handbook, admin search) call this first:
+// a stale-or-never-loaded isolate force-refreshes ONCE, so a cold
+// isolate never silently serves the seed-only catalog as if it were
+// the whole supply. Callers still check catalogIsFresh() afterwards
+// and label the payload when freshness cannot be proven.
+async function ensureCatalog(env) {
+  if (!catalogIsFresh()) { try { await refreshCustomCatalog(env, true); } catch (e) {} }
 }
 // refreshCustomCatalog returns no status (its contract is the reviewed
 // one), so freshness is read off its timestamp: a successful refresh
@@ -1647,7 +1720,7 @@ function catalogIsFresh() {
 }
 async function buildCatalogSnap(env) {
   const full = [], deleted = [];
-  const seeds = {};
+  const seeds = Object.create(null); // Pack PK (supp3 C6): null-prototype, keyed by mls
   CATALOG.forEach(function (c) { seeds[c.mls] = 1; });
   let cursor = undefined;
   do {
@@ -1660,7 +1733,12 @@ async function buildCatalogSnap(env) {
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: full, deleted: deleted, at: Date.now() })); } catch (e) {}
+  const builtAt = Date.now();
+  // Pack PK (supp3 C2): a failed snapshot write is SURFACED (error
+  // log), never swallowed silently — other isolates keep serving the
+  // old catalog and nobody used to notice.
+  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: full, deleted: deleted, at: builtAt })); catalogDataAt = Math.max(catalogDataAt, builtAt); }
+  catch (e) { console.error('catalog snapshot write failed (buildCatalogSnap): ' + (e && e.message || e)); }
   return { full: full, deleted: deleted };
 }
 async function updateCatalogSnap(env, rec, removedMls, tombstone) {
@@ -1675,15 +1753,23 @@ async function updateCatalogSnap(env, rec, removedMls, tombstone) {
     listings = listings.filter(function (r) { return r.mls !== removedMls; });
     if (tombstone && deleted.indexOf(removedMls) === -1) deleted.push(removedMls);
   }
-  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: listings, deleted: deleted, at: Date.now() })); } catch (e) {}
+  const writeAt = Date.now();
+  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: listings, deleted: deleted, at: writeAt })); catalogDataAt = Math.max(catalogDataAt, writeAt); }
+  catch (e) { console.error('catalog snapshot write failed (updateCatalogSnap): ' + (e && e.message || e)); }
 }
 async function doRefreshCustomCatalog(env) {
   const snap = await env.LEADS.get('catalog:snap', { type: 'json' });
   if (snap && Array.isArray(snap.listings)) {
+    // Pack PK (supp3 C2): never adopt a snapshot OLDER than the
+    // newest data this isolate already holds (its `at` was stored
+    // but never compared). Keep local state and do NOT stamp
+    // freshness on the straggler — the next caller retries.
+    if (snap.at && catalogDataAt && Number(snap.at) < catalogDataAt) return;
     customListings = snap.listings;
     customSlim = snap.listings.map(slimOf);
     deletedSeedMls = Array.isArray(snap.deleted) ? snap.deleted : [];
     customCatalogAt = Date.now();
+    if (snap.at) catalogDataAt = Math.max(catalogDataAt, Number(snap.at) || 0);
     return;
   }
   const built = await buildCatalogSnap(env);
@@ -1693,7 +1779,7 @@ async function doRefreshCustomCatalog(env) {
   customCatalogAt = Date.now();
 }
 function mergedCatalog() {
-  const over = {}, del = {};
+  const over = Object.create(null), del = Object.create(null); // Pack PK (supp3 C6): null-prototype maps keyed by mls
   customSlim.forEach(function (c) { over[c.mls] = 1; });
   deletedSeedMls.forEach(function (m) { del[m] = 1; });
   return CATALOG.filter(function (c) { return !over[c.mls] && !del[c.mls]; }).concat(customSlim);
@@ -1703,13 +1789,21 @@ function upsertLocalListing(rec) {
   customListings = customListings.filter(function (r) { return r.mls !== rec.mls; }).concat([rec]);
   customSlim = customSlim.filter(function (r) { return r.mls !== rec.mls; }).concat([slimOf(rec)]);
   deletedSeedMls = deletedSeedMls.filter(function (m) { return m !== rec.mls; });
-  customCatalogAt = Date.now();
+  // Pack PK (supp3 C1): only a LOADED catalog may stamp freshness.
+  // On a never-loaded isolate this mutation used to make a 1-of-N
+  // partial catalog read as "fresh" for 120s (and the perf fold's
+  // prune trusted it). Unloaded: leave the stamp at 0 so the next
+  // refresh really loads; the mutation itself is newer than any
+  // snapshot, so record it as the data watermark.
+  catalogDataAt = Date.now();
+  if (customCatalogAt > 0) customCatalogAt = Date.now();
 }
 function removeLocalListing(mls, tombstone) {
   customListings = customListings.filter(function (r) { return r.mls !== mls; });
   customSlim = customSlim.filter(function (r) { return r.mls !== mls; });
   if (tombstone && deletedSeedMls.indexOf(mls) === -1) deletedSeedMls.push(mls);
-  customCatalogAt = Date.now();
+  catalogDataAt = Date.now(); // Pack PK (supp3 C1/C2): see upsertLocalListing
+  if (customCatalogAt > 0) customCatalogAt = Date.now();
 }
 const LISTING_TYPES = ['condo', 'townhouse', 'house', 'duplex', 'apartment', 'land'];
 function cleanHttpsUrl(v, max) {
@@ -3557,7 +3651,13 @@ async function puPushStatus(env) {
 async function puAttentionAdd(env, kind, text, ref) {
   try {
     const cur = (await env.LEADS.get('attention', { type: 'json' })) || [];
-    cur.unshift({ at: new Date().toISOString(), kind: String(kind || 'note').slice(0, 30), text: String(text || '').slice(0, 300), ref: String(ref || '').slice(0, 120) });
+    const k2 = String(kind || 'note').slice(0, 30), t2 = String(text || '').slice(0, 300), r2 = String(ref || '').slice(0, 120);
+    // Pack PK (02-M4): an exact repeat (same kind + ref + text) is a
+    // retry of an action that already landed — the rules engine
+    // retries partial failures, and its notes used to duplicate on
+    // every retry. Idempotent actions must be safe to redo.
+    if (r2 && cur.some(function (e) { return e && e.kind === k2 && e.ref === r2 && e.text === t2; })) return;
+    cur.unshift({ at: new Date().toISOString(), kind: k2, text: t2, ref: r2 });
     await env.LEADS.put('attention', JSON.stringify(cur.slice(0, 50)));
   } catch (e) {}
 }
@@ -3603,7 +3703,17 @@ function puScoreLead(l, ctx) {
   const silenceTs = silenceAnchor ? Date.parse(silenceAnchor) : NaN;
   const silentDays = isFinite(silenceTs) ? Math.max(0, (ctx.now - silenceTs) / 86400000) : null;
   if (l.stage === 'new' && ageH !== null && ageH > 48) add('silent_new_48h', -15);
-  if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) add('silent_contacted_7d', -10);
+  // Pack PK (01-M2): the contacted silence penalty reads the SHARED
+  // silence measure (silentDays, from the silenceAnchor above) — the
+  // same number the rules engine's lead_cold trigger fires on — not
+  // stageAgeH. The two used to disagree: a lead touched yesterday
+  // could carry a 7-day silence penalty while its silentDays said 1.
+  // Reconciliation with Pack E (R-03 N3): buildFollowups' goingCold
+  // WORKLIST keeps its deliberate stageAt definition (it is a
+  // stage-age list, not a silence measure) — untouched. Inside the
+  // scorer, penalties, `next` and the cold trigger now all read
+  // silentDays.
+  if (l.stage === 'contacted' && silentDays !== null && silentDays > 7) add('silent_contacted_7d', -10);
   // Portal brain (2026-11-01): AI triage signals join the trail as
   // transparent listed reasons — they extend the deterministic rules,
   // never replace them, and the intent marker carries 0 points.
@@ -3628,7 +3738,7 @@ function puScoreLead(l, ctx) {
   else if (l.stage === 'new' && ageH !== null && ageH > 48) next = { kind: 'call', text: 'Overdue first contact — call now (' + Math.floor(ageH / 24) + 'd waiting)' };
   else if (l.stage === 'new') next = { kind: 'call', text: 'First contact today — call or message within 24h' };
   else if (ctx.pastViewing && l.stage === 'viewing') next = { kind: 'feedback', text: 'Ask for feedback on the viewing and agree the next step' };
-  else if (l.stage === 'contacted' && stageAgeH !== null && stageAgeH > 168) next = { kind: 'reengage', text: 'Re-engage — silent for 7+ days' };
+  else if (l.stage === 'contacted' && silentDays !== null && silentDays > 7) next = { kind: 'reengage', text: 'Re-engage — silent for 7+ days' }; // Pack PK (01-M2): shared silence measure (see the penalty above)
   else if (l.stage === 'offer') next = { kind: 'offer', text: 'Support the offer — keep daily contact' };
   else if (!l.phone) next = { kind: 'message', text: 'Ask for a phone number to speed up follow-up' };
   else if (ctx.searchCount >= 1 && !ctx.futureViewing && !ctx.pastViewing) next = { kind: 'invite', text: 'Invite them to view a matching home' };
@@ -3643,6 +3753,17 @@ function puScoreLead(l, ctx) {
    longer. Status discipline (PU-01 #7): a PAST viewing only counts
    when it actually happened (confirmed / completed); a FUTURE one
    only while it is live (new / confirmed). */
+/* Pack PK (item 9): ONE date validator + ONE listing-id normaliser
+   for the viewing/report paths. String comparison against `today`
+   used to file viewings with missing or garbage dates as PAST
+   (undefined >= today is false, so they fell into the past branch)
+   and could surface them as upcoming in lexicographic compares. */
+function puValidYmd(v) {
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const t = Date.parse(v + 'T00:00:00Z');
+  return isFinite(t) && new Date(t).toISOString().slice(0, 10) === v;
+}
+function puNormMls(v) { return String(v || '').trim().toUpperCase(); }
 async function puViewingSummary(env) {
   return adminCachedGen(env, 'viewsum', async function () {
     const today = todayVancouver();
@@ -3651,7 +3772,10 @@ async function puViewingSummary(env) {
     const rows = [];
     for (let i = 0; i < take.length; i += 20) {
       const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return env.LEADS.get('viewing:' + id, { type: 'json' }).catch(function () { return null; }); }));
-      for (const v of batch) if (v) rows.push(v);
+      // Pack PK (01-M6): a viewing without a REAL calendar date is
+      // excluded from the summary entirely — it is neither a past
+      // attendance nor an upcoming booking.
+      for (const v of batch) if (v && puValidYmd(v.date)) rows.push(v);
     }
     const byEmail = Object.create(null);
     for (const v of rows) {
@@ -3713,7 +3837,15 @@ async function puLeadScores(env) {
     for (const l of leads) {
       const ne = normEmail(l.email || '');
       const vc = viewByEmail[ne] || { future: false, past: false };
-      map[l.id] = puScoreLead(l, { now: now, searchCount: searchCount[ne] || 0, futureViewing: vc.future, pastViewing: vc.past });
+      // Pack PK (01-M5): the stage is normalised ONCE here and the
+      // NORMALISED value is scored. The pipeline board already
+      // bucketed an unknown stage as 'new' while the scorer read the
+      // raw stage — a card sitting in the New column could carry a
+      // non-new `next` and never earn silent_new_48h. The stored
+      // record (sm.leads) is untouched; only the scored copy is
+      // normalised.
+      const sl = STAGES.indexOf(l.stage) === -1 ? Object.assign({}, l, { stage: 'new' }) : l;
+      map[l.id] = puScoreLead(sl, { now: now, searchCount: searchCount[ne] || 0, futureViewing: vc.future, pastViewing: vc.past });
     }
     const out = { at: new Date(now).toISOString(), map: map, leads: leads, langByEmail: langByEmail, sources: sources };
     if (degraded) out.degraded = true;
@@ -3728,6 +3860,13 @@ async function puLeadScores(env) {
    that don't want the whole map. Admin GET paths never write. */
 async function puPersistScores(env) {
   const sm = await puLeadScores(env);
+  // Pack PK (01-H2): a DEGRADED aggregation (a searches or viewings
+  // sub-read failed) must never overwrite the lscore: mirrors —
+  // scores computed from partial inputs lose their searches_*/
+  // viewing points, and the reasons-signature check below would
+  // then treat the wrong values as current. Skip the whole mirror
+  // pass; the next healthy run republishes.
+  if (sm.degraded) return 0;
   let written = 0;
   for (const l of sm.leads) {
     if (written >= 60) break;
@@ -3778,8 +3917,10 @@ async function puToday(env) {
     const f = await buildFollowups(env);
     return { newCount: f.newCount, staleCount: f.staleCount, postViewingCount: f.postViewingCount, stale: f.staleLeads.slice(0, 5), post: f.postViewing.slice(0, 5) };
   });
+  let hotSm = null; // Pack PK (01-H1): the scores snapshot behind the hotLeads segment, for the sources fix-up below
   await seg('hotLeads', async function () {
     const sm = await puLeadScores(env);
+    hotSm = sm;
     // Pack K (PU-01 #7): band counts cover ACTIVE leads only — closed
     // leads are floored to the hot band by the scorer, so counting
     // them here inflated "hot" with finished business. Closed and
@@ -3795,8 +3936,18 @@ async function puToday(env) {
       if (s.band === 'hot' && l.stage !== 'closed' && l.stage !== 'dropped') rows.push({ id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, source: l.source || '', score: s.score, next: s.next });
     }
     rows.sort(function (a, b) { return b.score - a.score; });
-    return { counts: counts, hot: rows.slice(0, 6) };
+    const hres = { counts: counts, hot: rows.slice(0, 6) };
+    // Pack PK (01-M3): the segment's truncation state rides along —
+    // a capped aggregation must not read as a complete one.
+    if (sm.leadsTruncated) hres.leadsTruncated = true;
+    if (sm.viewingsTruncated) hres.viewingsTruncated = true;
+    return hres;
   });
+  // Pack PK (01-H1): when the scores aggregation is degraded, the
+  // hotLeads segment is built from partial inputs — its sources entry
+  // must SAY 'error' (which also keeps the gen cache from storing
+  // this Today payload as truth), never a blanket 'ok'.
+  if (hotSm && hotSm.degraded) out.sources.hotLeads = 'error';
   await seg('alerts', async function () {
     const last = (await env.LEADS.get('automation:last', { type: 'json' })) || null;
     let unsentAlerts = 0;
@@ -3805,9 +3956,11 @@ async function puToday(env) {
     // unsent alerts once the queue grew past 200 — scan the full
     // queue up to a labelled cap instead.
     const take = mids.slice(-1000);
-    for (const mid of take) {
-      const mm = await env.LEADS.get('mailq:' + mid, { type: 'json' });
-      if (mm && !mm.sent && mm.kind === 'alert') unsentAlerts++;
+    // Pack PK (01-M4): batched 20-wide like every other scan — the
+    // serial loop made up to 1000 sequential KV reads in one request.
+    for (let i = 0; i < take.length; i += 20) {
+      const batch = await Promise.all(take.slice(i, i + 20).map(function (mid) { return env.LEADS.get('mailq:' + mid, { type: 'json' }).catch(function () { return null; }); }));
+      for (const mm of batch) if (mm && !mm.sent && mm.kind === 'alert') unsentAlerts++;
     }
     const ares = { lastRun: last, unsentAlerts: unsentAlerts };
     if (mids.length > take.length) ares.truncated = true;
@@ -3827,11 +3980,15 @@ async function puToday(env) {
     const st = (await env.LEADS.get('radar:settings', { type: 'json' })) || { enabled: false };
     const keys = await listAllKeys(env, 'mlead:', 2000);
     let pairs = 0, hot = 0;
-    for (const k of keys.slice(-300)) {
-      const r = await env.LEADS.get(k.name, { type: 'json' });
-      if (r && (r.kind === 'pair' || (Array.isArray(r.matches) && r.matches.length))) {
-        pairs++;
-        if (r.kind === 'pair' && r.status === 'new' && (r.matchScore || 0) >= 80 && typeof r.motivation === 'number' && r.motivation >= 60 && r.motivationSource === 'computed' && r.created_at && (Date.now() - Date.parse(r.created_at) < 14 * 86400000)) hot++; // Pack PF2 (PF spot-check MF4): + 14-day liveness bound on created_at — IDENTICAL to the portal's isHot so counter and badges can never disagree // Pack PF (PF-04 MF1): computed-only hot rule — SAME predicate as the portal's isHot (kind pair + status new + numeric thresholds + motivationSource 'computed'; null pair motivation -> 0 -> fails, never coerced)
+    const takeR = keys.slice(-300);
+    // Pack PK (01-M4): batched 20-wide (was up to 300 serial reads).
+    for (let i = 0; i < takeR.length; i += 20) {
+      const batch = await Promise.all(takeR.slice(i, i + 20).map(function (k) { return env.LEADS.get(k.name, { type: 'json' }).catch(function () { return null; }); }));
+      for (const r of batch) {
+        if (r && (r.kind === 'pair' || (Array.isArray(r.matches) && r.matches.length))) {
+          pairs++;
+          if (r.kind === 'pair' && r.status === 'new' && (r.matchScore || 0) >= 80 && typeof r.motivation === 'number' && r.motivation >= 60 && r.motivationSource === 'computed' && r.created_at && (Date.now() - Date.parse(r.created_at) < 14 * 86400000)) hot++; // Pack PF2 (PF spot-check MF4): + 14-day liveness bound on created_at — IDENTICAL to the portal's isHot so counter and badges can never disagree // Pack PF (PF-04 MF1): computed-only hot rule — SAME predicate as the portal's isHot (kind pair + status new + numeric thresholds + motivationSource 'computed'; null pair motivation -> 0 -> fails, never coerced)
+        }
       }
     }
     return { enabled: !!st.enabled, pairs: pairs, hotPairs: hot, sampled: Math.min(keys.length, 300), total: keys.length };
@@ -3844,10 +4001,13 @@ async function puToday(env) {
     const byLang = Object.create(null); // dynamic keys — no fixed language list (ES-ready)
     const nids = await idxGet(env, 'nlsubs', 'nlsub:');
     const take = nids.slice(0, 1000);
-    for (const nid of take) {
-      const raw = await env.LEADS.get('nlsub:' + nid);
-      if (!raw) continue;
-      try { const s = JSON.parse(raw); total++; const lg = s.lang || 'en'; byLang[lg] = (byLang[lg] || 0) + 1; } catch (e) {}
+    // Pack PK (01-M4): batched 20-wide (was up to 1000 serial reads).
+    for (let i = 0; i < take.length; i += 20) {
+      const batch = await Promise.all(take.slice(i, i + 20).map(function (nid) { return env.LEADS.get('nlsub:' + nid).catch(function () { return null; }); }));
+      for (const raw of batch) {
+        if (!raw) continue;
+        try { const s = JSON.parse(raw); total++; const lg = s.lang || 'en'; byLang[lg] = (byLang[lg] || 0) + 1; } catch (e) {}
+      }
     }
     const nres = { total: total, byLang: byLang };
     if (nids.length > take.length) { nres.sampled = true; nres.subscribersTotal = nids.length; }
@@ -3892,12 +4052,24 @@ async function puPipeline(env) {
     });
     counts[st]++;
   }
+  let columnsTruncated = false;
   STAGES.forEach(function (st) {
     columns[st].sort(function (a, b) { return (b.score || 0) - (a.score || 0) || String(b.created_at).localeCompare(String(a.created_at)); });
+    if (columns[st].length > 120) columnsTruncated = true;
     columns[st] = columns[st].slice(0, 120);
   });
   const out = { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at };
   if (normalized) out.normalizedStages = normalized;
+  // Pack PK (01-H1 + 01-M3): the board forwards the aggregation's
+  // degraded state and sources (the gen cache keys its eviction off
+  // them, and the payload must not present a capped/partial board as
+  // complete): `total` counts only the leads the aggregation read.
+  out.degraded = !!sm.degraded;
+  out.sources = sm.sources || {};
+  out.leadsTruncated = !!sm.leadsTruncated;
+  out.viewingsTruncated = !!sm.viewingsTruncated;
+  out.columnsTruncated = columnsTruncated;
+  out.columnCap = 120;
   return out;
 }
 
@@ -3945,7 +4117,19 @@ function puMedianPrice(prices) {
    variant unification, so a query typed with Arabic letters finds
    the Persian spelling stored in records (and vice versa). */
 function puFoldText(v) {
-  let t = String(v || '').normalize('NFKC').toLowerCase();
+  // Pack PK (03-P3): decomposition FIRST — NFKC kept 'café' and
+  // 'cafe' distinct forever (the composed é never decomposed, so
+  // diacritic-insensitive matching silently failed). NFKD +
+  // combining-mark strip folds accents away; NFKD still collapses
+  // the full-width / compatibility forms NFKC handled.
+  let t = String(v || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  // Pack PK (04-L1/L2): bidi/format marks would otherwise ride along
+  // invisibly (a trailing RLM from a Persian keyboard broke the
+  // match), and Persian / Arabic-Indic digits now fold to ASCII so a
+  // phone typed with Persian digits matches the stored number.
+  t = t.replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+  t = t.replace(/[\u0660-\u0669\u06f0-\u06f9]/g, function (ch) { const c = ch.charCodeAt(0); return String(c <= 0x0669 ? c - 0x0660 : c - 0x06f0); });
+  t = t.toLowerCase();
   t = t.replace(/\u064a/g, '\u06cc').replace(/\u0643/g, '\u06a9').replace(/\u0629/g, '\u0647').replace(/[\u0623\u0625]/g, '\u0627').replace(/\u0624/g, '\u0648').replace(/\u0640/g, '');
   return t;
 }
@@ -3965,29 +4149,40 @@ async function puDemand(env) {
   // postal code the seller typed — aggregate only, address never
   // leaves). Pack K (PU-02 #11): read from the SHARED score
   // aggregation instead of rescanning every lead record here.
+  let smDegraded = false, smTruncated = false;
   try {
     const sm = await puLeadScores(env);
+    smDegraded = !!sm.degraded; smTruncated = !!sm.leadsTruncated;
     const valByCity = Object.create(null), valByFsa = Object.create(null);
+    // Pack PK (03-P2): demand cells count DISTINCT PEOPLE, not
+    // records — one seller who submitted two valuations is one unit
+    // of demand. Dedupe key per bucket: normalised email, else the
+    // lead id. `total` stays the record count, labelled by
+    // `people` alongside.
+    const cityPeople = Object.create(null), fsaPeople = Object.create(null);
     let valTotal = 0;
     for (const l of sm.leads) {
       if (!l || l.source !== 'home-valuation') continue;
       valTotal++;
+      const who = normEmail(l.email || '') || ('id:' + l.id);
       const rawCity = String(l.city || (l.valuation && l.valuation.city) || '').trim();
-      if (rawCity) { const c = puCityBucket(rawCity); valByCity[c] = (valByCity[c] || 0) + 1; }
-      const src = String((l.valuation && l.valuation.address) || '') + ' ' + String(l.postal || '');
-      const m = src.match(/\b([A-Za-z]\d[A-Za-z])\s?\d[A-Za-z]\d\b/);
-      if (m) { const f = m[1].toUpperCase(); valByFsa[f] = (valByFsa[f] || 0) + 1; }
+      if (rawCity) { const c = puCityBucket(rawCity); (cityPeople[c] || (cityPeople[c] = new Set())).add(who); }
+      const srcA = String((l.valuation && l.valuation.address) || '') + ' ' + String(l.postal || '');
+      const m = srcA.match(/\b([A-Za-z]\d[A-Za-z])\s?\d[A-Za-z]\d\b/);
+      if (m) { const f = m[1].toUpperCase(); (fsaPeople[f] || (fsaPeople[f] = new Set())).add(who); }
     }
+    for (const c of Object.keys(cityPeople)) valByCity[c] = cityPeople[c].size;
+    for (const f of Object.keys(fsaPeople)) valByFsa[f] = fsaPeople[f].size;
     const sc = puSuppressSmall(valByCity, 3);
     const sf = puSuppressSmall(valByFsa, 3);
-    out.valuations = { total: valTotal, byCity: sc.map, byFsa: sf.map, suppressedCells: sc.suppressed + sf.suppressed };
+    out.valuations = { total: valTotal, byCity: sc.map, byFsa: sf.map, suppressedCells: sc.suppressed + sf.suppressed, degraded: smDegraded, truncated: smTruncated };
     out.sources.valuations = 'ok';
   } catch (e) { out.valuations = null; out.sources.valuations = 'error'; console.error('puDemand valuations failed: ' + (e && e.message || e)); }
   // saved-search demand (bounded user sample, coverage labelled)
   try {
     const uids = await idxGet(env, 'users', 'user:', 5000);
     const sample = uids.slice(0, 300);
-    const byCity = Object.create(null), byType = Object.create(null);
+    const searchBuckets = new Map(); // Pack PK (03-P2): per-user bucket sets for the distinct-people counts below
     let searches = 0, userErrors = 0;
     for (let i = 0; i < sample.length; i += 20) {
       await Promise.all(sample.slice(i, i + 20).map(async function (em) {
@@ -3996,18 +4191,40 @@ async function puDemand(env) {
         try {
           const ss = await userSearches(env, em);
           if (!Array.isArray(ss)) return;
+          const mine = { types: new Set(), cities: new Set() };
           for (const s of ss) {
             searches++;
             const rawC = (s.criteria && s.criteria.city) || '';
-            if (rawC) { const c = puCityBucket(rawC); byCity[c] = (byCity[c] || 0) + 1; }
-            const t = String((s.criteria && s.criteria.type) || '').slice(0, 40);
-            if (t) byType[t] = (byType[t] || 0) + 1;
+            if (rawC) mine.cities.add(puCityBucket(rawC));
+            // Pack PK (03-P1): the type key is canonicalised
+            // (lowercase / trim / collapse / capped) — raw user text
+            // used to mint unbounded near-duplicate aggregate keys.
+            const t = String((s.criteria && s.criteria.type) || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 40);
+            if (t) mine.types.add(t);
           }
+          searchBuckets.set(em, mine);
         } catch (e) { userErrors++; }
       }));
     }
-    const sc2 = puSuppressSmall(byCity, 3);
-    out.searchDemand = { searches: searches, byCity: sc2.map, byType: byType, usersScanned: sample.length, usersTotal: uids.length, suppressedCells: sc2.suppressed };
+    // Pack PK (03-P2 + 03-P11/P12): byType/byCity count DISTINCT
+    // USERS (people), not searches — one keen searcher with five
+    // saved searches is one unit of demand. The scanned counts and
+    // the swallowed per-user failures are REPORTED (userErrors), so
+    // a partial summary never poses as complete; P12's "cached as
+    // truth" half is closed by degraded: any user error marks the
+    // section degraded (which also keeps the gen cache honest).
+    const typePeople = Object.create(null), cityPeopleS = Object.create(null);
+    for (const em of sample) {
+      const ss = searchBuckets.get(em);
+      if (!ss) continue;
+      for (const t of ss.types) (typePeople[t] || (typePeople[t] = new Set())).add(em);
+      for (const c of ss.cities) (cityPeopleS[c] || (cityPeopleS[c] = new Set())).add(em);
+    }
+    const byTypeP = Object.create(null), byCityP = Object.create(null);
+    for (const t of Object.keys(typePeople)) byTypeP[t] = typePeople[t].size;
+    for (const c of Object.keys(cityPeopleS)) byCityP[c] = cityPeopleS[c].size;
+    const sc2 = puSuppressSmall(byCityP, 3);
+    out.searchDemand = { searches: searches, byCity: sc2.map, byType: byTypeP, usersScanned: sample.length, usersTotal: uids.length, suppressedCells: sc2.suppressed, truncated: uids.length > sample.length, degraded: userErrors > 0 };
     if (userErrors) out.searchDemand.userErrors = userErrors;
     out.sources.searchDemand = 'ok';
   } catch (e) { out.searchDemand = null; out.sources.searchDemand = 'error'; }
@@ -4021,8 +4238,13 @@ async function puDemand(env) {
       const r = await env.LEADS.get(k.name, { type: 'json' });
       if (!r) continue;
       sampled++;
-      const reg = r.region || r.area || '';
+      // Pack PK (03-P1): region keys are canonicalised (lowercase /
+      // trim / collapse / capped) — raw poster text used to mint a
+      // new aggregate key per spelling ('Vancouver' vs 'vancouver '
+      // counted as different regions, unboundedly).
+      const reg = String(r.region || r.area || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 40);
       if (reg) byRegion[reg] = (byRegion[reg] || 0) + 1;
+      else byRegion.unknown = (byRegion.unknown || 0) + 1; // Pack PK (03-P7): the no-region bucket is labelled, not silently dropped
       if (r.side === 'demand' || r.side === 'supply') bySide[r.side]++;
     }
     out.pool = { total: keys.length, sampled: sampled, byRegion: byRegion, bySide: bySide, truncated: keys.length >= 200 };
@@ -4031,19 +4253,33 @@ async function puDemand(env) {
   // supply: active catalog by city (guarded like every other section —
   // an unguarded throw here used to 500 the whole route, PU-02 #11)
   try {
+    // Pack PK (supp3 P6, catalog hydration): never aggregate supply
+    // from a catalog this isolate cannot prove fresh — try one
+    // forced refresh first; if freshness is still unprovable, the
+    // rows are served but sources.supply says 'error' (the payload
+    // is not cached as truth, and the label stops lying).
+    await ensureCatalog(env);
+    const catalogFresh = catalogIsFresh();
     const supply = Object.create(null);
     for (const h of mergedCatalog()) {
       if (h.status !== 'active') continue;
-      const c = supply[h.city] || (supply[h.city] = { count: 0, prices: [] });
+      // Pack PK (03-P6): supply rows key on the CANONICAL city (the
+      // same resolver demand uses) — a portal listing typed
+      // 'burnaby' used to split the row from 'Burnaby' and lose its
+      // coordinates.
+      const cname = puCityBucket(h.city);
+      const c = supply[cname] || (supply[cname] = { count: 0, prices: [] });
       c.count++;
       if (h.price) c.prices.push(h.price);
     }
     const supplyRows = Object.keys(supply).map(function (city) {
-      return { city: city, count: supply[city].count, median: puMedianPrice(supply[city].prices), coords: PU_CITY_COORDS[String(city).toLowerCase()] || null };
-    }).sort(function (a, b) { return b.count - a.count; });
+      const lk = String(city).toLowerCase();
+      return { city: city, count: supply[city].count, median: puMedianPrice(supply[city].prices), coords: Object.prototype.hasOwnProperty.call(PU_CITY_COORDS, lk) ? PU_CITY_COORDS[lk] : null };
+    }).sort(function (a, b) { return b.count - a.count || String(a.city).localeCompare(String(b.city)); }); // Pack PK (03-P8): deterministic tie-break
     out.supply = supplyRows;
-    out.supplySource = customListings.length ? 'catalog' : 'seed';
-    out.sources.supply = 'ok';
+    out.supplySource = customSlim.length ? 'catalog' : 'seed';
+    if (!catalogFresh) out.catalogStale = true;
+    out.sources.supply = catalogFresh ? 'ok' : 'error';
   } catch (e) { out.supply = null; out.sources.supply = 'error'; console.error('puDemand supply failed: ' + (e && e.message || e)); }
   // census overlay: only FSAs with unsuppressed demand present
   // (PU-02 #11) — the old payload embedded the whole V3–V7 dataset
@@ -4062,6 +4298,10 @@ async function puDemand(env) {
     out.censusSource = 'Statistics Canada, 2021 Census Profile (FSA geography)';
     out.sources.census = 'ok';
   } catch (e) { out.census = null; out.sources.census = 'error'; }
+  // Pack PK (item 6): the overall degraded flag follows the shared
+  // truncated/degraded contract (any section in error, or a degraded
+  // scores aggregation, marks the whole payload).
+  out.degraded = smDegraded || Object.keys(out.sources).some(function (k) { return out.sources[k] === 'error'; });
   out.cityCoords = PU_CITY_COORDS;
   return out;
 }
@@ -4116,7 +4356,7 @@ function puCleanRule(r) {
   if (c.days !== undefined) cond.days = Math.max(1, Math.min(90, parseInt(c.days, 10) || 7));
   if (c.stage && STAGES.indexOf(c.stage) !== -1) cond.stage = c.stage;
   if (c.source && LEAD_SOURCES.indexOf(c.source) !== -1) cond.source = c.source;
-  return {
+  const out = {
     id: String(r.id || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || ('rule_' + randHex(6)),
     name: String(r.name || 'Untitled rule').slice(0, 80),
     // Pack K (PU-02 #8): enabled is explicit-true only. Every writer
@@ -4126,6 +4366,10 @@ function puCleanRule(r) {
     autoSend: r.autoSend === true, // Portal Brain 2: gate (b) of the agent email chain — default OFF, only Erfan flips it
     trigger: r.trigger, conditions: cond, actions: actions
   };
+  // Pack PK (T1): the enable stamp rides through cleaning — the PUT
+  // handler owns its value (server-stamped on an off->on flip).
+  if (typeof r.enabledAt === 'string' && r.enabledAt) out.enabledAt = r.enabledAt.slice(0, 40);
+  return out;
 }
 /* Pack K (PU-02 #4): config reads are strict now. ONLY an absent key
    seeds the (disabled) presets — and persists them, so the seed is a
@@ -4140,7 +4384,24 @@ async function puRulesGet(env) {
     return { rules: seeded.rules, seeded: true, updatedAt: seeded.updatedAt };
   }
   if (typeof r !== 'object' || !Array.isArray(r.rules)) throw new Error('rules_config_invalid');
-  return { rules: r.rules.map(puCleanRule).filter(Boolean), seeded: false, updatedAt: r.updatedAt || null };
+  const mapped = r.rules.map(puCleanRule);
+  const cleanedRules = mapped.filter(Boolean);
+  // Pack PK (02-L9): rules the cleaner dropped are COUNTED and the
+  // count is reported on GET — a stored rule used to vanish from
+  // every read silently (and the next PUT then deleted it for good
+  // without anyone seeing it go).
+  const droppedCount = mapped.length - cleanedRules.length;
+  // Pack PK (02-M2): a stored rule with no usable id got a FRESH
+  // random id from the cleaner on every read, so its dedupe keys
+  // never matched twice and it re-fired every run. When cleaning
+  // changed anything, persist the cleaned config ONCE (same
+  // updatedAt — this is a repair, not an edit) so ids are stable
+  // from then on.
+  if (JSON.stringify(cleanedRules) !== JSON.stringify(r.rules)) {
+    try { await env.LEADS.put('cfg:rules', JSON.stringify({ rules: cleanedRules, updatedAt: r.updatedAt || null })); }
+    catch (e) { console.error('puRulesGet: id stabilisation write-back failed: ' + (e && e.message || e)); }
+  }
+  return { rules: cleanedRules, seeded: false, updatedAt: r.updatedAt || null, dropped: droppedCount };
 }
 /* Pack K (PU-02 #9): ONE condition matcher for every lead-targeted
    trigger — stage/source conditions used to be honoured by some
@@ -4174,6 +4435,12 @@ async function puEvaluateRules(env, autoCtx) {
   };
   const cenv = Object.assign({}, env, { LEADS: ckv });
   const FIRE_BUDGET = 150, MAXFIRE = 25;
+  // Pack PK (02-M7): a hard ceiling on TOTAL engine ops (setup +
+  // firing). The firing budget never counted the setup reads, and a
+  // cold aggregation can cost thousands — past the ceiling the
+  // engine stops firing further targets and reports partial instead
+  // of blowing the invocation's subrequest budget mid-run.
+  const OPS_CEILING = 6000;
   const triggers = {};
   for (const r of rules) triggers[r.trigger] = true;
   const sm = await puLeadScores(cenv);
@@ -4185,17 +4452,37 @@ async function puEvaluateRules(env, autoCtx) {
   const leadByEmail = Object.create(null);
   for (const l of leads) { const ne = normEmail(l.email || ''); if (ne && !leadByEmail[ne]) leadByEmail[ne] = l; }
   // Viewings load ONLY when a viewing trigger is enabled (PU-02 #10).
+  // Pack PK (02-L2): the load is GUARDED — one vidx failure used to
+  // throw out of the engine entirely (no lead rule fired either).
+  // Now a failed load skips only the viewing triggers this run.
   let viewings = [];
+  let viewLoadFailed = false;
   if (triggers.viewing_booked || triggers.viewing_cancelled) {
-    const vidx = (await ckv.get('vidx', { type: 'json' })) || [];
-    const take = vidx.slice(0, 200);
-    for (let i = 0; i < take.length; i += 20) {
-      const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return ckv.get('viewing:' + id, { type: 'json' }).catch(function () { return null; }); }));
-      for (const v of batch) if (v) viewings.push(v);
-    }
-    if (vidx.length > take.length) out.viewingsTruncated = true;
-    viewings.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+    try {
+      const vidx = (await ckv.get('vidx', { type: 'json' })) || [];
+      const take = vidx.slice(0, 200);
+      for (let i = 0; i < take.length; i += 20) {
+        const batch = await Promise.all(take.slice(i, i + 20).map(function (id) { return ckv.get('viewing:' + id, { type: 'json' }).catch(function () { return null; }); }));
+        for (const v of batch) if (v) viewings.push(v);
+      }
+      if (vidx.length > take.length) out.viewingsTruncated = true;
+      viewings.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+    } catch (e) { viewLoadFailed = true; out.viewingsError = true; console.error('puEvaluateRules: viewing load failed: ' + (e && e.message || e)); }
   }
+  // Pack PK (02-L8): an engine run lock for the firing + log-flush
+  // section. runAutomations' own lock is a get-then-put (two
+  // isolates can both pass it); this second, dedicated lock keeps
+  // two engines from interleaving their RMW rulelog flush. TTL is
+  // the crash backstop; the finally-path in runAutomations' caller
+  // chain is not relied on — release happens at the end of THIS
+  // function, and a leaked lock expires in 120s.
+  let rulesLockHeld = false;
+  try {
+    const held = await env.LEADS.get('lock:rules');
+    if (held) { out.skippedReason = 'rules_locked'; out.ops = ops; return out; }
+    await env.LEADS.put('lock:rules', JSON.stringify({ at: Date.now() }), { expirationTtl: 120 });
+    rulesLockHeld = true;
+  } catch (e) { /* a lock-store failure must not disable the engine */ }
   const fireBase = ops;
   const budgetHit = function () { return (ops - fireBase) > FIRE_BUDGET; };
   const ageH = function (iso) { const t = Date.parse(iso); return isFinite(t) ? (now - t) / 3600000 : Infinity; };
@@ -4204,7 +4491,7 @@ async function puEvaluateRules(env, autoCtx) {
     try { await ckv.put('rulefire:' + ruleId + ':' + target, new Date().toISOString(), { expirationTtl: ttl }); return true; }
     catch (e) { console.error('puEvaluateRules: markFired failed for ' + ruleId + ': ' + (e && e.message || e)); return false; }
   }
-  async function runActions(rule, lead, viewing) {
+  async function runActions(rule, lead, viewing, dedupeTarget) {
     const done = [], failed = [];
     let skipped = 0;
     for (const a of rule.actions) {
@@ -4219,15 +4506,26 @@ async function puEvaluateRules(env, autoCtx) {
           // partial failure can never duplicate the task, and
           // dueDays 0 means due today (the old `|| 1` silently
           // turned it into tomorrow).
-          const target = viewing ? 'viewing:' + viewing.id : (lead.id || normEmail(lead.email || ''));
+          // Pack PK (02-H1): the hash input is the DEDUPE TARGET
+          // (rule.id | l.id:stageAt for stage_changed/lead_cold),
+          // not the bare lead id. The old input made a second stage
+          // change find the FIRST firing's task, skip the put, and
+          // still report done — no new task was ever created.
+          const target = dedupeTarget || (viewing ? 'viewing:' + viewing.id : (lead.id || normEmail(lead.email || '')));
           const tid = 'rt-' + (await sha256hex(rule.id + '|' + target)).slice(0, 32);
           let existing = null;
           try { existing = await ckv.get('task:' + tid, { type: 'json' }); } catch (e) {}
           if (!existing) {
             const dd = (a.dueDays === undefined ? 1 : a.dueDays);
             await ckv.put('task:' + tid, JSON.stringify({ id: tid, email: lead.email || '', text: (a.text || 'Follow up') + ' — ' + (lead.name || lead.email || ''), due: addDaysYmd(today, dd), done: false, created_at: new Date().toISOString(), rule: rule.id }));
-            await idxAdd(cenv, 'tasks', tid);
           }
+          // Pack PK (02-M1): idxAdd runs on EVERY firing, not only
+          // after a fresh put — when the put landed but idxAdd
+          // failed, the retry used to find the task, skip both, and
+          // leave it unindexed (invisible) forever. idxAdd is
+          // idempotent; its failure still fails the action so the
+          // retry keeps trying.
+          await idxAdd(cenv, 'tasks', tid);
           done.push(a.type);
         } else if (a.type === 'queue_draft') {
           if (lead.email && !(await isBanned(cenv, lead.email))) {
@@ -4236,12 +4534,20 @@ async function puEvaluateRules(env, autoCtx) {
             // id — the old key used '' for all of them, so two
             // different contacts collided into one draft per day.
             const qref = lead.id || (viewing ? 'v' + viewing.id : '');
-            await queueMail(cenv, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lead.id }, { key: 'rule:' + rule.id + ':' + qref + ':' + today });
+            // Pack PK (02-M5): the draft key names the DEDUPE
+            // TARGET, not the calendar day — a target firing at
+            // 23:59 and re-evaluated at 00:01 used to queue a
+            // duplicate draft under the new day's key.
+            await queueMail(cenv, { kind: 'followup', to: lead.email, lang: lang, name: lead.name || '', ref: lead.id }, { key: 'rule:' + rule.id + ':' + qref + ':' + (dedupeTarget || today) });
             done.push(a.type);
           } else skipped++;
         } else if (a.type === 'flag_hot') {
           const nk = normEmail(lead.email || '');
-          if (nk) { try { const meta = await getCMeta(cenv, nk); meta.hotFlag = true; meta.hotReason = rule.name; await saveCMeta(cenv, nk, meta); } catch (e) {} }
+          // Pack PK (02-L1): a cmeta failure PROPAGATES into the
+          // action's failed[] (retry + attempt cap), instead of the
+          // old empty catch that pushed 'flag_hot' into done while
+          // the flag was never written.
+          if (nk) { const meta = await getCMeta(cenv, nk); meta.hotFlag = true; meta.hotReason = rule.name; await saveCMeta(cenv, nk, meta); }
           await puAttentionAdd(cenv, 'rule', '🔥 ' + rule.name + ' — ' + (lead.name || lead.email || ''), lead.id);
           done.push(a.type);
         }
@@ -4257,9 +4563,22 @@ async function puEvaluateRules(env, autoCtx) {
     // old per-target read failed OPEN and re-fired everything.
     let firedSet = null;
     try {
-      const page = await ckv.list({ prefix: 'rulefire:' + rule.id + ':', limit: 1000 });
+      // Pack PK (02-M3): the prefetch PAGINATES. The old single
+      // list({limit:1000}) ignored list_complete/cursor — past 1000
+      // rulefire keys (realistic now: lead_cold keys live 30 days,
+      // supp2 T2) the overflow looked un-fired and the rule re-fired
+      // it. Still fail-closed: an incomplete enumeration past the
+      // page cap skips the rule like a failed read.
       const pfx = 'rulefire:' + rule.id + ':';
-      firedSet = new Set(((page && page.keys) || []).map(function (k) { return String(k.name).slice(pfx.length); }));
+      firedSet = new Set();
+      let cursor = undefined, complete = false;
+      for (let page_i = 0; page_i < 20 && !complete; page_i++) {
+        const page = await ckv.list({ prefix: pfx, limit: 1000, cursor: cursor });
+        for (const k of ((page && page.keys) || [])) firedSet.add(String(k.name).slice(pfx.length));
+        complete = !page || page.list_complete !== false;
+        cursor = complete ? undefined : page.cursor;
+      }
+      if (!complete) throw new Error('dedupe_prefetch_incomplete');
     } catch (e) {
       out.dedupeErrors++;
       console.error('puEvaluateRules: dedupe prefetch failed for ' + rule.id + ': ' + (e && e.message || e));
@@ -4267,16 +4586,48 @@ async function puEvaluateRules(env, autoCtx) {
     }
     const ttl = PU_RULE_TTLS[rule.trigger] || 3 * 86400;
     const cond = rule.conditions || {};
-    async function fire(target, lead, viewing) {
-      const res = await runActions(rule, lead, viewing);
+    const enabledAtMs = rule.enabledAt ? Date.parse(rule.enabledAt) : 0;
+    async function fire(target, lead, viewing, eventTs) {
+      // Pack PK (T1): ENABLE BASELINE. A rule enabled moments ago
+      // must not burst-fire its whole lookback window (a week of
+      // cancellations, 48h of new leads — with autoSend, a burst of
+      // stale drafts). Targets whose event predates the enable
+      // stamp by more than an hour are marked fired WITHOUT running
+      // actions: the owner plausibly enabled the rule BECAUSE of
+      // the last hour's events, but week-old ones are history.
+      if (enabledAtMs && eventTs !== null && eventTs !== undefined && isFinite(eventTs) && eventTs < enabledAtMs - 3600000) {
+        const markedB = await markFired(rule.id, target, ttl);
+        if (!markedB) { out.partial = true; return; }
+        firedSet.add(target);
+        out.baseline = (out.baseline || 0) + 1;
+        return;
+      }
+      const res = await runActions(rule, lead, viewing, target);
       if (res.failed.length) {
         // Partial-action failure (PU-02 #3): NOT marked fired — the
         // target retries on a later run (the successful actions are
         // idempotent), and the failed action types land in the log.
+        // Pack PK (02-M4): retries are CAPPED — the attempt count
+        // rides a ruletry: key with the rule's dedupe TTL; on the
+        // third failed attempt the target is marked fired with a
+        // 'gave_up' log entry instead of churning forever.
         out.errors += res.failed.length;
+        const tryKey = 'ruletry:' + rule.id + ':' + target;
+        let tries = 0;
+        try { tries = parseInt(await ckv.get(tryKey), 10) || 0; } catch (e) {}
+        tries++;
+        if (tries >= 3) {
+          const markedG = await markFired(rule.id, target, ttl);
+          if (markedG) { firedSet.add(target); try { await ckv.delete(tryKey); } catch (e) {} }
+          else out.partial = true;
+          logEntries.push({ at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: res.done, failed: res.failed, result: 'gave_up' });
+          return;
+        }
+        try { await ckv.put(tryKey, String(tries), { expirationTtl: ttl }); } catch (e) {}
         logEntries.push({ at: new Date().toISOString(), ruleId: rule.id, rule: rule.name, trigger: rule.trigger, target: target, actions: res.done, failed: res.failed });
         return;
       }
+      try { await ckv.delete('ruletry:' + rule.id + ':' + target); } catch (e) {}
       const marked = await markFired(rule.id, target, ttl);
       if (!marked) { out.partial = true; return; }
       firedSet.add(target);
@@ -4293,16 +4644,17 @@ async function puEvaluateRules(env, autoCtx) {
       if (nm > 0) {
         const target = 'run:' + today;
         if (!firedSet.has(target)) {
-          if (budgetHit()) out.partial = true;
-          else await fire(target, null, null);
+          if (budgetHit() || ops > OPS_CEILING) { out.partial = true; if (ops > OPS_CEILING) out.opsCeiling = true; }
+          else await fire(target, null, null, null); // search_match has no per-target event: the T1 baseline does not apply
         }
       }
       continue;
     }
     if (rule.trigger === 'viewing_booked' || rule.trigger === 'viewing_cancelled') {
+      if (viewLoadFailed) continue; // Pack PK (02-L2): no viewing data this run — viewing rules sit it out
       const wantCancelled = rule.trigger === 'viewing_cancelled';
       for (const v of viewings) {
-        if (out.fired >= MAXFIRE || budgetHit()) { out.partial = true; break; }
+        if (out.fired >= MAXFIRE || budgetHit() || ops > OPS_CEILING) { out.partial = true; if (ops > OPS_CEILING) out.opsCeiling = true; break; }
         let hit = false;
         if (wantCancelled) {
           // The cancellation instant is stamped on the record from
@@ -4315,27 +4667,32 @@ async function puEvaluateRules(env, autoCtx) {
         }
         if (!hit) continue;
         const lead = leadByEmail[normEmail(v.email || '')] || null;
+        // Pack PK (02-M8): viewing triggers honour the dropped/closed
+        // rule like the lead loop does — a viewing attached to a
+        // dropped or closed lead never fires.
+        if (lead && (lead.stage === 'dropped' || lead.stage === 'closed')) continue;
         if (lead && !puRuleLeadMatch(rule, lead)) continue;
         if (!lead && (cond.stage || cond.source)) continue;
         const target = 'viewing:' + v.id;
         if (firedSet.has(target)) continue;
         const effLead = lead || (v.email ? { id: '', name: v.name || '', email: v.email, stage: '', source: 'viewing' } : null);
-        await fire(target, effLead, v);
+        await fire(target, effLead, v, Date.parse(wantCancelled ? (v.cancelledAt || v.created_at) : v.created_at));
       }
       continue;
     }
     for (const l of leads) {
-      if (out.fired >= MAXFIRE || budgetHit()) { out.partial = true; break; }
+      if (out.fired >= MAXFIRE || budgetHit() || ops > OPS_CEILING) { out.partial = true; if (ops > OPS_CEILING) out.opsCeiling = true; break; }
       if (l.stage === 'dropped') continue; // dropped leads never fire (PU-02 #9)
-      let hit = false, target = l.id;
-      if (rule.trigger === 'lead_created') hit = ageH(l.created_at) <= 48;
-      else if (rule.trigger === 'valuation_submitted') hit = l.source === 'home-valuation' && ageH(l.created_at) <= 168;
+      let hit = false, target = l.id, eventTs = null;
+      if (rule.trigger === 'lead_created') { hit = ageH(l.created_at) <= 48; eventTs = Date.parse(l.created_at || ''); }
+      else if (rule.trigger === 'valuation_submitted') { hit = l.source === 'home-valuation' && ageH(l.created_at) <= 168; eventTs = Date.parse(l.created_at || ''); }
       else if (rule.trigger === 'stage_changed') {
         const st = Date.parse(l.stageAt || ''), ct = Date.parse(l.created_at || '');
         // A stageAt stamped at creation is the INITIAL stage, not a
         // change (PU-02 #9) — it must not fire a stage_changed rule.
         hit = isFinite(st) && ageH(l.stageAt) <= 48 && !(isFinite(ct) && Math.abs(st - ct) < 120000);
         target = l.id + ':' + (l.stageAt || '');
+        eventTs = st;
       }
       else if (rule.trigger === 'lead_cold') {
         // Silence comes from the scorer's own measure (PU-02 #9).
@@ -4343,11 +4700,14 @@ async function puEvaluateRules(env, autoCtx) {
         const sd = scoresById[l.id] ? scoresById[l.id].silentDays : null;
         hit = l.stage === 'contacted' && sd !== null && sd !== undefined && sd >= d;
         target = l.id + ':' + (l.stageAt || '');
+        // Pack PK (T1): for a state trigger the "event" is the
+        // moment the lead CROSSED the cold threshold.
+        eventTs = hit ? (Date.now() - Math.round((sd - d) * 86400000)) : null;
       }
       if (!hit) continue;
       if (!puRuleLeadMatch(rule, l)) continue;
       if (firedSet.has(target)) continue;
-      await fire(target, l, null);
+      await fire(target, l, null, eventTs);
     }
   }
   // Pack K (PU-02 #6): the run's log is collected in memory and
@@ -4360,6 +4720,7 @@ async function puEvaluateRules(env, autoCtx) {
     } catch (e) { console.error('puEvaluateRules: rulelog flush failed: ' + (e && e.message || e)); }
   }
   out.ops = ops;
+  if (rulesLockHeld) { try { await env.LEADS.delete('lock:rules'); } catch (e) {} }
   return out;
 }
 
@@ -4415,6 +4776,10 @@ async function puFileMetas(env, mls) {
           if (!raw) continue;
           const r = JSON.parse(raw);
           if (mlsNorm && String(r.mls || '').trim().toUpperCase() !== mlsNorm) continue;
+          // Pack PK (04-M3): BACKFILL the KV metadata for legacy
+          // (pre-metadata) records — this branch otherwise re-read
+          // the body on every list forever.
+          try { await env.LEADS.put('file:' + fid, raw, { metadata: { name: r.name || 'file', type: r.type || '', size: r.size || 0, mls: String(r.mls || '').trim().toUpperCase(), at: r.at || null, hasAi: r.aiSummary ? 1 : 0 } }); } catch (e) {}
           out.push({ id: r.id || fid, name: r.name, type: r.type, size: r.size, mls: String(r.mls || '').trim().toUpperCase(), at: r.at, aiSummary: r.aiSummary || null });
         } catch (e) {}
       }
@@ -4434,23 +4799,35 @@ async function puFileMetas(env, mls) {
   }
   return out;
 }
+// Pack PK (05-L1): files are enrichment on the report surfaces — a
+// metadata failure degrades to files:null + a flag, never a 500 for
+// the whole report.
+async function puFileMetasSafe(env, mls) {
+  try { return { files: await puFileMetas(env, mls), filesError: false }; }
+  catch (e) { console.error('puFileMetas failed: ' + (e && e.message || e)); return { files: null, filesError: true }; }
+}
 /* Full file records INCLUDING the base64 payload — only for the
    handbook-data includeFiles flag (phase 2, 2026-11-01), so the
    handbook flow can embed file images/text without extra fetches.
    Capped at 10 files to bound the response. */
 async function puFilesFull(env, mls) {
+  // Pack PK (F2): the old body read EVERY file record (base64 and
+  // all) and filtered by MLS afterwards. Candidates now come from
+  // puFileMetas (KV metadata — no body reads), and bodies are read
+  // only for matches, under the same 10-file cap. Matches past the
+  // cap set `truncated` so the handbook can label the partial set.
+  const metas = await puFileMetas(env, mls);
   const out = [];
-  for (const fid of await idxGet(env, 'files', 'file:')) {
-    const raw = await env.LEADS.get('file:' + fid);
+  for (const m of metas) {
+    if (out.length >= 10) break;
+    const raw = await env.LEADS.get('file:' + m.id);
     if (!raw) continue;
     try {
       const r = JSON.parse(raw);
-      if (mls && String(r.mls || '').trim().toUpperCase() !== String(mls).trim().toUpperCase()) continue;
       out.push({ id: r.id, name: r.name, type: r.type, size: r.size, mls: r.mls || '', at: r.at, aiSummary: r.aiSummary || null, data: r.data || '' });
     } catch (e) {}
-    if (out.length >= 10) break;
   }
-  return out;
+  return { files: out, truncated: metas.length > out.length, matched: metas.length };
 }
 /* Rich listing record for reports + handbooks: the portal-managed
    full record wins, then the full seed record, then the thin matching
@@ -4476,11 +4853,15 @@ function puNeighbourhood(listing) {
   const row = (fsa && Object.prototype.hasOwnProperty.call(PR_CENSUS_FSA, fsa)) ? PR_CENSUS_FSA[fsa] : null;
   const census = row ? { fsa: fsa, pop: row[0], dwellings: row[1], pctAge0to14: row[2], pctAge65plus: row[3], medianAge: row[4], pctSingleDetached: row[5], avgHouseholdSize: row[6], medianIncome: row[7], pctOwner: row[8], pctRenter: row[9], pctEnglishAtHome: row[10], pctNonOfficialAtHome: row[11] } : null;
   const cityLabel = String(listing.city || '');
-  const city = cityLabel.toLowerCase();
+  // Pack PK (05-L6): the compare is trimmed + folded — a stored
+  // ' Langley' or an accented spelling used to match no schools.
+  // (Distance ranking was considered and rejected: listings carry
+  // no coordinates, so there is no signal to rank by.)
+  const city = puFoldText(cityLabel.trim());
   const schools = [];
   let schoolsTotal = 0;
   for (const sc of PR_SCHOOLS) {
-    if (String(sc[1]).toLowerCase() === city) {
+    if (puFoldText(String(sc[1]).trim()) === city) {
       schoolsTotal++;
       if (schools.length < 6) schools.push({ name: sc[0], level: sc[4], kind: sc[5] });
     }
@@ -4503,13 +4884,30 @@ function puNeighbourhood(listing) {
    and travel ONLY in `photos` (the listing copy used to duplicate
    them). dataSource names where the record came from; `thin` marks
    the slim catalog fallback. */
+function puCleanDesc(h) {
+  // Pack PK (05-L5): desc is a per-language object — keep only
+  // string values for the portal's languages, capped; a plain
+  // string desc becomes {en}; the legacy description field is the
+  // last fallback. The old projection passed ANY object through.
+  const langs = ['en', 'fa', 'hi', 'zh', 'es'];
+  if (h.desc && typeof h.desc === 'object' && !Array.isArray(h.desc)) {
+    const o = {};
+    for (const lg of langs) if (typeof h.desc[lg] === 'string' && h.desc[lg]) o[lg] = h.desc[lg].slice(0, 4000);
+    if (Object.keys(o).length) return o;
+  }
+  if (typeof h.desc === 'string' && h.desc) return { en: h.desc.slice(0, 4000) };
+  return h.description ? { en: String(h.description).slice(0, 4000) } : null;
+}
 function puPublicListing(h, dataSource) {
   if (!h) return null;
   const photos = [];
   const rawPhotos = [];
   if (h.photo) rawPhotos.push(h.photo);
   if (Array.isArray(h.photos)) for (const pp of h.photos) rawPhotos.push(pp);
-  for (const pp of rawPhotos) if (typeof pp === 'string' && pp && photos.indexOf(pp) === -1) photos.push(pp);
+  // Pack PK (05-L5): photo URLs are scheme-checked — https/http or
+  // a scheme-less relative path ('photos/x.webp' seeds); anything
+  // else (javascript:, data:) never reaches a rendered page.
+  for (const pp of rawPhotos) if (typeof pp === 'string' && pp && photos.indexOf(pp) === -1 && (/^https?:\/\//i.test(pp) || !/^[a-z][a-z0-9+.-]*:/i.test(pp))) photos.push(pp);
   const num = function (v) { return (v === null || v === undefined) ? null : v; };
   return {
     listing: {
@@ -4517,7 +4915,7 @@ function puPublicListing(h, dataSource) {
       price: (typeof h.price === 'number' && isFinite(h.price)) ? h.price : null,
       beds: num(h.beds), baths: num(h.baths), sqft: num(h.sqft),
       type: h.type || '', status: h.status || '',
-      desc: (h.desc && typeof h.desc === 'object') ? h.desc : (h.description ? { en: String(h.description) } : null),
+      desc: puCleanDesc(h),
       features: Array.isArray(h.features) ? h.features.filter(function (f) { return typeof f === 'string'; }).slice(0, 30) : [],
       year: num(h.year), strata: num(h.strata), tax: num(h.tax), parking: h.parking || '',
       stalls: num(h.stalls), lot: num(h.lot), listed: h.listed || '', dom: num(h.dom),
@@ -8739,6 +9137,12 @@ async function handleRequest(request, env, ctx) {
 
       // ---- admin: portal upgrade — files, search, report data (systems 6, 7, 9) ----
       if (path === '/api/admin/files' && request.method === 'POST') {
+        // Pack PK (04-M7): reject an oversized upload from the
+        // Content-Length header BEFORE the body is parsed (base64
+        // inflates by 4/3; slack covers the JSON envelope). Absent
+        // header -> the in-body size checks below still rule.
+        const clHdr = parseInt(request.headers.get('content-length') || '', 10);
+        if (isFinite(clHdr) && clHdr > Math.ceil(PU_FILE_MAX * 4 / 3) + 32768) return json({ ok: false, error: 'too_large' }, 413, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
@@ -8746,7 +9150,10 @@ async function handleRequest(request, env, ctx) {
         // the stored name (they can spoof the displayed filename in
         // the portal and in mail clients). U+200C (ZWNJ) is NOT in the
         // strip set — Persian names legitimately need it.
-        const name = String(d.name || 'file').replace(/[\u0000-\u001f\u202a-\u202e\u2066-\u2069<>:"/\\|?*]/g, ' ').trim().slice(0, 100) || 'file';
+        // Pack PK (04-M1): the 100-char cap counts CODE POINTS —
+        // slice() cut UTF-16 units and could split an emoji or a
+        // combining sequence in half.
+        const name = Array.from(String(d.name || 'file').replace(/[\u0000-\u001f\u202a-\u202e\u2066-\u2069<>:"/\\|?*]/g, ' ').trim()).slice(0, 100).join('') || 'file';
         const type = String(d.type || 'application/octet-stream').slice(0, 80);
         const mls = String(d.mls || '').trim().toUpperCase().slice(0, 40);
         const b64 = String(d.dataBase64 || '');
@@ -8795,7 +9202,11 @@ async function handleRequest(request, env, ctx) {
         const dlName = String(rec.name || 'file');
         const asciiName = dlName.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '') || 'file';
         const hdrs = new Headers(cors(origin));
-        hdrs.set('Content-Type', rec.type || 'application/octet-stream');
+        // Pack PK (04-L5): reflect the stored type ONLY when it is
+        // on the upload allowlist — a legacy/corrupt record carrying
+        // text/html is served as a plain download instead. (The CSP
+        // sandbox + attachment disposition stay as defence in depth.)
+        hdrs.set('Content-Type', PU_FILE_TYPES.indexOf(rec.type) !== -1 ? rec.type : 'application/octet-stream');
         hdrs.set('Content-Disposition', 'attachment; filename="' + asciiName + '"; filename*=UTF-8\'\'' + encodeURIComponent(dlName).replace(/'/g, '%27'));
         hdrs.set('X-Content-Type-Options', 'nosniff');
         hdrs.set('Cache-Control', 'no-store');
@@ -8828,7 +9239,10 @@ async function handleRequest(request, env, ctx) {
         const rawQ = String(url.searchParams.get('q') || '').slice(0, 80);
         const q = puFoldText(rawQ).trim();
         const qDigits = q.replace(/\D/g, '');
-        const isPhoneQ = qDigits.length >= 7 && /^[+\d][\d\s().-]*$/.test(q);
+        // Pack PK (04-L3): a short digit query (4+) is a phone
+        // SUFFIX search — the old >=7 floor returned nothing for the
+        // last-4-digits lookup the palette is most often used for.
+        const isPhoneQ = qDigits.length >= 4 && /^[+\d][\d\s().-]*$/.test(q);
         const minLen = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/.test(q) ? 1 : 2;
         if (q.length < minLen) return json({ ok: true, q: rawQ.trim(), leads: [], listings: [], viewings: [], pairs: [] }, 200, origin);
         const rank = function () {
@@ -8846,30 +9260,43 @@ async function handleRequest(request, env, ctx) {
           if (!isPhoneQ) return 0;
           const d = String(v || '').replace(/\D/g, '');
           if (!d) return 0;
-          if (d === qDigits || d.slice(-10) === qDigits.slice(-10)) return 3;
+          if (d === qDigits || (qDigits.length >= 7 && d.slice(-10) === qDigits.slice(-10))) return 3;
+          if (d.slice(-qDigits.length) === qDigits) return 2; // Pack PK (04-L3): suffix match
           if (d.indexOf(qDigits) !== -1) return 1;
           return 0;
         };
         const byRank = function (a, b) { return b._r - a._r; };
         const strip = function (x) { const y = Object.assign({}, x); delete y._r; return y; };
+        await ensureCatalog(env); // Pack PK (supp3 P6): listings below read the catalog — hydrate first
         const sm = await puLeadScores(env);
-        const leads = sm.leads.map(function (l) { const sc = sm.map[l.id]; const r = Math.max(rank(l.name, l.email, l.city), phoneRank(l.phone)); return r ? { _r: r, id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, score: sc ? sc.score : null } : null; }).filter(Boolean).sort(byRank).slice(0, 8).map(strip);
-        const listings = mergedCatalog().map(function (h) { const r = rank(h.street, h.city, h.mls); return r ? { _r: r, mls: h.mls, street: h.street, city: h.city, price: h.price, status: h.status } : null; }).filter(Boolean).sort(byRank).slice(0, 8).map(strip);
+        const leadsAll = sm.leads.map(function (l) { const sc = sm.map[l.id]; const r = Math.max(rank(l.name, l.email, l.city), phoneRank(l.phone)); return r ? { _r: r, id: l.id, name: l.name || '', email: l.email || '', stage: l.stage, score: sc ? sc.score : null } : null; }).filter(Boolean).sort(byRank);
+        const leads = leadsAll.slice(0, 8).map(strip);
+        const listingsAll = mergedCatalog().map(function (h) { const r = rank(h.street, h.city, h.mls); return r ? { _r: r, mls: h.mls, street: h.street, city: h.city, price: h.price, status: h.status } : null; }).filter(Boolean).sort(byRank);
+        const listings = listingsAll.slice(0, 8).map(strip);
         const vs = await puViewingSummary(env);
-        const viewings = vs.rows.map(function (v) { const r = Math.max(rank(v.name, v.email, v.listingId), phoneRank(v.phone)); return r ? { _r: r, id: v.id, name: v.name || '', email: v.email || '', date: v.date, time: v.time, listingId: v.listingId, status: v.status } : null; }).filter(Boolean).sort(byRank).slice(0, 6).map(strip);
+        const viewingsAll = vs.rows.map(function (v) { const r = Math.max(rank(v.name, v.email, v.listingId), phoneRank(v.phone)); return r ? { _r: r, id: v.id, name: v.name || '', email: v.email || '', date: v.date, time: v.time, listingId: v.listingId, status: v.status } : null; }).filter(Boolean).sort(byRank);
+        const viewings = viewingsAll.slice(0, 6).map(strip);
         const pairIdx = await adminCachedGen(env, 'searchpairs', async function () {
           const keys = await listAllKeys(env, 'mlead:', 2000);
           const slim = [];
-          for (const k of keys.slice(-300)) {
-            const r = await env.LEADS.get(k.name, { type: 'json' });
-            if (r) slim.push({ id: r.id, title: r.title || '', area: r.area || '', kind: r.kind || '' });
+          // Pack PK (04-M5): batched 20-wide — the loader used to
+          // read up to 300 records one await at a time.
+          const takeP = keys.slice(-300);
+          for (let i = 0; i < takeP.length; i += 20) {
+            const batch = await Promise.all(takeP.slice(i, i + 20).map(function (k) { return env.LEADS.get(k.name, { type: 'json' }).catch(function () { return null; }); }));
+            for (const r of batch) if (r) slim.push({ id: r.id, title: r.title || '', area: r.area || '', kind: r.kind || '' });
           }
           return slim;
         });
-        const pairs = pairIdx.map(function (r) { const rk = rank(r.title, r.area); return rk ? { _r: rk, id: r.id, title: r.title, area: r.area, kind: r.kind } : null; }).filter(Boolean).sort(byRank).slice(0, 6).map(strip);
-        return json({ ok: true, q: rawQ.trim(), leads: leads, listings: listings, viewings: viewings, pairs: pairs }, 200, origin);
+        const pairsAll = pairIdx.map(function (r) { const rk = rank(r.title, r.area); return rk ? { _r: rk, id: r.id, title: r.title, area: r.area, kind: r.kind } : null; }).filter(Boolean).sort(byRank);
+        const pairs = pairsAll.slice(0, 6).map(strip);
+        // Pack PK (item 6): the palette slices for display; the
+        // pre-slice match counts ride along so a capped group never
+        // reads as the whole result set.
+        return json({ ok: true, q: rawQ.trim(), leads: leads, listings: listings, viewings: viewings, pairs: pairs, counts: { leads: leadsAll.length, listings: listingsAll.length, viewings: viewingsAll.length, pairs: pairsAll.length } }, 200, origin);
       }
       if (path === '/api/admin/reports/listing-performance' && request.method === 'GET') {
+        await ensureCatalog(env); // Pack PK (supp3 P6): hydrate before the catalog-backed payload lookup
         // Pack K (PU-03 #5/#10): mls is normalized; an empty one is a
         // 400, not a 404 hunt through an empty key. Untracked listings
         // say tracked:false instead of dressing zeroes up as data,
@@ -8879,30 +9306,42 @@ async function handleRequest(request, env, ctx) {
         const proj = puListingPayload(mls);
         if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const totals = await perfRead(env);
+        // Pack PK (supp3 N1): perfRead returns null on a failed KV
+        // read — totals.listings used to throw a 500. A stale
+        // (read-only) fold is reported as perf.stale.
+        if (!totals) return json({ ok: false, error: 'perf_unavailable' }, 503, origin);
         const perfRec = (totals.listings && totals.listings[mls]) || null;
+        const filesLP = await puFileMetasSafe(env, mls); // Pack PK (05-L1)
         const perf = perfRec || { v: 0, s: 0, b: 0, l: 0 };
         const ds = await mpReadStatsSafe(env);
         const month0 = ((ds && ds.months) || [])[0] || null;
-        return json({ ok: true, listing: proj.listing, photos: proj.photos, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, since: totals.startedAt || null, sources: totals.sources || {}, tracked: !!perfRec, trackedLabel: perfRec ? 'tracked events' : 'not tracked yet' }, market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: await puFileMetas(env, mls) }, 200, origin);
+        return json({ ok: true, listing: proj.listing, photos: proj.photos, perf: { views: perf.v || 0, saves: perf.s || 0, bookings: perf.b || 0, leads: perf.l || 0, stale: !!totals.stale, since: totals.startedAt || null, sources: totals.sources || {}, tracked: !!perfRec, trackedLabel: perfRec ? 'tracked events' : 'not tracked yet' }, market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: filesLP.files, filesError: filesLP.filesError || undefined }, 200, origin);
       }
       if (path === '/api/admin/reports/property' && request.method === 'GET') {
         const mls = String(url.searchParams.get('mls') || '').trim().toUpperCase().slice(0, 40);
         if (!mls) return json({ ok: false, error: 'mls_required' }, 400, origin);
+        await ensureCatalog(env); // Pack PK (supp3 P6): hydrate before the catalog-backed payload lookup
         const proj = puListingPayload(mls);
         if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const h = puRichListing(mls);
         const ds = await mpReadStatsSafe(env);
         const month0 = ((ds && ds.months) || [])[0] || null;
-        return json({ ok: true, listing: proj.listing, photos: proj.photos, neighbourhood: puNeighbourhood(h), market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: await puFileMetas(env, mls) }, 200, origin);
+        const filesRP = await puFileMetasSafe(env, mls); // Pack PK (05-L1)
+        return json({ ok: true, listing: proj.listing, photos: proj.photos, neighbourhood: puNeighbourhood(h), market: month0 ? Object.assign({}, month0, { scope: 'regional', scopeLabel: 'Regional market - all areas, not this listing\'s neighbourhood' }) : null, files: filesRP.files, filesError: filesRP.filesError || undefined }, 200, origin);
       }
       if (path === '/api/admin/handbook-data' && request.method === 'GET') {
         const mls = String(url.searchParams.get('mls') || '').trim().toUpperCase().slice(0, 40);
         if (!mls) return json({ ok: false, error: 'mls_required' }, 400, origin);
+        await ensureCatalog(env); // Pack PK (supp3 P6): hydrate before the catalog-backed payload lookup
         const proj = puListingPayload(mls);
         if (!proj) return json({ ok: false, error: 'not_found' }, 404, origin);
         const h = puRichListing(mls);
-        const leadId = String(url.searchParams.get('leadId') || '').slice(0, 64);
-        let client = null, viewing = null;
+        // Pack PK (05-L3): the lead id is charset-validated — an
+        // out-of-charset value is treated as absent (the client
+        // section is optional enrichment), never as a lookup key.
+        const leadIdRaw = String(url.searchParams.get('leadId') || '');
+        const leadId = /^[A-Za-z0-9_-]{1,64}$/.test(leadIdRaw) ? leadIdRaw : '';
+        let client = null, viewing = null, viewingPartial = false;
         if (leadId) {
           const l = await env.LEADS.get('lead:' + leadId, { type: 'json' });
           if (l) {
@@ -8916,7 +9355,11 @@ async function handleRequest(request, env, ctx) {
               // record the index surfaced first.
               try {
                 const vs = await puViewingSummary(env);
-                const mine = vs.rows.filter(function (v) { return normEmail(v.email || '') === normEmail(l.email) && v.listingId === mls && v.status !== 'cancelled'; });
+                viewingPartial = !!vs.partial; // Pack PK (05-M4): a truncated summary is labelled, not silent
+                // Pack PK (05-M4): the listing side compares
+                // NORMALISED mls — a viewing stored with a lowercase
+                // listing id used to be invisible here.
+                const mine = vs.rows.filter(function (v) { return normEmail(v.email || '') === normEmail(l.email) && puNormMls(v.listingId) === mls && v.status !== 'cancelled'; });
                 const today = todayVancouver();
                 const byDTa = function (a, b) { return String(a.date + ' ' + a.time).localeCompare(String(b.date + ' ' + b.time)); };
                 const future = mine.filter(function (v) { return v.date >= today; }).sort(byDTa);
@@ -8931,7 +9374,8 @@ async function handleRequest(request, env, ctx) {
         const ds = await mpReadStatsSafe(env);
         const monthsArr = (ds && ds.months) || [];
         const month = monthsArr[0] || null;
-        const rateMonth = monthsArr.find(function (m) { return m && m.rates && typeof m.rates.bestFixed5 === 'number'; }) || null;
+        // Pack PK (05-L7): a stored NaN is typeof 'number' — require finite.
+        const rateMonth = monthsArr.find(function (m) { return m && m.rates && typeof m.rates.bestFixed5 === 'number' && isFinite(m.rates.bestFixed5); }) || null;
         let mortgage = null;
         const rate = rateMonth ? rateMonth.rates.bestFixed5 : null;
         // Pack K (PU-03 #3): the price is validated as a number
@@ -8940,16 +9384,36 @@ async function handleRequest(request, env, ctx) {
         // with the payload so a printed handbook can be audited.
         const price = (typeof h.price === 'number' && isFinite(h.price) && h.price > 0) ? h.price : null;
         if (rate && price) {
+          // Pack PK (05-M3): staleness is measured from the END of
+          // the data's month (+45 days) — the old month-mismatch
+          // flagged month-old-on-the-1st rates published days
+          // earlier. An unparseable non-empty month counts as stale.
+          let rateStaleCalc = false;
+          if (rateMonth.month) {
+            const rmm = String(rateMonth.month).match(/^(\d{4})-(\d{2})$/);
+            if (!rmm) rateStaleCalc = true;
+            else rateStaleCalc = (Date.now() - (Date.UTC(parseInt(rmm[1], 10), parseInt(rmm[2], 10), 1) - 86400000)) > 45 * 86400000;
+          }
+          // Pack PK (05-L7): no dangling separator without a date.
+          const rateSourceStr = (rateMonth.rates.source || 'market dataset') + (rateMonth.rates.sourceDate ? ' · ' + rateMonth.rates.sourceDate : '');
           const principal = Math.round(price * 0.8);
           const pmt = caMonthlyPayment(principal, rate, 25);
-          mortgage = { price: price, downPayment: price - principal, principal: principal, ratePct: rate, years: 25, monthly: pmt, rateMonth: rateMonth.month || '', rateSource: (rateMonth.rates.source || 'market dataset') + ' · ' + (rateMonth.rates.sourceDate || ''), estimate: true, rateStale: !!rateMonth.month && String(rateMonth.month) !== todayVancouver().slice(0, 7), assumptions: { compounding: 'semi-annual (Canada)', amortizationYears: 25, downPaymentPct: 20, paymentFrequency: 'monthly', rateBasis: 'best 5-year fixed from the market dataset' } };
+          mortgage = { price: price, downPayment: price - principal, principal: principal, ratePct: rate, years: 25, monthly: pmt, rateMonth: rateMonth.month || '', rateSource: rateSourceStr, estimate: true, rateStale: rateStaleCalc, assumptions: { compounding: 'semi-annual (Canada)', amortizationYears: 25, downPaymentPct: 20, paymentFrequency: 'monthly', rateBasis: 'best 5-year fixed from the market dataset' } };
         }
         const photos = proj.photos;
         // Phase 2 (2026-11-01): ?includeFiles=1 returns the files'
         // content (base64) alongside the metas, so the handbook can
         // embed them; default (no flag) stays metas-only.
         const incFiles = url.searchParams.get('includeFiles') === '1';
-        return json({ ok: true, listing: proj.listing, photos: photos, client: client, viewing: viewing, brand: { name: settings.brand || '', email: settings.email || '', phone: settings.phone || '' }, neighbourhood: puNeighbourhood(h), mortgage: mortgage, mortgageNote: mortgage ? null : (rate ? 'price_unavailable' : 'rate_unavailable'), files: incFiles ? await puFilesFull(env, mls) : await puFileMetas(env, mls), includeFiles: incFiles }, 200, origin);
+        // Pack PK (05-L1 + F2): files never 500 the handbook — a
+        // failure degrades to files:null + filesError; the F2
+        // truncated flag labels a capped includeFiles set.
+        let filesOut = null, filesError = false, filesTruncated = false;
+        try {
+          if (incFiles) { const fr = await puFilesFull(env, mls); filesOut = fr.files; filesTruncated = !!fr.truncated; }
+          else filesOut = await puFileMetas(env, mls);
+        } catch (e) { filesError = true; console.error('handbook-data files failed: ' + (e && e.message || e)); }
+        return json({ ok: true, listing: proj.listing, photos: photos, client: client, viewing: viewing, viewingPartial: viewingPartial || undefined, brand: { name: settings.brand || '', email: settings.email || '', phone: settings.phone || '' }, neighbourhood: puNeighbourhood(h), mortgage: mortgage, mortgageNote: mortgage ? null : (rate ? 'price_unavailable' : 'rate_unavailable'), files: filesOut, filesError: filesError || undefined, filesTruncated: filesTruncated || undefined, includeFiles: incFiles }, 200, origin);
       }
 
       // ---- admin: portal upgrade — automation rules (system 5) ----
@@ -8958,7 +9422,7 @@ async function handleRequest(request, env, ctx) {
         // silent preset list dressed up as the owner's rules.
         let cfg = null;
         try { cfg = await puRulesGet(env); } catch (e) { return json({ ok: false, error: 'rules_unavailable' }, 503, origin); }
-        return json({ ok: true, rules: cfg.rules, seeded: cfg.seeded, updatedAt: cfg.updatedAt || null, triggers: PU_RULE_TRIGGERS, actions: PU_RULE_ACTIONS }, 200, origin);
+        return json({ ok: true, rules: cfg.rules, seeded: cfg.seeded, dropped: cfg.dropped || 0, updatedAt: cfg.updatedAt || null, triggers: PU_RULE_TRIGGERS, actions: PU_RULE_ACTIONS }, 200, origin);
       }
       if (path === '/api/admin/rules' && request.method === 'PUT') {
         let d = null;
@@ -8980,21 +9444,58 @@ async function handleRequest(request, env, ctx) {
         }
         rejected += Math.max(0, d.rules.length - 50);
         if (d.rules.length > 0 && clean.length === 0) return json({ ok: false, error: 'no_valid_rules', rejected: rejected }, 400, origin);
-        // Optimistic concurrency: when the client names the config
-        // version it based its edit on, a mismatch is a 409 instead
-        // of a silent overwrite of someone else's save.
-        if (d.baseUpdatedAt) {
-          let cur = null;
-          try { cur = await env.LEADS.get('cfg:rules', { type: 'json' }); } catch (e) {}
-          if (cur && cur.updatedAt && cur.updatedAt !== d.baseUpdatedAt) return json({ ok: false, error: 'conflict', updatedAt: cur.updatedAt }, 409, origin);
+        // Pack PK (item 12): optimistic concurrency is REQUIRED now,
+        // not opt-in — the version the edit was based on must be
+        // named, and a mismatch is a 409 instead of a silent
+        // overwrite of someone else's save. (The check itself is the
+        // Pack K one; PK makes sending baseUpdatedAt mandatory and
+        // reads the stored config exactly once for all three guards
+        // below.)
+        let cur = null;
+        try { cur = await env.LEADS.get('cfg:rules', { type: 'json' }); } catch (e) {}
+        // The base is required whenever the stored config carries a
+        // version. An UNVERSIONED config (written before versioning
+        // existed, or seeded directly) accepts this save — which
+        // stamps the first version and starts the chain; requiring a
+        // base there would deadlock the first save forever.
+        if (cur && cur.updatedAt) {
+          if (!d.baseUpdatedAt || typeof d.baseUpdatedAt !== 'string') return json({ ok: false, error: 'base_required' }, 400, origin);
+          if (cur.updatedAt !== d.baseUpdatedAt) return json({ ok: false, error: 'conflict', updatedAt: cur.updatedAt }, 409, origin);
+        }
+        // Pack PK (S2): storing an EMPTY rule list wipes every rule
+        // — it needs the explicit confirmEmpty flag on top of the
+        // version check, so a fat-fingered save can never do it
+        // silently.
+        if (clean.length === 0 && d.confirmEmpty !== true) return json({ ok: false, error: 'empty_requires_confirm' }, 400, origin);
+        // Pack PK (T1): stamp enabledAt when a rule flips off -> on
+        // (or first appears enabled). The engine baselines targets
+        // whose events predate the stamp, so enabling a rule can
+        // never burst-fire its whole lookback window. A rule that
+        // was already enabled keeps its original stamp; disabling
+        // clears it.
+        const storedById = Object.create(null);
+        if (cur && Array.isArray(cur.rules)) for (const sr of cur.rules) { if (sr && sr.id) storedById[String(sr.id)] = sr; }
+        const stampNow = new Date().toISOString();
+        for (const c of clean) {
+          const prev = storedById[c.id];
+          if (c.enabled === true) {
+            if (prev && prev.enabled === true) { if (prev.enabledAt) c.enabledAt = prev.enabledAt; else delete c.enabledAt; }
+            else c.enabledAt = stampNow;
+          } else delete c.enabledAt;
         }
         const updatedAt = new Date().toISOString();
         await env.LEADS.put('cfg:rules', JSON.stringify({ rules: clean, updatedAt: updatedAt }));
         return json({ ok: true, rules: clean, rejected: rejected, updatedAt: updatedAt }, 200, origin);
       }
       if (path === '/api/admin/rules/log' && request.method === 'GET') {
-        let log = [];
-        try { log = (await env.LEADS.get('rulelog', { type: 'json' })) || []; } catch (e) {}
+        // Pack PK (supp2 S10/S11): this handler used to fail OPEN —
+        // a KV error answered {ok:true, log:[]} ("no rule activity"
+        // during an outage), and a corrupt non-array value crashed
+        // on .slice. Like /rules itself: storage trouble is a 503.
+        let log = null;
+        try { log = await env.LEADS.get('rulelog', { type: 'json' }); } catch (e) { return json({ ok: false, error: 'log_unavailable' }, 503, origin); }
+        if (log === null || log === undefined) log = [];
+        if (!Array.isArray(log)) return json({ ok: false, error: 'log_unavailable' }, 503, origin);
         return json({ ok: true, log: log.slice(0, 100) }, 200, origin);
       }
 
