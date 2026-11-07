@@ -6865,8 +6865,32 @@ async function handleRequest(request, env, ctx) {
         try { prec = await env.LEADS.get(pkey, { type: 'json' }); } catch (e) {}
         // Pack APP (APP-03 M3): a re-registration inside 5 minutes writes
         // nothing — the bridge re-posts on token refresh and on app
-        // resume, and each write burns the account's daily KV budget.
-        if (prec && typeof prec.lastSeen === 'number' && pnow - prec.lastSeen < 300000) return json({ ok: true }, 200, origin);
+        // launch/resume, and each write burns the account's daily KV
+        // budget. Pack APP2: the skip covers an UNCHANGED re-registration
+        // only — a platform or lang change inside the window still
+        // writes (the verify round caught the skip silently dropping a
+        // lang change).
+        if (prec && typeof prec.lastSeen === 'number' && pnow - prec.lastSeen < 300000 && prec.platform === pplatform && prec.lang === plang) return json({ ok: true }, 200, origin);
+        // Pack APP2 (APP-03 M1 close condition): a GLOBAL daily cap on
+        // NEW records. The limited() check above is a per-isolate
+        // in-memory window, so a rotating-IP writer could grow the LEADS
+        // namespace (which also holds the real leads) without bound; a
+        // WAF rule cannot cover the workers.dev route, so the cap lives
+        // here: one KV counter per UTC day, counted ONLY when the
+        // token's hash has no stored record — refreshes of existing
+        // tokens are never counted and never capped. 500/day is orders
+        // above any plausible organic registrations before the apps
+        // even ship. The counter increments before the put, so a failed
+        // put over-counts by one — fail-closed by design. (A failed
+        // record read above lands here too: prec is null, so the write
+        // counts against the cap rather than bypassing it.)
+        if (!prec) {
+          const capKey = 'app:pushcap:' + new Date(pnow).toISOString().slice(0, 10);
+          let capN = 0;
+          try { capN = parseInt((await env.LEADS.get(capKey)) || '0', 10) || 0; } catch (e) {}
+          if (capN >= 500) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+          try { await env.LEADS.put(capKey, String(capN + 1), { expirationTtl: 259200 }); } catch (e) {}
+        }
         // Pack APP (APP-03 H1/M1/M3): the token rides in the VALUE (the
         // send side reads it back on plug-in day); a 270-day TTL,
         // refreshed by every write, reaps tokens from uninstalled apps;
