@@ -1675,6 +1675,10 @@ let customSlim = [];
 let deletedSeedMls = [];
 let customCatalogAt = 0;
 let catalogRefreshing = null;
+// Pack PK2 (PK-verify E1): when the last refresh attempt FAILED, so
+// ensureCatalog's forced retry can honour the failure backoff
+// instead of force-retrying on every request during an outage.
+let catalogFailedAt = 0;
 // Pack PK (supp3 C2): the newest catalog-data timestamp this isolate
 // has seen or applied (snapshot `at`, rebuild time, or a local
 // mutation). A snapshot OLDER than this is an eventual-consistency
@@ -1690,9 +1694,11 @@ async function refreshCustomCatalog(env, force) {
   mine = (async function () {
     try {
       await doRefreshCustomCatalog(env);
+      catalogFailedAt = 0;
     } catch (e) {
       console.error('catalog refresh failed', e && e.message);
       customCatalogAt = Date.now() - 90000;
+      catalogFailedAt = Date.now(); // Pack PK2 (E1): the failure instant ensureCatalog's backoff reads
     } finally {
       if (catalogRefreshing === mine) catalogRefreshing = null;
     }
@@ -1706,8 +1712,22 @@ async function refreshCustomCatalog(env, force) {
 // isolate never silently serves the seed-only catalog as if it were
 // the whole supply. Callers still check catalogIsFresh() afterwards
 // and label the payload when freshness cannot be proven.
+// Pack PK2 (PK-verify E1): the force must not bypass the two
+// safeguards refreshCustomCatalog itself carries — a refresh
+// already in flight is awaited (never duplicated), and a refresh
+// that failed moments ago is not retried until the ~30s grace the
+// failure backoff grants has passed; during an outage every
+// request otherwise paid a full failing refresh, and the payload
+// labelling (not another attempt) is what carries the honesty.
 async function ensureCatalog(env) {
-  if (!catalogIsFresh()) { try { await refreshCustomCatalog(env, true); } catch (e) {} }
+  if (catalogIsFresh()) return;
+  if (catalogRefreshing) {
+    try { await catalogRefreshing; } catch (e) {}
+    if (catalogIsFresh()) return;
+    if (catalogRefreshing) return; // a newer refresh is already running — ride it, never stack a forced one
+  }
+  if (catalogFailedAt && Date.now() - catalogFailedAt < 30000) return;
+  try { await refreshCustomCatalog(env, true); } catch (e) {}
 }
 // refreshCustomCatalog returns no status (its contract is the reviewed
 // one), so freshness is read off its timestamp: a successful refresh
@@ -4514,7 +4534,13 @@ async function puEvaluateRules(env, autoCtx) {
           const target = dedupeTarget || (viewing ? 'viewing:' + viewing.id : (lead.id || normEmail(lead.email || '')));
           const tid = 'rt-' + (await sha256hex(rule.id + '|' + target)).slice(0, 32);
           let existing = null;
-          try { existing = await ckv.get('task:' + tid, { type: 'json' }); } catch (e) {}
+          // Pack PK2 (PK-verify W1): a failed task READ is a failed
+          // action, never "no task exists". The old empty catch
+          // turned a KV error into existing=null, and the put below
+          // then wrote a fresh done:false task OVER a completed or
+          // owner-edited one. Throwing lands the action in failed[]
+          // — the target stays un-fired and retries on a later run.
+          try { existing = await ckv.get('task:' + tid, { type: 'json' }); } catch (e) { throw new Error('task_read_failed'); }
           if (!existing) {
             const dd = (a.dueDays === undefined ? 1 : a.dueDays);
             await ckv.put('task:' + tid, JSON.stringify({ id: tid, email: lead.email || '', text: (a.text || 'Follow up') + ' — ' + (lead.name || lead.email || ''), due: addDaysYmd(today, dd), done: false, created_at: new Date().toISOString(), rule: rule.id }));
@@ -9435,10 +9461,15 @@ async function handleRequest(request, env, ctx) {
         const clean = [];
         const seenIds = new Set();
         let rejected = 0;
+        // Pack PK2 (PK-verify S5): duplicate ids are still
+        // regenerated, but no longer SILENTLY — each regeneration
+        // is reported in the PUT response, so the caller can see
+        // its rule came back wearing a different id.
+        const regenerated = [];
         for (const r of d.rules.slice(0, 50)) {
           const c = puCleanRule(r);
           if (!c) { rejected++; continue; }
-          if (seenIds.has(c.id)) c.id = 'rule_' + randHex(6);
+          if (seenIds.has(c.id)) { const fromId = c.id; c.id = 'rule_' + randHex(6); regenerated.push({ from: fromId, to: c.id }); }
           seenIds.add(c.id);
           clean.push(c);
         }
@@ -9452,7 +9483,16 @@ async function handleRequest(request, env, ctx) {
         // reads the stored config exactly once for all three guards
         // below.)
         let cur = null;
-        try { cur = await env.LEADS.get('cfg:rules', { type: 'json' }); } catch (e) {}
+        // Pack PK2 (PK-verify S2): a read ERROR is not a missing
+        // config. The old empty catch left cur=null on any KV
+        // failure, which skipped every guard below (base, 409,
+        // confirmEmpty) AND emptied storedById — each already-
+        // enabled rule then looked newly enabled, took a fresh
+        // enabledAt stamp, and the engine baselined away events
+        // that should have fired. Fail closed with a 503; only a
+        // genuine null (no stored config) takes the unversioned
+        // first-save path below.
+        try { cur = await env.LEADS.get('cfg:rules', { type: 'json' }); } catch (e) { return json({ ok: false, error: 'rules_unavailable' }, 503, origin); }
         // The base is required whenever the stored config carries a
         // version. An UNVERSIONED config (written before versioning
         // existed, or seeded directly) accepts this save — which
@@ -9485,7 +9525,18 @@ async function handleRequest(request, env, ctx) {
         }
         const updatedAt = new Date().toISOString();
         await env.LEADS.put('cfg:rules', JSON.stringify({ rules: clean, updatedAt: updatedAt }));
-        return json({ ok: true, rules: clean, rejected: rejected, updatedAt: updatedAt }, 200, origin);
+        // Pack PK2 (PK-verify S8, cheap form): config CHANGES get
+        // an audit trail too (rule FIRES already land in rulelog).
+        // A capped append-only list under 'rulecfglog'. The append
+        // never fails the save: a read error skips it (history is
+        // never truncated to a lone entry), a write error is logged.
+        try {
+          const prevLog = await env.LEADS.get('rulecfglog', { type: 'json' });
+          const cfgLog = Array.isArray(prevLog) ? prevLog : [];
+          cfgLog.push({ at: updatedAt, rules: clean.length, rejected: rejected });
+          await env.LEADS.put('rulecfglog', JSON.stringify(cfgLog.slice(-50)));
+        } catch (e) { console.error('rules PUT: rulecfglog append failed: ' + (e && e.message || e)); }
+        return json({ ok: true, rules: clean, rejected: rejected, regenerated: regenerated, updatedAt: updatedAt }, 200, origin);
       }
       if (path === '/api/admin/rules/log' && request.method === 'GET') {
         // Pack PK (supp2 S10/S11): this handler used to fail OPEN —
