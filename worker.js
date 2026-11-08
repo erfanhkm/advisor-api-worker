@@ -5118,7 +5118,13 @@ async function brainCfg(env) {
     predHot: (function () { const n = parseInt(b.predHot, 10); return isFinite(n) ? Math.max(1, Math.min(101, n)) : 70; })(),
     predWarm: (function () { const n = parseInt(b.predWarm, 10); return isFinite(n) ? Math.max(0, Math.min(101, n)) : 40; })(),
     predSilenceContacted: (function () { const n = parseInt(b.predSilenceContacted, 10); return isFinite(n) ? Math.max(0, Math.min(365, n)) : 7; })(),
-    predSilenceNew: (function () { const n = parseInt(b.predSilenceNew, 10); return isFinite(n) ? Math.max(0, Math.min(365, n)) : 4; })()
+    predSilenceNew: (function () { const n = parseInt(b.predSilenceNew, 10); return isFinite(n) ? Math.max(0, Math.min(365, n)) : 4; })(),
+    // Pack PM6 (PB2-07d S8): the per-plan provider-call budget for
+    // agent mode. Heavy steps are charged their estimated provider
+    // calls (see brainPlanStepCost); a step that would take the plan
+    // over this budget is refused in the trace, never half-run. 0 is
+    // a valid kill switch for heavy steps. Default 16.
+    planCallCap: (function () { const n = parseInt(b.planCallCap, 10); return isFinite(n) ? Math.max(0, Math.min(200, n)) : 16; })()
   };
 }
 function brainPaidHints(cfg) {
@@ -5310,10 +5316,14 @@ async function brainLeadLang(env, lead) {
 /* A short, warm, ready-to-review message from Erfan in the lead's
    language. Returns {text, via, lang} or null. The text is only ever
    queued as HELD mail or stored as a draft — never sent from here. */
-async function brainDraftText(env, lead, purpose, langOverride) {
+async function brainDraftText(env, lead, purpose, langOverride, preStyle) {
   await brainLeadCtxMerge(env, lead); // Pack PM3 (N6): memory merged at read
   const lang = (langOverride && BRAIN_LANG_NAMES[langOverride]) ? langOverride : await brainLeadLang(env, lead);
-  const style = await brainStyleBlock(env); // Portal Brain 2: learned style + preferences
+  /* Pack PM6 (PB2-03 S7): a caller running a LOOP (the follow-up
+     drafting cron) may pass the run's style block in — the block is
+     global, not per-lead, and re-reading it (cfg + pairs + prefs)
+     for every lead in the loop was pure waste. */
+  const style = (typeof preStyle === 'string') ? preStyle : await brainStyleBlock(env); // Portal Brain 2: learned style + preferences
   const sys = 'You write short follow-up messages for a real-estate advisor named Erfan in British Columbia, Canada. Write the message in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Warm, professional, 60-110 words, first person as Erfan, no placeholders, no signature block beyond "Erfan". ' + BRAIN_GROUND + style;
   const ctxJson = JSON.stringify(brainLeadCtx(lead));
   const w = await brainWithCritic(env, { task: 'draft', system: sys, prompt: 'Purpose: ' + purpose + '\nLead data (JSON):\n' + ctxJson, maxTokens: 600, ctxJson: ctxJson });
@@ -5392,24 +5402,39 @@ async function brainFollowupDrafts(env) {
   const f = await buildFollowups(env);
   const today = todayVancouver();
   const items = [].concat(f.newLeads || [], f.staleLeads || [], f.postViewing || []);
+  /* Pack PM6 (PB2-05 S6): the drafting loop now runs under its OWN
+     KV op budget, like the rules engine and the alerts/reminders
+     runners already do. It runs last in the automation chain, after
+     predictions; an unbudgeted loop at scale spends the invocation's
+     remaining ops and dies mid-lead instead of stopping cleanly.
+     The worklist computation above stays OUTSIDE the budget (it is
+     shared desk data); the budget bounds the per-lead drafting ops
+     (reads, the writer/critic chain's accounting writes, the held
+     mail queueing). A spent budget stops the loop with partial:true
+     — undrafted leads are simply picked up by the next run. The
+     style block is also hoisted to once per run (PB2-03 S7). */
+  const benv = countKvEnv(env, 100);
+  const runStyle = await brainStyleBlock(benv);
   for (const it of items) {
     if (out.made >= 5) break;
-    const lead = await env.LEADS.get('lead:' + it.id, { type: 'json' });
+    if (kvLeft(benv) <= 0) { out.partial = true; break; }
+    const lead = await benv.LEADS.get('lead:' + it.id, { type: 'json' });
     if (!lead || !lead.email) { out.skipped++; continue; }
     /* Pack PM3 (PB2-03R N6): the cached draft lives under its OWN key —
        the loop used to PUT the whole lead record back after a long
        writer+critic chain, reverting anything Erfan changed meanwhile. */
-    const ownDraft = await env.LEADS.get('lead:' + it.id + ':aidraft', { type: 'json' });
+    const ownDraft = await benv.LEADS.get('lead:' + it.id + ':aidraft', { type: 'json' });
     if ((ownDraft && ownDraft.date === today) || (lead.aiDraft && lead.aiDraft.date === today)) { out.skipped++; continue; }
-    if (await isBanned(env, lead.email)) { out.skipped++; continue; }
+    if (await isBanned(benv, lead.email)) { out.skipped++; continue; }
+    if (kvLeft(benv) <= 0) { out.partial = true; break; }
     const purpose = it.viewingDate ? ('Follow-up after their viewing on ' + it.viewingDate + ': ask for feedback and agree the next step.') : 'Follow-up with a lead who has not been contacted yet (or has gone quiet): re-open the conversation and offer a concrete next step.';
-    const d = await brainDraftText(env, lead, purpose);
+    const d = await brainDraftText(benv, lead, purpose, undefined, runStyle);
     if (!d) { out.skipped++; continue; }
     const draftRec = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, compliance: d.compliance || [], at: new Date().toISOString(), date: today };
     let midF = null;
-    try { midF = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
+    try { midF = await queueMail(benv, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
     if (midF) draftRec.mailId = midF; // Portal Brain 2: lets the portal edit THIS held draft (style learning)
-    await env.LEADS.put('lead:' + it.id + ':aidraft', JSON.stringify(draftRec));
+    await benv.LEADS.put('lead:' + it.id + ':aidraft', JSON.stringify(draftRec));
     out.made++;
   }
   return out;
@@ -5480,17 +5505,32 @@ async function brainCopyGenerate(env, mls) {
   const style = await brainPrefsBlock(env);
   const langs = {};
   const critics = {};
+  const failed = {};
   let via = '';
-  for (const lg of brainLangs()) {
+  /* Pack PM6 (PB2-03 S7): the languages generate IN PARALLEL and a
+     failed language no longer sinks the whole run — the old sequential
+     loop returned {ok:false} on the first failure and stored nothing,
+     so one slow/dead provider variant cost Erfan every language. Each
+     language's result (or failure) is now recorded on its own; the
+     record carries `failed` so the portal can name the missing ones. */
+  const perLang = await Promise.all(brainLangs().map(async function (lg) {
     const sys = 'You write marketing copy for a real-estate listing. Write ONE polished listing description (120-180 words) in ' + (BRAIN_LANG_NAMES[lg] || 'English') + ' from the specs given. ' + BRAIN_GROUND + ' Never invent amenities, features, schools or figures that are not in the specs.' + style;
-    const w = await brainWithCritic(env, { task: 'copy', system: sys, prompt: 'Listing specs (JSON):\n' + JSON.stringify(specs), maxTokens: 550, ctxJson: JSON.stringify(specs) });
-    if (!w.ok) return { ok: false, error: w.error };
-    langs[lg] = String(w.text).trim().slice(0, 2400);
-    critics[lg] = w.critic;
-    via = w.via || via;
+    try {
+      const w = await brainWithCritic(env, { task: 'copy', system: sys, prompt: 'Listing specs (JSON):\n' + JSON.stringify(specs), maxTokens: 550, ctxJson: JSON.stringify(specs) });
+      if (!w.ok) return { lg: lg, error: w.error || 'ai' };
+      return { lg: lg, text: String(w.text).trim().slice(0, 2400), critic: w.critic, via: w.via || '' };
+    } catch (e) { return { lg: lg, error: 'failed' }; }
+  }));
+  for (const pl of perLang) {
+    if (pl.error) { failed[pl.lg] = pl.error; continue; }
+    langs[pl.lg] = pl.text;
+    critics[pl.lg] = pl.critic;
+    via = pl.via || via;
   }
+  if (!Object.keys(langs).length) return { ok: false, error: (perLang[0] && perLang[0].error) || 'ai' };
   const worst = Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'flagged'; }) ? 'flagged' : (Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'revised'; }) ? 'revised' : 'passed');
   const rec = { mls: mls, langs: langs, at: new Date().toISOString(), via: via, critic: { status: worst, perLang: critics } };
+  if (Object.keys(failed).length) rec.failed = failed;
   /* Pack PM3 (PB2-04b M4): never overwrite Erfan's hand edits — if the
      stored record carries editedAt, the regeneration lands in
      aicopy:<mls>:proposed and waits for an explicit portal accept. One
@@ -5499,11 +5539,11 @@ async function brainCopyGenerate(env, mls) {
   if (existing && existing.editedAt) {
     try { await env.LEADS.put('aicopy:' + mls + ':prev', JSON.stringify(existing)); } catch (e) {}
     await env.LEADS.put('aicopy:' + mls + ':proposed', JSON.stringify(rec));
-    return { ok: true, copy: rec, proposed: true, keptEdited: true };
+    return { ok: true, copy: rec, proposed: true, keptEdited: true, partial: !!rec.failed, failedLangs: rec.failed ? Object.keys(rec.failed) : [] };
   }
   if (existing) { try { await env.LEADS.put('aicopy:' + mls + ':prev', JSON.stringify(existing)); } catch (e) {} }
   await env.LEADS.put('aicopy:' + mls, JSON.stringify(rec));
-  return { ok: true, copy: rec };
+  return { ok: true, copy: rec, partial: !!rec.failed, failedLangs: rec.failed ? Object.keys(rec.failed) : [] };
 }
 /* AI file summary (feature 6): the portal extracts the text locally
    and posts it here; the structured key-facts land on the file record
@@ -5545,9 +5585,25 @@ async function brainShowingBrief(env, q) {
     if (!lead) return { ok: false, error: 'not_found', status: 404 };
     if (lead.email) {
       const vidxB = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-      for (const vid of vidxB.slice(0, 200)) {
-        const v = await env.LEADS.get('viewing:' + vid, { type: 'json' });
-        if (v && normEmail(v.email || '') === normEmail(lead.email) && (!mls || v.listingId === mls) && v.status !== 'cancelled') { viewing = v; viewingKey = 'viewing:' + vid; mls = v.listingId || mls; break; }
+      /* Pack PM6 (PB2-04b S3): the match scan no longer walks up to
+         200 vidx entries with a sequential KV get each — the records
+         are bulk-fetched in chunks of 100 (the PM5 pattern, per-key
+         fallback) and the FIRST match in vidx order still wins. vidx
+         is newest-first since Pack E, so the cap covers the newest
+         viewings; the S3 "busy accounts miss new viewings" half was
+         closed by that ordering, this closes the sequential cost. */
+      const takeB = vidxB.slice(0, 200);
+      const vrecsB = [];
+      for (let ci = 0; ci < takeB.length; ci += 100) {
+        const chunkB = takeB.slice(ci, ci + 100);
+        let gotB = null;
+        try { const rb = await env.LEADS.get(chunkB.map(function (id) { return 'viewing:' + id; }), { type: 'json' }); if (rb && typeof rb.get === 'function') gotB = rb; } catch (e) {}
+        if (gotB) { for (const id of chunkB) vrecsB.push(gotB.get('viewing:' + id) || null); }
+        else { for (const id of chunkB) { try { vrecsB.push(await env.LEADS.get('viewing:' + id, { type: 'json' })); } catch (e) { vrecsB.push(null); } } }
+      }
+      for (let vi = 0; vi < takeB.length; vi++) {
+        const v = vrecsB[vi];
+        if (v && normEmail(v.email || '') === normEmail(lead.email) && (!mls || v.listingId === mls) && v.status !== 'cancelled') { viewing = v; viewingKey = 'viewing:' + takeB[vi]; mls = v.listingId || mls; break; }
       }
     }
   }
@@ -5702,6 +5758,20 @@ async function brainExecIntent(env, intent) {
   }
   return { action: action, ok: false, error: 'rejected' };
 }
+/* Pack PM6 (PB2-07d S8): estimated provider calls for one plan step.
+   The writer+critic chains dominate: a draft or a prepared email is
+   up to 4 calls (write, critic, revision, critic); listing copy is
+   write+critic per language on the typical path; research is a search
+   plus one call; a showing brief is one call. Everything else is
+   KV-only and charged 0. */
+function brainPlanStepCost(st) {
+  const a = String((st && st.action) || '');
+  if (a === 'draft_message' || a === 'prepare_email') return 4;
+  if (a === 'update_listing_copy_draft') return 2 * brainLangs().length;
+  if (a === 'research') return 2;
+  if (a === 'create_viewing_brief') return 1;
+  return 0;
+}
 async function brainChat(env, body) {
   const lang = body && body.lang === 'en' ? 'en' : 'fa';
   const hist = (body && Array.isArray(body.messages) ? body.messages : []).slice(-8)
@@ -5735,11 +5805,41 @@ async function brainChat(env, body) {
     if (!Array.isArray(steps) || !steps.length) { executed.push({ step: 1, action: 'unknown', ok: false, error: 'rejected' }); }
     else {
       const planSteps = steps.slice(0, 4);
+      /* Pack PM6 (PB2-07d S8 + PB2-04aR S5): a per-plan provider-call
+         budget and heavy-step dedupe. A 4-lead plan used to cost ~16
+         provider calls with nothing counting them, and identical
+         heavy steps ran twice. Cost-bearing steps are charged BEFORE
+         they run (brainPlanStepCost vs cfg:brain.planCallCap, default
+         16): a step that would overrun the budget, an exact repeat of
+         a cost-bearing step, or a second copy step is refused in the
+         trace ('plan_budget' / 'duplicate') and the plan CONTINUES —
+         a refusal is not a step failure, nothing was attempted.
+         Zero-cost steps are never refused here: the executor's own
+         idempotence (PM1) already dedupes them honestly. */
+      const planCfg = await brainCfg(env);
+      let planSpent = 0;
+      const seenHeavy = {};
+      let copySeen = false;
       for (let si = 0; si < planSteps.length; si++) {
         const st = planSteps[si] || {};
+        const cost = brainPlanStepCost(st);
+        let refuse = '';
+        if (cost > 0) {
+          const sig = String(st.action || '') + '|' + JSON.stringify(st.params || {});
+          if (seenHeavy[sig] || (st.action === 'update_listing_copy_draft' && copySeen)) refuse = 'duplicate';
+          else if (planSpent + cost > planCfg.planCallCap) refuse = 'plan_budget';
+          if (!refuse) { seenHeavy[sig] = true; if (st.action === 'update_listing_copy_draft') copySeen = true; planSpent += cost; }
+        }
+        if (refuse) {
+          const rres = { step: si + 1, action: String(st.action || ''), ok: false, error: refuse, charged: 0 };
+          executed.push(rres);
+          try { await puAttentionAdd(env, 'brain-agent', '🧠 Agent step ' + (si + 1) + '/' + planSteps.length + ': ' + (rres.action || '?') + ' → SKIPPED (' + refuse + ')', ''); } catch (e) {}
+          continue;
+        }
         let res = null;
         try { res = await brainExecIntent2(env, st); } catch (e) { res = { action: String(st.action || ''), ok: false, error: 'failed' }; }
         res = Object.assign({ step: si + 1 }, res);
+        if (cost > 0) res.charged = cost;
         executed.push(res);
         try { await puAttentionAdd(env, 'brain-agent', '🧠 Agent step ' + (si + 1) + '/' + planSteps.length + ': ' + (res.action || '?') + ' → ' + (res.ok ? 'done' : 'FAILED (' + (res.error || 'error') + ')'), (res.leadId || res.contactRef || '')); } catch (e) {}
         if (!res.ok) {
@@ -6003,7 +6103,7 @@ async function brainExecIntent2(env, intent) {
     if (!mls || !puRichListing(mls)) return { action: action, ok: false, error: 'not_found' };
     const out = await brainCopyGenerate(env, mls);
     if (!out.ok) return { action: action, ok: false, error: out.error };
-    return { action: action, ok: true, mls: mls, draft: true, proposed: !!out.proposed, critic: out.copy.critic || null };
+    return { action: action, ok: true, mls: mls, draft: true, proposed: !!out.proposed, critic: out.copy.critic || null, partial: !!out.partial, failedLangs: out.failedLangs || [] };
   }
   if (action === 'create_viewing_brief') {
     const out = await brainShowingBrief(env, { viewingId: String(params.viewingId || '').slice(0, 64), mls: String(params.mls || '').slice(0, 40), leadId: String(params.leadId || '').slice(0, 64), fresh: true });
