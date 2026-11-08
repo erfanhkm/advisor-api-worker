@@ -5177,7 +5177,7 @@ function brainJson(text) {
   return null;
 }
 function brainStr(v, max) { return typeof v === 'string' ? v.trim().slice(0, max) : (typeof v === 'number' ? String(v).slice(0, max) : ''); }
-function chatRefOf(d) { const s = String((d && d.chatRef) || ''); return /^[A-Za-z0-9_-]{8,64}$/.test(s) ? s : ''; } // Portal Brain 2: validated site-chat session ref from an intake payload ('' = none)
+function chatRefOf(d) { return ''; } // PB2-08 §D (2026-11-07): body.chatRef is client-supplied and UNVERIFIED — no server-issued ref exists until the signed bridge scheme (post-licensing activation), so intake IGNORES it entirely: never stored, never consumed (the triage chat-summary fetch at brainTriage keys off this value, so it can no longer fire for any new record). Was: format-validated passthrough (/^[A-Za-z0-9_-]{8,64}$/ on d.chatRef).
 function brainLangs() {
   const base = ['en', 'fa', 'hi', 'zh'];
   if (validLang('es') === 'es') base.push('es'); // Spanish joins automatically if the worker language set grows
