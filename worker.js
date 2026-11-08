@@ -1996,9 +1996,19 @@ async function queueMail(env, item, opts) {
     // as "doesn't exist" — that could overwrite a record the sender
     // already marked sent. The error propagates to the caller.
     const exists = await env.LEADS.get(mkey);
+    /* Pack PM3 (gap #23): an existing keyed record still returns null —
+       that IS the dedupe signal the executor/follow-up callers report
+       as already_queued (PU2/PackK pins). The gap in the old code was
+       that callers needing the handle had no way to name the record:
+       the id is deterministic ('k-' + sha256(key).slice(0,40)), and the
+       triage caller now derives + stamps it (see below). The record
+       itself is never replaced here. */
     if (exists) return null;
     const rec = Object.assign({}, item, { id: hid, key: opts.key, created_at: new Date().toISOString(), queuedAt: Date.now(), sent: false });
-    await env.LEADS.put(mkey, JSON.stringify(rec), opts.ttl ? { expirationTtl: opts.ttl } : undefined);
+    /* Pack PM3 (gap #23): keyed mail expires on the same per-kind TTL as
+       unkeyed mail unless the caller pins one — a keyed record used to
+       live forever, silently blocking its key for all time. */
+    await env.LEADS.put(mkey, JSON.stringify(rec), { expirationTtl: opts.ttl || MAIL_TTL_BY_KIND[item && item.kind] || MAIL_TTL_DEFAULT });
     await idxAdd(env, 'mailq', hid);
     return hid;
   }
@@ -3519,7 +3529,11 @@ async function buildFollowups(env) {
     const ageUnknown = !(ts > 0); // NaN (or epoch) parse: age is unknowable, never "0h"
     const item = { id: l.id, name: l.name || '', email: l.email || '', phone: l.phone || '', intent: l.intent || '', source: l.source || '', created_at: l.created_at || '', ageHours: ageUnknown ? null : Math.max(0, Math.floor((now - ts) / 3600000)), stageAt: l.stageAt || null };
     if (ageUnknown) item.ageUnknown = true;
-    if (l.aiDraft && l.aiDraft.text) item.aiDraft = { text: l.aiDraft.text, lang: l.aiDraft.lang || '', at: l.aiDraft.at || '', via: l.aiDraft.via || '', critic: l.aiDraft.critic || null, mailId: l.aiDraft.mailId || '' }; // portal brain: cached follow-up draft rides along (+ Brain 2 critic badge)
+    /* Pack PM3 (PB2-03R N6): the follow-up draft is merged from its own
+       key at read; the on-record copy is only a legacy fallback. */
+    let aiDr = l.aiDraft || null;
+    try { const own = await env.LEADS.get('lead:' + lid + ':aidraft', { type: 'json' }); if (own && own.text) aiDr = own; } catch (e) {}
+    if (aiDr && aiDr.text) item.aiDraft = { text: aiDr.text, lang: aiDr.lang || '', at: aiDr.at || '', via: aiDr.via || '', critic: aiDr.critic || null, mailId: aiDr.mailId || '' }; // portal brain: cached follow-up draft rides along (+ Brain 2 critic badge)
     // Pack E (R-03 N3): a missing/unknown stage defaults to 'new' — such
     // leads used to appear in NO list at all (invisible work).
     const stage = STAGES.indexOf(l.stage) !== -1 ? l.stage : 'new';
@@ -5240,6 +5254,13 @@ function brainLangs() {
   if (validLang('es') === 'es') base.push('es'); // Spanish joins automatically if the worker language set grows
   return base;
 }
+/* Pack PM3 (PB2-03R N6): merge the rolling memory into a lead object
+   IN MEMORY for prompt building — never persisted back to the record. */
+async function brainLeadCtxMerge(env, lead) {
+  if (!lead || !lead.id) return lead;
+  try { const mem = await env.LEADS.get('brain:mem:lead:' + lead.id, { type: 'json' }); if (mem && mem.summary) lead.brainSummary = mem.summary; } catch (e) {}
+  return lead;
+}
 /* Bounded, PII-minimised lead summary for prompts: no email, no phone. */
 function brainLeadCtx(l) {
   if (!l) return null;
@@ -5264,6 +5285,7 @@ async function brainLeadLang(env, lead) {
    language. Returns {text, via, lang} or null. The text is only ever
    queued as HELD mail or stored as a draft — never sent from here. */
 async function brainDraftText(env, lead, purpose, langOverride) {
+  await brainLeadCtxMerge(env, lead); // Pack PM3 (N6): memory merged at read
   const lang = (langOverride && BRAIN_LANG_NAMES[langOverride]) ? langOverride : await brainLeadLang(env, lead);
   const style = await brainStyleBlock(env); // Portal Brain 2: learned style + preferences
   const sys = 'You write short follow-up messages for a real-estate advisor named Erfan in British Columbia, Canada. Write the message in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Warm, professional, 60-110 words, first person as Erfan, no placeholders, no signature block beyond "Erfan". ' + BRAIN_GROUND + style;
@@ -5321,7 +5343,7 @@ async function brainTriageLead(env, leadId) {
         const ovr = (fresh.ai.lang && fresh.ai.langConf >= 0.5 && BRAIN_LANG_NAMES[fresh.ai.lang]) ? fresh.ai.lang : '';
         const d = await brainDraftText(env, fresh, 'First reply to a new enquiry: thank them, confirm what they are looking for, and offer the natural next step (a call or a viewing).', ovr);
         await brainMemoryRefresh(env, leadId, 'triage');
-        if (d) await queueMail(env, { kind: 'followup', to: fresh.email, lang: d.lang, name: fresh.name || '', ref: leadId, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'triage:' + leadId });
+        if (d) { const midT = await queueMail(env, { kind: 'followup', to: fresh.email, lang: d.lang, name: fresh.name || '', ref: leadId, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'triage:' + leadId }); const hidT = midT || ('k-' + (await sha256hex('triage:' + leadId)).slice(0, 40)); const again2 = await env.LEADS.get('lead:' + leadId, { type: 'json' }); if (again2 && again2.triageMailId !== hidT) { again2.triageMailId = hidT; await env.LEADS.put('lead:' + leadId, JSON.stringify(again2)); } }
       }
     } catch (e) {}
   } catch (e) {}
@@ -5342,16 +5364,20 @@ async function brainFollowupDrafts(env) {
     if (out.made >= 5) break;
     const lead = await env.LEADS.get('lead:' + it.id, { type: 'json' });
     if (!lead || !lead.email) { out.skipped++; continue; }
-    if (lead.aiDraft && lead.aiDraft.date === today) { out.skipped++; continue; }
+    /* Pack PM3 (PB2-03R N6): the cached draft lives under its OWN key —
+       the loop used to PUT the whole lead record back after a long
+       writer+critic chain, reverting anything Erfan changed meanwhile. */
+    const ownDraft = await env.LEADS.get('lead:' + it.id + ':aidraft', { type: 'json' });
+    if ((ownDraft && ownDraft.date === today) || (lead.aiDraft && lead.aiDraft.date === today)) { out.skipped++; continue; }
     if (await isBanned(env, lead.email)) { out.skipped++; continue; }
     const purpose = it.viewingDate ? ('Follow-up after their viewing on ' + it.viewingDate + ': ask for feedback and agree the next step.') : 'Follow-up with a lead who has not been contacted yet (or has gone quiet): re-open the conversation and offer a concrete next step.';
     const d = await brainDraftText(env, lead, purpose);
     if (!d) { out.skipped++; continue; }
-    lead.aiDraft = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, at: new Date().toISOString(), date: today };
+    const draftRec = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, at: new Date().toISOString(), date: today };
     let midF = null;
     try { midF = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
-    if (midF) lead.aiDraft.mailId = midF; // Portal Brain 2: lets the portal edit THIS held draft (style learning)
-    await env.LEADS.put('lead:' + it.id, JSON.stringify(lead));
+    if (midF) draftRec.mailId = midF; // Portal Brain 2: lets the portal edit THIS held draft (style learning)
+    await env.LEADS.put('lead:' + it.id + ':aidraft', JSON.stringify(draftRec));
     out.made++;
   }
   return out;
@@ -5429,6 +5455,17 @@ async function brainCopyGenerate(env, mls) {
   }
   const worst = Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'flagged'; }) ? 'flagged' : (Object.keys(critics).some(function (k) { return critics[k] && critics[k].status === 'revised'; }) ? 'revised' : 'passed');
   const rec = { mls: mls, langs: langs, at: new Date().toISOString(), via: via, critic: { status: worst, perLang: critics } };
+  /* Pack PM3 (PB2-04b M4): never overwrite Erfan's hand edits — if the
+     stored record carries editedAt, the regeneration lands in
+     aicopy:<mls>:proposed and waits for an explicit portal accept. One
+     previous version is kept either way (aicopy:<mls>:prev). */
+  const existing = await env.LEADS.get('aicopy:' + mls, { type: 'json' });
+  if (existing && existing.editedAt) {
+    try { await env.LEADS.put('aicopy:' + mls + ':prev', JSON.stringify(existing)); } catch (e) {}
+    await env.LEADS.put('aicopy:' + mls + ':proposed', JSON.stringify(rec));
+    return { ok: true, copy: rec, proposed: true, keptEdited: true };
+  }
+  if (existing) { try { await env.LEADS.put('aicopy:' + mls + ':prev', JSON.stringify(existing)); } catch (e) {} }
   await env.LEADS.put('aicopy:' + mls, JSON.stringify(rec));
   return { ok: true, copy: rec };
 }
@@ -5457,9 +5494,10 @@ async function brainFileSummary(env, fileId, text) {
    on the viewing record for 24h. The portal may attach it to the
    handbook flow as an INTERNAL notes page — never client copy. */
 async function brainShowingBrief(env, q) {
-  let viewing = null, lead = null, mls = String(q.mls || '').slice(0, 40);
+  let viewing = null, lead = null, mls = String(q.mls || '').slice(0, 40), viewingKey = '';
   if (q.viewingId) {
-    viewing = await env.LEADS.get('viewing:' + String(q.viewingId).slice(0, 64), { type: 'json' });
+    viewingKey = 'viewing:' + String(q.viewingId).slice(0, 64); // Pack PM3 (PB2-04b S4): key from the READ key, never from the record body
+    viewing = await env.LEADS.get(viewingKey, { type: 'json' });
     if (!viewing) return { ok: false, error: 'not_found', status: 404 };
     mls = viewing.listingId || mls;
     if (viewing.email) {
@@ -5473,16 +5511,23 @@ async function brainShowingBrief(env, q) {
       const vidxB = (await env.LEADS.get('vidx', { type: 'json' })) || [];
       for (const vid of vidxB.slice(0, 200)) {
         const v = await env.LEADS.get('viewing:' + vid, { type: 'json' });
-        if (v && normEmail(v.email || '') === normEmail(lead.email) && (!mls || v.listingId === mls) && v.status !== 'cancelled') { viewing = v; mls = v.listingId || mls; break; }
+        if (v && normEmail(v.email || '') === normEmail(lead.email) && (!mls || v.listingId === mls) && v.status !== 'cancelled') { viewing = v; viewingKey = 'viewing:' + vid; mls = v.listingId || mls; break; }
       }
     }
   }
   const h = mls ? puRichListing(mls) : null;
   if (!h) return { ok: false, error: 'not_found', status: 404 };
-  if (viewing && viewing.aiBrief && viewing.aiBrief.at && (Date.now() - Date.parse(viewing.aiBrief.at)) < 86400000 && !q.fresh) {
-    return { ok: true, brief: viewing.aiBrief.brief, via: viewing.aiBrief.via || '', at: viewing.aiBrief.at, cached: true };
+  /* Pack PM3 (PB2-04b M3): the brief lives under its OWN key — the old
+     whole-record put reverted any confirm/cancel that landed during
+     generation. The on-record copy is only a legacy fallback. */
+  let ownBrief = null;
+  if (viewing && viewingKey) { try { ownBrief = await env.LEADS.get(viewingKey + ':aibrief', { type: 'json' }); } catch (e) {} }
+  const cachedBrief = ownBrief || (viewing ? viewing.aiBrief : null);
+  if (viewing && cachedBrief && cachedBrief.at && (Date.now() - Date.parse(cachedBrief.at)) < 86400000 && !q.fresh) {
+    return { ok: true, brief: cachedBrief.brief, via: cachedBrief.via || '', at: cachedBrief.at, cached: true };
   }
   const sm = await puLeadScores(env);
+  if (lead) await brainLeadCtxMerge(env, lead); // Pack PM3 (N6)
   const score = lead ? sm.map[lead.id] : null;
   const hood = puNeighbourhood(h);
   const data = {
@@ -5502,8 +5547,8 @@ async function brainShowingBrief(env, q) {
     propertyNotes: brainStr(p.propertyNotes, 900),
     followUp: brainStr(p.followUp, 300)
   };
-  if (viewing) {
-    try { viewing.aiBrief = { brief: brief, at: new Date().toISOString(), via: r.via || '' }; await env.LEADS.put('viewing:' + viewing.id, JSON.stringify(viewing)); } catch (e) {}
+  if (viewing && viewingKey) {
+    try { await env.LEADS.put(viewingKey + ':aibrief', JSON.stringify({ brief: brief, at: new Date().toISOString(), via: r.via || '' })); } catch (e) {}
   }
   return { ok: true, brief: brief, via: r.via || '', at: new Date().toISOString(), cached: false };
 }
@@ -5695,20 +5740,54 @@ async function brainOutcome(env, entry) {
   try {
     const list = (await env.LEADS.get('brain:outcomes', { type: 'json' })) || [];
     list.unshift(Object.assign({ at: new Date().toISOString() }, entry));
-    await env.LEADS.put('brain:outcomes', JSON.stringify(list.slice(0, 500)));
+    /* Pack PM3 (PB2-04c S3 + PB2-04b S5): age-prune on write (~90 days)
+       — the list is the calibration loop's raw material and used to
+       grow unbounded with no TTL. */
+    const cut = Date.now() - 90 * 86400000;
+    const kept = list.filter(function (o) { const t = Date.parse((o && o.at) || ''); return !isFinite(t) || t >= cut; });
+    await env.LEADS.put('brain:outcomes', JSON.stringify(kept.slice(0, 500)));
+  } catch (e) {}
+}
+/* Pack PM3 (gap #30): score the PREVIOUS prediction run against what
+   actually happened — a stored close band is a hit when the lead has
+   since closed (or reached offer for a high band); a stored low cold
+   risk is a miss when the lead was dropped or went silent 14d+. The
+   aggregate lands in brain:predcheck and is surfaced by brain status +
+   calibration. Honest small numbers beat no instrument at all. */
+async function brainPredCheck(env, sm) {
+  try {
+    const prevMap = (await env.LEADS.get('pred:map', { type: 'json' })) || {};
+    const ids = Object.keys(prevMap);
+    if (!ids.length) return;
+    let closeTotal = 0, closeHits = 0, coldTotal = 0, coldHits = 0, checked = 0;
+    const now = Date.now();
+    for (const id of ids.slice(0, 300)) {
+      const p = prevMap[id]; if (!p) continue;
+      const l = sm.leads.find(function (x) { return x.id === id; });
+      if (!l) continue;
+      checked++;
+      if (p.c === 'high' || p.c === 'medium') { closeTotal++; if (l.stage === 'closed' || (p.c === 'high' && l.stage === 'offer')) closeHits++; }
+      if (p.r === 'low') { coldTotal++; const anchor = Date.parse(l.stageAt || l.created_at || ''); if (!(l.stage === 'dropped' || (isFinite(anchor) && (now - anchor) > 14 * 86400000 && (l.stage === 'new' || l.stage === 'contacted')))) coldHits++; }
+    }
+    if (checked) await env.LEADS.put('brain:predcheck', JSON.stringify({ at: new Date().toISOString(), checked: checked, closeHits: closeHits, closeTotal: closeTotal, coldHits: coldHits, coldTotal: coldTotal }));
   } catch (e) {}
 }
 
 /* ---- style learning + advisor preferences ---- */
 async function brainStylePairs(env) {
-  try { const s = await env.LEADS.get('brain:style', { type: 'json' }); return Array.isArray(s) ? s : []; } catch (e) { return []; }
+  /* Pack PM3 (PB2-03R S8): a read ERROR must not look like an empty
+     store — brainStyleAdd used to overwrite the whole 20-pair history
+     with one pair after a transient failure. Callers that can tolerate
+     emptiness catch; writers must abort on error. */
+  const s = await env.LEADS.get('brain:style', { type: 'json' });
+  return Array.isArray(s) ? s : [];
 }
 async function brainStyleAdd(env, pair) {
   try {
-    const list = await brainStylePairs(env);
+    const list = await brainStylePairs(env); // throws on read error -> abort, history preserved
     list.unshift({ original: String(pair.original || '').slice(0, 1800), final: String(pair.final || '').slice(0, 1800), kind: String(pair.kind || 'draft').slice(0, 30), at: new Date().toISOString() });
     await env.LEADS.put('brain:style', JSON.stringify(list.slice(0, 20)));
-  } catch (e) {}
+  } catch (e) { return; }
   await brainOutcome(env, { type: 'draft_edited', ref: pair.ref || '', kind: pair.kind || 'draft' });
 }
 async function brainPrefs(env) {
@@ -5716,7 +5795,8 @@ async function brainPrefs(env) {
 }
 async function brainStyleBlock(env) {
   const cfg = await brainCfg(env);
-  const pairs = (await brainStylePairs(env)).slice(0, cfg.styleK);
+  let pairsAll = []; try { pairsAll = await brainStylePairs(env); } catch (e) {}
+  const pairs = pairsAll.slice(0, cfg.styleK);
   const prefs = await brainPrefs(env);
   let out = '';
   if (prefs) out += '\nADVISOR PREFERENCES (follow these): ' + prefs;
@@ -5727,17 +5807,26 @@ async function brainStyleBlock(env) {
 /* ---- per-lead rolling memory ---- */
 async function brainMemoryRefresh(env, leadId, why) {
   try {
+    /* Pack PM3 (PB2-03R S7): per-lead cooldown — triage, stage changes
+       and viewing events can fire seconds apart for the same lead; each
+       refresh is a paid LLM call summarising the previous summary. */
+    const cool = await env.LEADS.get('brain:memcool:' + leadId, { type: 'json' });
+    if (cool && cool.at && (Date.now() - Date.parse(cool.at)) < 10 * 60000) return;
     const lead = await env.LEADS.get('lead:' + leadId, { type: 'json' });
     if (!lead) return;
+    try { await env.LEADS.put('brain:memcool:' + leadId, JSON.stringify({ at: new Date().toISOString() }), { expirationTtl: 1800 }); } catch (e) {}
     const prev = await env.LEADS.get('brain:mem:lead:' + leadId, { type: 'json' });
     const sys = 'You maintain a rolling memory summary for a real-estate advisor about ONE lead. Reply with ONLY the updated summary: 2-4 short sentences, facts only (what they want, budget/areas, timeline, last interaction, open threads). Merge the previous summary with the lead data; drop anything the data contradicts. ' + BRAIN_GROUND;
+    if (prev && prev.summary) lead.brainSummary = prev.summary; // in-memory merge (PM3/N6)
     const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Previous summary: ' + ((prev && prev.summary) || '(none)') + '\nEvent: ' + String(why || 'update') + '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 3000), maxTokens: 300 });
     if (!r.ok) return;
     const summary = String(r.text || '').trim().slice(0, 600);
     if (!summary) return;
     await env.LEADS.put('brain:mem:lead:' + leadId, JSON.stringify({ leadId: leadId, name: lead.name || '', summary: summary, events: ((prev && prev.events) || 0) + 1, updatedAt: new Date().toISOString(), why: String(why || '').slice(0, 40) }));
-    const fresh = await env.LEADS.get('lead:' + leadId, { type: 'json' });
-    if (fresh) { fresh.brainSummary = summary; await env.LEADS.put('lead:' + leadId, JSON.stringify(fresh)); }
+    /* Pack PM3 (PB2-03R N6): the summary is NO LONGER mirrored into the
+       lead record — that whole-record put could revert a just-saved
+       stage/note. Prompt builders merge brain:mem at read via
+       brainLeadCtxMerge (in-memory only, never persisted). */
   } catch (e) {}
 }
 
@@ -5813,6 +5902,7 @@ async function brainPrepareEmail(env, params) {
   if (!contact) return { action: 'prepare_email', ok: false, error: 'not_found' };
   if (await isBanned(env, contact.email)) return { action: 'prepare_email', ok: false, error: 'suppressed' };
   const lang = (contact.ai && contact.ai.lang && BRAIN_LANG_NAMES[contact.ai.lang]) ? contact.ai.lang : ((contact.lang && BRAIN_LANG_NAMES[contact.lang]) ? contact.lang : 'en');
+  if (kind === 'lead') await brainLeadCtxMerge(env, contact); // Pack PM3 (N6)
   const ctxObj = kind === 'lead' ? brainLeadCtx(contact) : { name: brainStr(contact.name || contact.title, 80), area: brainStr(contact.area, 80), title: brainStr(contact.title, 120), message: brainStr(contact.message || contact.summary || '', 400) };
   const style = await brainStyleBlock(env);
   const sys = 'You write a complete email for a real-estate advisor named Erfan in British Columbia, Canada, to the contact in the data. Write in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Reply with ONLY a JSON object: {"subject":"...","body":"..."}. The body: warm, professional, 80-140 words, first person as Erfan, one clear next step, no placeholders. ' + BRAIN_GROUND + style;
@@ -5858,7 +5948,7 @@ async function brainExecIntent2(env, intent) {
     if (!mls || !puRichListing(mls)) return { action: action, ok: false, error: 'not_found' };
     const out = await brainCopyGenerate(env, mls);
     if (!out.ok) return { action: action, ok: false, error: out.error };
-    return { action: action, ok: true, mls: mls, draft: true, critic: out.copy.critic || null };
+    return { action: action, ok: true, mls: mls, draft: true, proposed: !!out.proposed, critic: out.copy.critic || null };
   }
   if (action === 'create_viewing_brief') {
     const out = await brainShowingBrief(env, { viewingId: String(params.viewingId || '').slice(0, 64), mls: String(params.mls || '').slice(0, 40), leadId: String(params.leadId || '').slice(0, 64), fresh: true });
@@ -5875,6 +5965,7 @@ async function brainExecIntent2(env, intent) {
    exist for the lead; otherwise it is explicitly "insufficient data". */
 async function brainComputePredictions(env) {
   const sm = await puLeadScores(env);
+  await brainPredCheck(env, sm); // Pack PM3 (gap #30): score the previous run first
   const now = Date.now();
   // interaction timestamps per email: lead creations + viewing datetimes
   const timesByEmail = {};
@@ -5997,7 +6088,7 @@ async function brainVideoPack(env, mls) {
 /* ---- voice memo -> structured proposal (nothing auto-applied) ---- */
 async function brainVoiceProposal(env, transcript, leadId) {
   let lead = null;
-  if (leadId) lead = await env.LEADS.get('lead:' + String(leadId).slice(0, 64), { type: 'json' });
+  if (leadId) { lead = await env.LEADS.get('lead:' + String(leadId).slice(0, 64), { type: 'json' }); await brainLeadCtxMerge(env, lead); }
   const sys = 'You convert a voice-memo transcript (the advisor speaking, possibly in Persian) into structured CRM updates. Reply with ONLY a JSON object: {"note":"...","tasks":[{"text":"...","dueInDays":2}],"stageSuggestion":""}. note = a clean CRM note in the language of the transcript summarising what was said (facts only). tasks = up to 3 concrete follow-ups actually mentioned or clearly implied. stageSuggestion = one of new/contacted/viewing/offer/closed ONLY if the memo clearly states a stage change, else "". ' + BRAIN_GROUND;
   const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Transcript:\n' + String(transcript).slice(0, 3000) + (lead ? '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 1500) : ''), maxTokens: 600 });
   if (!r.ok) return { ok: false, error: r.error };
@@ -9032,7 +9123,7 @@ async function handleRequest(request, env, ctx) {
         const out = [];
         for (const id of vidx.slice(0, 100)) {
           const raw = await env.LEADS.get('viewing:' + id);
-          if (raw) { try { out.push(JSON.parse(raw)); } catch (e) {} }
+          if (raw) { try { const vobj = JSON.parse(raw); try { const ob = await env.LEADS.get('viewing:' + id + ':aibrief', { type: 'json' }); if (ob) vobj.aiBrief = ob; } catch (e) {} out.push(vobj); } catch (e) {} }
         }
         return json({ ok: true, viewings: out }, 200, origin);
       }
@@ -9250,7 +9341,9 @@ async function handleRequest(request, env, ctx) {
         const used = await brainUsage(env);
         let log = [];
         try { log = (await env.LEADS.get('brain:log', { type: 'json' })) || []; } catch (e) {}
-        return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), binding: !!(env.AICHAT && typeof env.AICHAT.fetch === 'function'), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, log: log.slice(0, 10) }, 200, origin);
+        let predCheck = null;
+        try { predCheck = await env.LEADS.get('brain:predcheck', { type: 'json' }); } catch (e) {}
+        return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), binding: !!(env.AICHAT && typeof env.AICHAT.fetch === 'function'), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, predictionAccuracy: predCheck, log: log.slice(0, 10) }, 200, origin);
       }
       if (path === '/api/admin/brain/provision' && request.method === 'POST') {
         // One-shot: stores the shared secret into cfg:brain (merging
@@ -9293,12 +9386,27 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         const out = await brainCopyGenerate(env, String((d && d.mls) || '').slice(0, 40));
         if (!out.ok) return json({ ok: false, error: out.error }, out.status || 200, origin);
-        return json({ ok: true, copy: out.copy }, 200, origin);
+        return json({ ok: true, copy: out.copy, proposed: !!out.proposed, keptEdited: !!out.keptEdited }, 200, origin);
       }
       if (path === '/api/admin/brain/copy' && request.method === 'GET') {
         const mls = String(url.searchParams.get('mls') || '').slice(0, 40);
         const rec = mls ? await env.LEADS.get('aicopy:' + mls, { type: 'json' }) : null;
-        return json({ ok: true, copy: rec || null }, 200, origin);
+        const proposed = mls ? await env.LEADS.get('aicopy:' + mls + ':proposed', { type: 'json' }) : null;
+        return json({ ok: true, copy: rec || null, proposed: proposed || null }, 200, origin);
+      }
+      if (path === '/api/admin/brain/copy/accept' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const mls = String((d && d.mls) || '').slice(0, 40);
+        if (!mls) return json({ ok: false, error: 'validation' }, 400, origin);
+        const prop = await env.LEADS.get('aicopy:' + mls + ':proposed', { type: 'json' });
+        if (!prop) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const cur = await env.LEADS.get('aicopy:' + mls, { type: 'json' });
+        if (cur) { try { await env.LEADS.put('aicopy:' + mls + ':prev', JSON.stringify(cur)); } catch (e) {} }
+        prop.acceptedAt = new Date().toISOString();
+        await env.LEADS.put('aicopy:' + mls, JSON.stringify(prop));
+        await env.LEADS.delete('aicopy:' + mls + ':proposed');
+        return json({ ok: true, copy: prop }, 200, origin);
       }
       if (path === '/api/admin/brain/copy' && request.method === 'PUT') {
         let d = null;
@@ -9331,7 +9439,7 @@ async function handleRequest(request, env, ctx) {
 
       // ---- Portal Brain 2: memory + learning panel ----
       if (path === '/api/admin/brain/memory' && request.method === 'GET') {
-        const style = await brainStylePairs(env);
+        let style = []; try { style = await brainStylePairs(env); } catch (e) {}
         const prefs = await brainPrefs(env);
         const memKeys = await listAllKeys(env, 'brain:mem:lead:', 100);
         const summaries = [];
