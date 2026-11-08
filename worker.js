@@ -3710,7 +3710,7 @@ async function puPushStatus(env) {
 async function puAttentionAdd(env, kind, text, ref) {
   try {
     const cur = (await env.LEADS.get('attention', { type: 'json' })) || [];
-    const k2 = String(kind || 'note').slice(0, 30), t2 = String(text || '').slice(0, 300), r2 = String(ref || '').slice(0, 120);
+    const k2 = String(kind || 'note').slice(0, 30), t2 = brainAttnText(text, 300), r2 = String(ref || '').slice(0, 120);
     // Pack PK (02-M4): an exact repeat (same kind + ref + text) is a
     // retry of an action that already landed — the rules engine
     // retries partial failures, and its notes used to duplicate on
@@ -5177,6 +5177,34 @@ function brainJson(text) {
   return null;
 }
 function brainStr(v, max) { return typeof v === 'string' ? v.trim().slice(0, max) : (typeof v === 'number' ? String(v).slice(0, max) : ''); }
+/* Pack PM1 (PB2-04b M1): brainStr caps length but never stripped —
+   a visitor name or attention text carrying backticks / newlines /
+   control chars rides RAW into the model's desk context, and a name
+   that IS a fenced plan block gets echoed by the model and executed.
+   brainCtxStr is brainStr + the control stripping, applied to every
+   visitor-controlled string that enters a prompt context. */
+function brainCtxStr(v, max) {
+  const s = brainStr(v, max);
+  return s.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/`+/g, "'").replace(/\s+/g, ' ').trim();
+}
+/* Pack PM1 (PB2-04b M2): the attention feed is re-ingested by
+   brainChatContext, so anything derived from model output or visitor
+   data is written HOSTILE-SHAPED: no emails, no control chars, no
+   backticks. Model/vendor raw text is never logged — only allowlisted
+   action names and fixed vocabulary (the writers pass shaped text). */
+function brainAttnText(v, max) {
+  return brainCtxStr(String(v || '').replace(/[\w.+-]+@[\w-]+(\.[\w-]+)+/g, '[email]'), max || 300);
+}
+/* Pack PM1 (PB2-07d M1): strict YMD validation — the SAME round-trip
+   check the portal task route applies (POST/PATCH /api/admin/tasks):
+   shape + real calendar date. Due-date consumers compare lexically,
+   so an impossible date (2026-13-01, 0000-00-00) stored once poisons
+   every due comparison forever. */
+function brainValidYmd(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const t = Date.parse(s + 'T00:00:00Z');
+  return !isNaN(t) && new Date(t).toISOString().slice(0, 10) === s;
+}
 function chatRefOf(d) { return ''; } // PB2-08 §D (2026-11-07): body.chatRef is client-supplied and UNVERIFIED — no server-issued ref exists until the signed bridge scheme (post-licensing activation), so intake IGNORES it entirely: never stored, never consumed (the triage chat-summary fetch at brainTriage keys off this value, so it can no longer fire for any new record). Was: format-validated passthrough (/^[A-Za-z0-9_-]{8,64}$/ on d.chatRef).
 function brainLangs() {
   const base = ['en', 'fa', 'hi', 'zh'];
@@ -5451,13 +5479,13 @@ async function brainChatContext(env) {
   const parts = [];
   parts.push('Today (America/Vancouver): ' + t.today + '.');
   const vw = t.viewings || {};
-  const fmtV = function (v) { return (v.time || '') + ' ' + (v.name || '') + ' — ' + (v.listing || '') + ' [' + (v.status || '') + ']'; };
+  const fmtV = function (v) { return (v.time || '') + ' ' + brainCtxStr(v.name, 80) + ' — ' + brainCtxStr(v.listing, 80) + ' [' + brainCtxStr(v.status, 30) + ']'; };
   parts.push('Viewings today: ' + ((vw.today || []).slice(0, 5).map(fmtV).join('; ') || 'none') + '. Tomorrow: ' + ((vw.tomorrow || []).slice(0, 5).map(fmtV).join('; ') || 'none') + '. Awaiting confirmation: ' + (vw.awaitingCount || 0) + '.');
   const fu = t.followups || {};
   parts.push('Follow-ups due: ' + (fu.newCount || 0) + ' new leads, ' + (fu.staleCount || 0) + ' stale (48h+), ' + (fu.postViewingCount || 0) + ' post-viewing.');
   const hl = t.hotLeads || {};
   parts.push('Lead bands: ' + ((hl.counts && hl.counts.hot) || 0) + ' hot, ' + ((hl.counts && hl.counts.warm) || 0) + ' warm, ' + ((hl.counts && hl.counts.cold) || 0) + ' cold.');
-  if ((hl.hot || []).length) parts.push('Hot leads (id | name | score | stage | source): ' + hl.hot.map(function (x) { return x.id + ' | ' + (x.name || '') + ' | ' + x.score + ' | ' + (x.stage || '') + ' | ' + (x.source || ''); }).join('; ') + '.');
+  if ((hl.hot || []).length) parts.push('Hot leads (id | name | score | stage | source): ' + hl.hot.map(function (x) { return x.id + ' | ' + brainCtxStr(x.name, 80) + ' | ' + x.score + ' | ' + brainCtxStr(x.stage, 20) + ' | ' + brainCtxStr(x.source, 30); }).join('; ') + '.');
   const mp = t.marketPulse || {};
   if (mp.cur) {
     const c = mp.cur, bits = [];
@@ -5473,7 +5501,7 @@ async function brainChatContext(env) {
   const nl = t.newsletter || {};
   parts.push('Newsletter subscribers: ' + (nl.total || 0) + '.');
   const at = (t.attention && t.attention.items) || [];
-  if (at.length) parts.push('Latest attention items: ' + at.slice(0, 3).map(function (a) { return brainStr(a.text, 120); }).join(' | '));
+  if (at.length) parts.push('Latest attention items: ' + at.slice(0, 3).map(function (a) { return brainAttnText(a.text, 120); }).join(' | '));
   return parts.join('\n');
 }
 async function brainExecIntent(env, intent) {
@@ -5495,24 +5523,59 @@ async function brainExecIntent(env, intent) {
     if (action === 'generate_report') return { action: action, ok: true, mls: mls, link: '/api/admin/reports/listing-performance?mls=' + encodeURIComponent(mls) };
     return { action: action, ok: true, mls: mls, leadId: leadId, link: '/api/admin/handbook-data?mls=' + encodeURIComponent(mls) + (leadId ? '&leadId=' + encodeURIComponent(leadId) : '') };
   }
-  const lead = await env.LEADS.get('lead:' + String(params.leadId || '').slice(0, 64), { type: 'json' });
+  const leadIdRaw = String(params.leadId || '');
+  // Pack PM1 (PB2-07d S6): the leadId shape is validated before any
+  // key is built from it.
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(leadIdRaw)) return { action: action, ok: false, error: 'not_found' };
+  const lead = await env.LEADS.get('lead:' + leadIdRaw, { type: 'json' });
   if (!lead) return { action: action, ok: false, error: 'not_found' };
   if (action === 'draft_message') {
     if (!lead.email) return { action: action, ok: false, error: 'no_email' };
+    // Pack PM1 (PB2-07d S5): the triage path's two skips apply here
+    // too — never draft to a placeholder caller address, never draft
+    // to a closed/dropped lead.
+    if (String(lead.email).indexOf('@calls.local') !== -1) return { action: action, ok: false, error: 'suppressed' };
+    if (lead.stage === 'closed' || lead.stage === 'dropped') return { action: action, ok: false, error: 'lead_closed' };
     if (await isBanned(env, lead.email)) return { action: action, ok: false, error: 'suppressed' };
     const tone = ['warm', 'short', 'formal'].indexOf(String(params.tone || '')) !== -1 ? String(params.tone) : 'warm';
     const d = await brainDraftText(env, lead, 'Follow-up message requested from the portal assistant (tone: ' + tone + ').');
     if (!d) return { action: action, ok: false, error: 'ai_unavailable' };
-    const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: lead.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'bdraft:' + lead.id + ':' + Date.now().toString(36) });
-    await puAttentionAdd(env, 'brain-action', '🧠 Assistant drafted a held follow-up for ' + (lead.name || lead.email), lead.id);
-    return { action: action, ok: true, leadId: lead.id, queued: !!mid, lang: d.lang };
+    // Pack PM1 (PB2-07d S2): idempotent per lead+day (the triage
+    // pattern at brainTriage / the manual route's 'draft:' key) — a
+    // retried step returns the existing record instead of queueing a
+    // second draft. queued reports a NEW queueing only; deduped says
+    // an identical draft was already held.
+    const mid = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: lead.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'bdraft:' + lead.id + ':' + todayVancouver() });
+    const deduped = !mid;
+    if (!deduped) await puAttentionAdd(env, 'brain-action', '🧠 Assistant drafted a held follow-up for ' + (lead.name || lead.email), lead.id);
+    // Pack PM1 (PB2-07c S5 / 07d S1): the critic verdict + the mail id
+    // ride the result — the portal's critic badge rendered from
+    // x.critic and could never show while this return dropped both.
+    return { action: action, ok: true, leadId: lead.id, queued: !deduped, deduped: deduped, mailId: mid, lang: d.lang, critic: d.critic || null };
   }
   if (action === 'create_followup') {
     if (!lead.email) return { action: action, ok: false, error: 'no_email' };
-    let due = String(params.when || '').slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(due)) due = addDaysYmd(todayVancouver(), 1);
+    // Pack PM1 (PB2-07d M1): strict calendar validation — the portal
+    // task route's round-trip check (brainValidYmd). The old
+    // shape-only regex stored 2026-13-01 / 0000-00-00 and silently
+    // replaced a malformed date with tomorrow; every due comparison
+    // in the system is lexical, so a stored impossible date never
+    // falls due (or is overdue forever). Invalid/missing, past, and
+    // >1y out are all refused with invalid_date.
+    const due = String(params.when || '').slice(0, 10);
+    const today0 = todayVancouver();
+    if (!brainValidYmd(due) || due < today0 || due > addDaysYmd(today0, 366)) return { action: action, ok: false, error: 'invalid_date' };
     const note = brainStr(params.note, 200) || ('Follow up with ' + (lead.name || lead.email));
-    const task = { id: 'tk' + Date.now().toString(36) + randHex(4), email: normEmail(lead.email), text: note, due: due, done: false, created_at: new Date().toISOString() };
+    const em0 = normEmail(lead.email);
+    // Pack PM1 (PB2-07d S2): idempotent on email+text+due — a retried
+    // step returns the existing task instead of minting a duplicate.
+    const existing = (await allTasks(env)).find(function (t) { return t && !t.done && normEmail(t.email || '') === em0 && t.text === note && t.due === due; });
+    if (existing) return { action: action, ok: true, leadId: lead.id, taskId: existing.id, due: existing.due, deduped: true };
+    // Pack PM1 (PB2-07d S4): assistant-created tasks are marked —
+    // source + leadId — so the portal can render them distinctly and
+    // a steered model cannot plant fake "urgent" items that look
+    // like Erfan's own.
+    const task = { id: 'tk' + Date.now().toString(36) + randHex(4), email: em0, text: note, due: due, done: false, created_at: new Date().toISOString(), source: 'assistant', leadId: lead.id };
     await env.LEADS.put('task:' + task.id, JSON.stringify(task));
     await idxAdd(env, 'tasks', task.id);
     await puAttentionAdd(env, 'brain-action', '🧠 Assistant created a follow-up for ' + (lead.name || lead.email) + ' (due ' + due + ')', lead.id);
@@ -5541,7 +5604,11 @@ async function brainChat(env, body) {
   // 4 validated steps in order; the trace is returned to the portal and
   // every step is logged to the attention feed. Execution stops at the
   // first invalid/failed step and says so.
-  const mPlan = reply.match(/```plan\s*([\s\S]*?)```/);
+  // Pack PM1 (PB2-04b M1): the block match is anchored to the END of
+  // the reply — the prompt's "at the end, nowhere else" rule is now
+  // enforced in code. A fence echoed mid-reply (e.g. from a visitor
+  // name the model repeated) can no longer execute.
+  const mPlan = reply.match(/```plan\s*([\s\S]*?)```\s*$/);
   if (mPlan) {
     reply = reply.replace(mPlan[0], '').trim();
     let steps = null;
@@ -5563,7 +5630,7 @@ async function brainChat(env, body) {
       }
     }
   } else {
-    const mIntent = reply.match(/```intent\s*([\s\S]*?)```/);
+    const mIntent = reply.match(/```intent\s*([\s\S]*?)```\s*$/);
     if (mIntent) {
       reply = reply.replace(mIntent[0], '').trim();
       let intent = null;
@@ -5718,7 +5785,11 @@ async function brainPrepareEmail(env, params) {
   const mid = await queueMail(env, { kind: 'followup', to: contact.email, lang: lang, name: contact.name || '', ref: contact.id || ref, subject: subject, aiText: comp.text, aiVia: w.via, critic: w.critic || null, agentEmail: { gates: { sender: senderOk, autoSend: autoSend, rule: gov ? gov.id : null }, compliance: comp.issues, released: released } }, { key: 'bmail:' + (contact.id || ref) + ':' + Date.now().toString(36) });
   const gate = released ? null : (!senderOk ? 'sender_not_configured' : 'autosend_off');
   await puAttentionAdd(env, 'brain-agent', released ? '🧠 Agent email to ' + (contact.name || contact.email) + ' passed both gates and was released to the mailer queue' : '🧠 Agent email to ' + (contact.name || contact.email) + ' is HELD (' + (gate === 'sender_not_configured' ? 'no business sender identity configured' : 'auto-send is off for the governing rule') + ')', contact.id || ref);
-  return { action: 'prepare_email', ok: true, contactRef: ref, kind: kind, queued: !!mid, held: !released, gate: gate, critic: w.critic || null, complianceIssues: comp.issues };
+  // Pack PM1 (PB2-07c S4): the trace line carries recipient + subject
+  // + the held record's id, and the governing rule is NAMED (or its
+  // absence stated) — a status line in a two-gate send chain must
+  // never be under-informative.
+  return { action: 'prepare_email', ok: true, contactRef: ref, kind: kind, queued: !!mid, held: !released, gate: gate, to: contact.email, subject: subject, mailId: mid, ruleId: gov ? gov.id : null, ruleName: gov ? (gov.name || gov.id) : null, critic: w.critic || null, complianceIssues: comp.issues };
 }
 
 /* ---- expanded intent execution (Brain-2 actions + v1 delegation) ---- */
