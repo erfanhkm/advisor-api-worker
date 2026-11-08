@@ -1822,7 +1822,7 @@ function mergedCatalog() {
   deletedSeedMls.forEach(function (m) { del[m] = 1; });
   return CATALOG.filter(function (c) { return !over[c.mls] && !del[c.mls]; }).concat(customSlim);
 }
-function slimOf(rec) { return { mls: rec.mls, street: rec.street, city: rec.city, type: rec.type, price: rec.price, beds: rec.beds, status: rec.status || 'active', pt: rec.pt || 'resale', completion: rec.completion || '' }; }
+function slimOf(rec) { return { mls: rec.mls, street: rec.street, city: rec.city, type: rec.type, price: rec.price, beds: rec.beds, status: rec.status || 'active', pt: rec.pt || 'resale', completion: rec.completion || '', listed: rec.listed || '' }; } // Pack PM5: `listed` rides so predictions can derive days-on-market (mergedCatalog entries otherwise carry no DOM data at all)
 function upsertLocalListing(rec) {
   customListings = customListings.filter(function (r) { return r.mls !== rec.mls; }).concat([rec]);
   customSlim = customSlim.filter(function (r) { return r.mls !== rec.mls; }).concat([slimOf(rec)]);
@@ -5109,7 +5109,16 @@ async function brainCfg(env) {
     // Pack PM4 (PB2-03 M4): an explicit styleK of 0 must DISABLE style
     // injection (it is the M3 kill switch) — the old `parseInt(...) || 3`
     // silently turned 0 back into 3. Fall back to 3 only on NaN.
-    styleK: (function () { const sk = parseInt(b.styleK, 10); return Math.max(0, Math.min(5, isFinite(sk) ? sk : 3)); })()
+    styleK: (function () { const sk = parseInt(b.styleK, 10); return Math.max(0, Math.min(5, isFinite(sk) ? sk : 3)); })(),
+    // Pack PM5 (PB2-04c S1): the prediction thresholds were build-time
+    // constants (70/40 score bands, 7d/4d silence). They are now
+    // cfg:brain-tunable; brainCalibration PROPOSES changes from the
+    // predcheck instrument, it never auto-tunes. A threshold of 101
+    // disables its score band (no lead score can exceed 100).
+    predHot: (function () { const n = parseInt(b.predHot, 10); return isFinite(n) ? Math.max(1, Math.min(101, n)) : 70; })(),
+    predWarm: (function () { const n = parseInt(b.predWarm, 10); return isFinite(n) ? Math.max(0, Math.min(101, n)) : 40; })(),
+    predSilenceContacted: (function () { const n = parseInt(b.predSilenceContacted, 10); return isFinite(n) ? Math.max(0, Math.min(365, n)) : 7; })(),
+    predSilenceNew: (function () { const n = parseInt(b.predSilenceNew, 10); return isFinite(n) ? Math.max(0, Math.min(365, n)) : 4; })()
   };
 }
 function brainPaidHints(cfg) {
@@ -6012,13 +6021,57 @@ async function brainExecIntent2(env, intent) {
 async function brainComputePredictions(env) {
   const sm = await puLeadScores(env);
   await brainPredCheck(env, sm); // Pack PM3 (gap #30): score the previous run first
+  const bcfg = await brainCfg(env); // Pack PM5 (PB2-04c S1): thresholds are cfg:brain-tunable
   const now = Date.now();
-  // interaction timestamps per email: lead creations + viewing datetimes
-  const timesByEmail = {};
-  const pushT = function (email, iso) { const e = normEmail(email || ''); const t = Date.parse(iso || ''); if (e && isFinite(t)) { (timesByEmail[e] = timesByEmail[e] || []).push(t); } };
-  for (const l of sm.leads) pushT(l.email, l.created_at);
+  // Pack PM5 (PB2-04c M2): prediction records are written ON CHANGE.
+  // The old code rewrote every pred:lead / pred:listing / summary key
+  // on every run, changed or not, against the free tier's 1,000 KV
+  // writes/day. The `at` stamp is excluded from the comparison — it
+  // alone changes every run and would defeat the gate. predWrites
+  // counts this run's pred:* writes and rides the summary so the
+  // quota cost of a run is visible, not guessed.
+  let predWrites = 0;
+  const predPutChanged = async function (key, obj) {
+    let prev = null;
+    try { prev = await env.LEADS.get(key, { type: 'json' }); } catch (e) {}
+    if (prev !== null && prev !== undefined) {
+      const strip = function (o) { if (o && typeof o === 'object' && !Array.isArray(o)) { const c = Object.assign({}, o); delete c.at; return c; } return o; };
+      if (JSON.stringify(strip(prev)) === JSON.stringify(strip(obj))) return false;
+    }
+    await env.LEADS.put(key, JSON.stringify(obj));
+    predWrites++;
+    return true;
+  };
+  // Interaction hours per email (lead creations + viewing times).
+  // Pack PM5 (PB2-04c M3): hours are VANCOUVER hours. A created_at is
+  // a true instant -> converted via Intl; a viewing's date+time is a
+  // Vancouver WALL-CLOCK booking (the calendar event carries timeZone
+  // America/Vancouver), so its hour is read straight off the booking —
+  // parsing it as a UTC instant and converting back would shift it
+  // twice. The old code took getHours() in worker UTC for both, so a
+  // 9am Vancouver creation labelled "evening".
+  const vanHourFmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', hour: 'numeric', hourCycle: 'h23' });
+  const vanHour = function (t) { try { const h = parseInt(vanHourFmt.format(new Date(t)), 10); return isFinite(h) ? h : null; } catch (e) { return null; } };
+  const hoursByEmail = {};
+  const pushH = function (email, h) { const e = normEmail(email || ''); if (e && h !== null && isFinite(h)) { (hoursByEmail[e] = hoursByEmail[e] || []).push(h); } };
+  for (const l of sm.leads) { const t = Date.parse(l.created_at || ''); if (isFinite(t)) pushH(l.email, vanHour(t)); }
   const vidxP = (await env.LEADS.get('vidx', { type: 'json' })) || [];
-  for (const vid of vidxP.slice(0, 300)) { const v = await env.LEADS.get('viewing:' + vid, { type: 'json' }); if (v) pushT(v.email, (v.date || '') + 'T' + (v.time || '12:00') + ':00'); }
+  // Pack PM5 (PB2-04c M2): bulk viewing gets (chunks of 100, the KV
+  // bulk-get cap) with a per-key fallback if the binding declines.
+  const vids = vidxP.slice(0, 300);
+  const vrecs = [];
+  for (let i = 0; i < vids.length; i += 100) {
+    const chunk = vids.slice(i, i + 100);
+    let got = null;
+    try { const r = await env.LEADS.get(chunk.map(function (id) { return 'viewing:' + id; }), { type: 'json' }); if (r && typeof r.get === 'function') got = r; } catch (e) {}
+    if (got) { for (const id of chunk) vrecs.push(got.get('viewing:' + id) || null); }
+    else { for (const id of chunk) { try { vrecs.push(await env.LEADS.get('viewing:' + id, { type: 'json' })); } catch (e) { vrecs.push(null); } } }
+  }
+  for (const v of vrecs) {
+    if (!v || !puValidYmd(v.date)) continue; // a viewing without a REAL date is not an interaction (PK 01-M6 discipline)
+    const hh = parseInt(String(v.time || '').slice(0, 2), 10);
+    pushH(v.email, (isFinite(hh) && hh >= 0 && hh <= 23) ? hh : 12);
+  }
   const topClose = [], topCold = [];
   const predMap = {};
   let leadCount = 0;
@@ -6028,25 +6081,26 @@ async function brainComputePredictions(env) {
     const factors = [];
     let closeBand = 'low';
     if (l.stage === 'offer') { closeBand = 'high'; factors.push('stage: offer'); }
-    else if (s.score >= 70) { closeBand = 'high'; factors.push('lead score ' + s.score + ' (hot)'); }
-    else if (s.score >= 40 || l.stage === 'viewing' || l.stage === 'contacted') { closeBand = 'medium'; factors.push('lead score ' + s.score + ', stage ' + (l.stage || 'new')); }
+    else if (s.score >= bcfg.predHot) { closeBand = 'high'; factors.push('lead score ' + s.score + ' (hot)'); }
+    else if (s.score >= bcfg.predWarm || l.stage === 'viewing' || l.stage === 'contacted') { closeBand = 'medium'; factors.push('lead score ' + s.score + ', stage ' + (l.stage || 'new')); }
     else factors.push('lead score ' + s.score + ', stage ' + (l.stage || 'new'));
     if (l.ai && l.ai.urgency >= 2) { factors.push('triage urgency ' + l.ai.urgency + '/3'); if (closeBand === 'medium') closeBand = 'high'; }
     const anchor = l.stageAt || l.created_at;
     const ageD = anchor ? (now - Date.parse(anchor)) / 86400000 : 0;
     let coldRisk = 'low';
-    if ((l.stage === 'contacted' && ageD >= 7) || (l.stage === 'new' && ageD >= 4)) { coldRisk = 'high'; factors.push('silent ' + Math.floor(ageD) + 'd in stage ' + (l.stage || 'new')); }
+    if ((l.stage === 'contacted' && ageD >= bcfg.predSilenceContacted) || (l.stage === 'new' && ageD >= bcfg.predSilenceNew)) { coldRisk = 'high'; factors.push('silent ' + Math.floor(ageD) + 'd in stage ' + (l.stage || 'new')); }
     else if (ageD >= 2) { coldRisk = 'medium'; factors.push('no recorded movement for ' + Math.floor(ageD) + 'd'); }
-    const times = timesByEmail[normEmail(l.email || '')] || [];
+    const hours = (hoursByEmail[normEmail(l.email || '')] || []).slice().sort(function (a, b) { return a - b; });
     let bestContact = null;
-    if (times.length >= 3) {
-      const hours = times.map(function (t) { return new Date(t).getHours(); }).sort(function (a, b) { return a - b; });
+    if (hours.length >= 3) {
       const med = hours[Math.floor(hours.length / 2)];
       bestContact = med < 11 ? 'morning' : (med < 16 ? 'afternoon' : 'evening');
-      factors.push('best contact ' + bestContact + ' (median of ' + times.length + ' recorded interactions)');
+      // Pack PM5 (PB2-04c M3): the factor names its real inputs — these
+      // are creation/viewing times, not "recorded interactions".
+      factors.push('best contact ' + bestContact + ' (inferred from ' + hours.length + ' creation/viewing times, Vancouver)');
     }
-    const pred = { closeBand: closeBand, coldRisk: coldRisk, bestContact: bestContact, bestContactData: times.length >= 3 ? 'ok' : 'insufficient data', factors: factors, at: new Date().toISOString(), estimate: true };
-    await env.LEADS.put('pred:lead:' + l.id, JSON.stringify(pred));
+    const pred = { closeBand: closeBand, coldRisk: coldRisk, bestContact: bestContact, bestContactData: hours.length >= 3 ? 'ok' : 'insufficient data', factors: factors, at: new Date().toISOString(), estimate: true };
+    await predPutChanged('pred:lead:' + l.id, pred);
     predMap[l.id] = { c: closeBand, r: coldRisk, e: normEmail(l.email || '') };
     leadCount++;
     if (closeBand === 'high') topClose.push({ id: l.id, name: l.name || '', band: closeBand });
@@ -6055,21 +6109,44 @@ async function brainComputePredictions(env) {
   // listings: stale risk vs catalog norms (views from perf + days on market)
   const perf = await perfRead(env).catch(function () { return null; });
   const cat = mergedCatalog();
-  const doms = cat.map(function (h) { return h.dom || 0; }).filter(function (d) { return d > 0; }).sort(function (a, b) { return a - b; });
+  // Pack PM5 (PB2-04c medians note): ONE population for both medians —
+  // listings with a DOM and a recorded performance entry. Mixing them
+  // (medDom over dom>0, medViews over the whole catalog incl. no-perf
+  // listings whose views read as 0) let medViews collapse to 0, and
+  // the medViews&& guard then silently disabled the low-views stale
+  // rule for every listing.
+  const perfListings = (perf && perf.listings) || {};
+  // Corollary found while building PM5: mergedCatalog entries carry
+  // no dom at all (the slim catalog is "matching fields only"), so
+  // the DOM stale rules could never fire and medDom was always 0.
+  // Predictions derives days-on-market the platform's own way —
+  // publicListing recomputes dom from `listed` — using the entry's
+  // listed date (custom records, via slimOf) or the built-in's
+  // SEED_LISTINGS date.
+  const seedListed = Object.create(null);
+  for (const s of SEED_LISTINGS) if (s && s.mls && s.listed) seedListed[s.mls] = s.listed;
+  const domOf = function (h) {
+    const listed = h.listed || seedListed[h.mls] || '';
+    const d = listed ? Math.floor((now - Date.parse(listed)) / 86400000) : NaN;
+    return (isFinite(d) && d > 0) ? d : (h.dom || 0);
+  };
+  const pop = cat.filter(function (h) { return domOf(h) > 0 && Object.prototype.hasOwnProperty.call(perfListings, h.mls); });
+  const doms = pop.map(function (h) { return domOf(h); }).sort(function (a, b) { return a - b; });
   const medDom = doms.length ? doms[Math.floor(doms.length / 2)] : 0;
-  const viewsArr = cat.map(function (h) { return (perf && perf.listings && perf.listings[h.mls] && perf.listings[h.mls].v) || 0; }).sort(function (a, b) { return a - b; });
+  const viewsArr = pop.map(function (h) { return perfListings[h.mls].v || 0; }).sort(function (a, b) { return a - b; });
   const medViews = viewsArr.length ? viewsArr[Math.floor(viewsArr.length / 2)] : 0;
   const topStale = [];
   let listCount = 0;
   for (const h of cat) {
     const factors = [];
     const views = (perf && perf.listings && perf.listings[h.mls] && perf.listings[h.mls].v) || 0;
+    const dom = domOf(h);
     let risk = 'low';
-    if (medDom && (h.dom || 0) >= medDom * 1.5 && (h.dom || 0) >= 14) { risk = 'high'; factors.push('DOM ' + (h.dom || 0) + ' vs catalog median ' + medDom); }
-    else if (medDom && (h.dom || 0) > medDom) { risk = 'medium'; factors.push('DOM ' + (h.dom || 0) + ' above catalog median ' + medDom); }
+    if (medDom && dom >= medDom * 1.5 && dom >= 14) { risk = 'high'; factors.push('DOM ' + dom + ' vs catalog median ' + medDom); }
+    else if (medDom && dom > medDom) { risk = 'medium'; factors.push('DOM ' + dom + ' above catalog median ' + medDom); }
     if (medViews && views < medViews * 0.4) { if (risk === 'low') risk = 'medium'; factors.push('views ' + views + ' vs catalog median ' + medViews); }
     if (!factors.length) factors.push('in line with catalog norms (median DOM ' + medDom + ', median views ' + medViews + ')');
-    await env.LEADS.put('pred:listing:' + h.mls, JSON.stringify({ staleRisk: risk, views: views, dom: h.dom || 0, factors: factors, at: new Date().toISOString(), estimate: true }));
+    await predPutChanged('pred:listing:' + h.mls, { staleRisk: risk, views: views, dom: dom, factors: factors, at: new Date().toISOString(), estimate: true });
     listCount++;
     if (risk === 'high') topStale.push({ mls: h.mls, street: h.street || '', city: h.city || '' });
   }
@@ -6085,9 +6162,13 @@ async function brainComputePredictions(env) {
       hoods.push({ board: bName, momentum: dPct > 0.3 ? 'rising' : (dPct < -0.3 ? 'cooling' : 'flat'), deltaPct: dPct, factors: ['benchmark ' + pB.benchmark + ' -> ' + cB.benchmark + ' (' + monthsP[1].month + ' -> ' + monthsP[0].month + ')'] });
     }
   }
-  const summary = { at: new Date().toISOString(), estimate: true, leads: leadCount, listings: listCount, topClose: topClose.slice(0, 5), topCold: topCold.slice(0, 5), topStale: topStale.slice(0, 5), hoods: hoods };
-  await env.LEADS.put('pred:map', JSON.stringify(predMap));
-  await env.LEADS.put('pred:hoods', JSON.stringify(hoods));
+  await predPutChanged('pred:map', predMap);
+  await predPutChanged('pred:hoods', hoods);
+  // pred:summary is written on EVERY run (the one deliberate exception
+  // to write-on-change): its `at` is the daily recompute gate's clock —
+  // the scheduled chain compares its date against today before paying
+  // for a recompute — and it carries this run's pred:* write count.
+  const summary = { at: new Date().toISOString(), estimate: true, leads: leadCount, listings: listCount, writes: predWrites + 1, topClose: topClose.slice(0, 5), topCold: topCold.slice(0, 5), topStale: topStale.slice(0, 5), hoods: hoods };
   await env.LEADS.put('pred:summary', JSON.stringify(summary));
   return summary;
 }
@@ -6104,6 +6185,18 @@ async function brainCalibration(env) {
   const proposals = [];
   if (editRate !== null && editRate >= 40) proposals.push('Proposal: the draft edit rate is high — review the Brain memory panel and add a preferences note describing the edits you keep making. (Nothing changes until you approve it.)');
   if ((counts.draft_approved || 0) >= 5 && editRate !== null && editRate <= 10) proposals.push('Proposal: drafts are landing well — consider raising the style-examples count (cfg styleK) so new drafts lean on more of your approved voice.');
+  // Pack PM5 (PB2-04c S1): the prediction thresholds are cfg:brain
+  // values now, so calibration can PROPOSE moving them, scored by
+  // PM3's predcheck instrument (brain:predcheck). Propose-only, like
+  // everything here — the values move only when Erfan sets cfg:brain.
+  try {
+    const pc = await env.LEADS.get('brain:predcheck', { type: 'json' });
+    if (pc && pc.checked) {
+      lines.push('Prediction check: ' + pc.checked + ' leads scored — close bands hit ' + (pc.closeHits || 0) + '/' + (pc.closeTotal || 0) + ', low cold-risk held ' + (pc.coldHits || 0) + '/' + (pc.coldTotal || 0) + '.');
+      if ((pc.closeTotal || 0) >= 8 && (pc.closeHits || 0) / pc.closeTotal < 0.5) proposals.push('Proposal: fewer than half of the high/medium close bands converted — consider RAISING the prediction score thresholds (cfg:brain predHot/predWarm) so a "high" band means it. (Nothing changes until you set them.)');
+      if ((pc.coldTotal || 0) >= 8 && (pc.coldHits || 0) / pc.coldTotal < 0.5) proposals.push('Proposal: leads scored "low" cold-risk keep going cold — consider LOWERING the silence thresholds (cfg:brain predSilenceContacted/predSilenceNew) so risk flags earlier. (Nothing changes until you set them.)');
+    }
+  } catch (e) {}
   if (!proposals.length) proposals.push('No adjustments proposed this cycle.');
   for (const pr of proposals) lines.push(pr);
   const text = lines.join(' ');
