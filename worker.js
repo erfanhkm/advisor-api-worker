@@ -7010,7 +7010,14 @@ async function handleRequest(request, env, ctx) {
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
     // the Content-Length check and the chunked-body check cannot drift.
-    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))); };
+    // Pack PM9b: /api/admin/brain/file-summary joins at 512KB — the
+    // portal legitimately sends up to 48,000 chars of document text
+    // (Pack PM9 #34) and the 32KB default 413'd any body past ~32k
+    // chars before brainFileSummary's chunker could run, so a very
+    // large file surfaced as a summary FAILURE instead of a truncated
+    // summary. 512KB covers 48k chars even fully multi-byte/escaped;
+    // the chunker still reads at most 8 x 6,000 chars of it.
+    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768))))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
