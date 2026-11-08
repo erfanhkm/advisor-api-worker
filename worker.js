@@ -5106,7 +5106,10 @@ async function brainCfg(env) {
     // chain. Absent (today) = the chain always stops at gate (a) and
     // the email stays a HELD draft. Set ONLY via cfg:brain by Erfan.
     sender: (b.sender && typeof b.sender === 'object' && typeof b.sender.from === 'string' && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(b.sender.from)) ? { from: b.sender.from.slice(0, 120), name: String(b.sender.name || '').slice(0, 80) } : null,
-    styleK: Math.max(0, Math.min(5, parseInt(b.styleK, 10) || 3))
+    // Pack PM4 (PB2-03 M4): an explicit styleK of 0 must DISABLE style
+    // injection (it is the M3 kill switch) — the old `parseInt(...) || 3`
+    // silently turned 0 back into 3. Fall back to 3 only on NaN.
+    styleK: (function () { const sk = parseInt(b.styleK, 10); return Math.max(0, Math.min(5, isFinite(sk) ? sk : 3)); })()
   };
 }
 function brainPaidHints(cfg) {
@@ -5220,6 +5223,20 @@ function brainJson(text) {
   return null;
 }
 function brainStr(v, max) { return typeof v === 'string' ? v.trim().slice(0, max) : (typeof v === 'number' ? String(v).slice(0, max) : ''); }
+/* Pack PM4 (PB2-03R N4): PII redaction ported from the ai-chat worker
+   (cycle 32 M3) — the advisor worker had NO redaction, so a lead's
+   free-text message, the site-chat summary and the LLM-written memory
+   summary carried raw emails/phone numbers into every provider prompt,
+   including the second-family critic, and the memory summary could
+   restate an identifier and re-inject it into all later prompts.
+   NAME TREATMENT (explicit decision): names are NOT redacted — the
+   advisor's drafts are personalised by name, and the ported helper
+   (like its ai-chat original) covers email + phone identifiers only. */
+function brainRedactPii(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,4}/g, '[email]')
+    .replace(/\+?\d[\d\s().-]{8,18}\d/g, function (m) { const d = m.replace(/\D/g, '').length; const plausible = d >= 10 && (m.charAt(0) === '+' ? d <= 15 : d <= 11) && !/^\d{4}-\d{2}-\d{2}/.test(m); return plausible ? '[phone]' : m; }); // the date/budget guards ride along: ISO dates and 12-digit budget ranges are not phones
+}
 /* Pack PM1 (PB2-04b M1): brainStr caps length but never stripped —
    a visitor name or attention text carrying backticks / newlines /
    control chars rides RAW into the model's desk context, and a name
@@ -5267,10 +5284,10 @@ function brainLeadCtx(l) {
   const out = {
     name: brainStr(l.name, 80), intent: brainStr(l.intent, 30), source: brainStr(l.source, 30),
     stage: brainStr(l.stage, 20), city: brainStr(l.city, 60), budget: brainStr(l.budget, 60),
-    message: brainStr(l.message, 400), created_at: brainStr(l.created_at, 30)
+    message: brainRedactPii(brainStr(l.message, 400)), created_at: brainStr(l.created_at, 30)
   };
-  if (l.brainSummary) out.memory = brainStr(l.brainSummary, 600); // Portal Brain 2 rolling per-lead summary
-  if (l.chatSummary) out.viaSiteChat = brainStr(l.chatSummary, 400); // came via site chat: <summary>
+  if (l.brainSummary) out.memory = brainRedactPii(brainStr(l.brainSummary, 600)); // Portal Brain 2 rolling per-lead summary — PM4/N4: redacted (it can restate identifiers from the raw message)
+  if (l.chatSummary) out.viaSiteChat = brainRedactPii(brainStr(l.chatSummary, 400)); // came via site chat: <summary> — PM4/N4: redacted before it reaches any provider
   if (l.listingId) out.listing = l.listingId;
   if (l.valuation) out.valuation = { city: brainStr(l.valuation.city, 60), type: brainStr(l.valuation.type, 30), beds: l.valuation.beds, baths: l.valuation.baths, sqft: l.valuation.sqft, estimate: l.valuation.estimate ? { low: l.valuation.estimate.low, high: l.valuation.estimate.high } : null };
   if (l.ai) out.ai = { intent: l.ai.intent, urgency: l.ai.urgency, areas: l.ai.areas, timeline: l.ai.timeline };
@@ -5293,7 +5310,13 @@ async function brainDraftText(env, lead, purpose, langOverride) {
   const w = await brainWithCritic(env, { task: 'draft', system: sys, prompt: 'Purpose: ' + purpose + '\nLead data (JSON):\n' + ctxJson, maxTokens: 600, ctxJson: ctxJson });
   if (!w.ok) return null;
   const text = String(w.text || '').trim().slice(0, 1800);
-  return text ? { text: text, via: w.via, lang: lang, critic: w.critic } : null;
+  if (!text) return null;
+  /* Pack PM4 (gap #20 — PB2-03R §4.1): EVERY lead draft now passes the
+     deterministic compliance check, not just prepare_email bodies.
+     Same order as the email chain: critic first, compliance last; the
+     issues ride the result so draft surfaces can show them. */
+  const comp = brainCompliance(text, lang);
+  return { text: comp.text, via: w.via, lang: lang, critic: w.critic, compliance: comp.issues };
 }
 /* Lead triage (feature 2): extraction -> lead.ai, plus a first-reply
    HELD draft. Runs only via ctx.waitUntil; never throws; an AI
@@ -5373,7 +5396,7 @@ async function brainFollowupDrafts(env) {
     const purpose = it.viewingDate ? ('Follow-up after their viewing on ' + it.viewingDate + ': ask for feedback and agree the next step.') : 'Follow-up with a lead who has not been contacted yet (or has gone quiet): re-open the conversation and offer a concrete next step.';
     const d = await brainDraftText(env, lead, purpose);
     if (!d) { out.skipped++; continue; }
-    const draftRec = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, at: new Date().toISOString(), date: today };
+    const draftRec = { text: d.text, lang: d.lang, via: d.via, critic: d.critic || null, compliance: d.compliance || [], at: new Date().toISOString(), date: today };
     let midF = null;
     try { midF = await queueMail(env, { kind: 'followup', to: lead.email, lang: d.lang, name: lead.name || '', ref: it.id, aiText: d.text, aiVia: d.via, critic: d.critic || null }, { key: 'fdraft:' + it.id + ':' + today }); } catch (e) {}
     if (midF) draftRec.mailId = midF; // Portal Brain 2: lets the portal edit THIS held draft (style learning)
@@ -5441,7 +5464,11 @@ async function brainCopyGenerate(env, mls) {
   const h = puRichListing(mls);
   if (!h) return { ok: false, error: 'not_found', status: 404 };
   const specs = { street: h.street || '', city: h.city || '', type: h.type || '', price: h.price || null, beds: h.beds, baths: h.baths, sqft: h.sqft || h.size || null, status: h.status || '', existingDescription: brainStr(h.desc || h.description || '', 600), photos: (Array.isArray(h.photos) ? h.photos.length : (h.photo ? 1 : 0)) };
-  const style = await brainStyleBlock(env);
+  /* Pack PM4 (PB2-03 M3 / PB2-03R N5): the copywriter gets the advisor's
+     own PREFERENCES line only — the learned STYLE EXAMPLES are verbatim
+     client correspondence and must never ride into listing copy (a
+     detail from client A's mail could echo into published copy). */
+  const style = await brainPrefsBlock(env);
   const langs = {};
   const critics = {};
   let via = '';
@@ -5634,7 +5661,7 @@ async function brainExecIntent(env, intent) {
     // Pack PM1 (PB2-07c S5 / 07d S1): the critic verdict + the mail id
     // ride the result — the portal's critic badge rendered from
     // x.critic and could never show while this return dropped both.
-    return { action: action, ok: true, leadId: lead.id, queued: !deduped, deduped: deduped, mailId: mid, lang: d.lang, critic: d.critic || null };
+    return { action: action, ok: true, leadId: lead.id, queued: !deduped, deduped: deduped, mailId: mid, lang: d.lang, critic: d.critic || null, complianceIssues: d.compliance || [] };
   }
   if (action === 'create_followup') {
     if (!lead.email) return { action: action, ok: false, error: 'no_email' };
@@ -5785,7 +5812,11 @@ async function brainStylePairs(env) {
 async function brainStyleAdd(env, pair) {
   try {
     const list = await brainStylePairs(env); // throws on read error -> abort, history preserved
-    list.unshift({ original: String(pair.original || '').slice(0, 1800), final: String(pair.final || '').slice(0, 1800), kind: String(pair.kind || 'draft').slice(0, 30), at: new Date().toISOString() });
+    /* Pack PM4 (PB2-03R N5 + PB2-03 S5): storage is capped at the ONLY
+       window any consumer uses — brainStyleBlock slices 400 chars per
+       side into prompts. The old 1800-char retention kept raw client
+       correspondence in KV for no functional reason. */
+    list.unshift({ original: String(pair.original || '').slice(0, 400), final: String(pair.final || '').slice(0, 400), kind: String(pair.kind || 'draft').slice(0, 30), at: new Date().toISOString() });
     await env.LEADS.put('brain:style', JSON.stringify(list.slice(0, 20)));
   } catch (e) { return; }
   await brainOutcome(env, { type: 'draft_edited', ref: pair.ref || '', kind: pair.kind || 'draft' });
@@ -5793,13 +5824,15 @@ async function brainStyleAdd(env, pair) {
 async function brainPrefs(env) {
   try { const p = await env.LEADS.get('brain:prefs', { type: 'json' }); return (p && typeof p.text === 'string') ? p.text.slice(0, 1000) : ''; } catch (e) { return ''; }
 }
+async function brainPrefsBlock(env) {
+  const prefs = await brainPrefs(env);
+  return prefs ? '\nADVISOR PREFERENCES (follow these): ' + prefs : '';
+}
 async function brainStyleBlock(env) {
   const cfg = await brainCfg(env);
   let pairsAll = []; try { pairsAll = await brainStylePairs(env); } catch (e) {}
   const pairs = pairsAll.slice(0, cfg.styleK);
-  const prefs = await brainPrefs(env);
-  let out = '';
-  if (prefs) out += '\nADVISOR PREFERENCES (follow these): ' + prefs;
+  let out = await brainPrefsBlock(env);
   if (pairs.length) out += '\nSTYLE EXAMPLES — the advisor edited earlier AI drafts into these final versions; match this voice:\n' + pairs.map(function (pr, i) { return 'Example ' + (i + 1) + ' — AI draft: ' + String(pr.original || '').slice(0, 400) + '\nAdvisor final: ' + String(pr.final || '').slice(0, 400); }).join('\n');
   return out;
 }
@@ -5818,9 +5851,9 @@ async function brainMemoryRefresh(env, leadId, why) {
     const prev = await env.LEADS.get('brain:mem:lead:' + leadId, { type: 'json' });
     const sys = 'You maintain a rolling memory summary for a real-estate advisor about ONE lead. Reply with ONLY the updated summary: 2-4 short sentences, facts only (what they want, budget/areas, timeline, last interaction, open threads). Merge the previous summary with the lead data; drop anything the data contradicts. ' + BRAIN_GROUND;
     if (prev && prev.summary) lead.brainSummary = prev.summary; // in-memory merge (PM3/N6)
-    const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Previous summary: ' + ((prev && prev.summary) || '(none)') + '\nEvent: ' + String(why || 'update') + '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 3000), maxTokens: 300 });
+    const r = await brainCall(env, { task: 'extract', system: sys, prompt: 'Previous summary: ' + brainRedactPii((prev && prev.summary) || '(none)') + '\nEvent: ' + String(why || 'update') + '\nLead data (JSON):\n' + JSON.stringify(brainLeadCtx(lead)).slice(0, 3000), maxTokens: 300 });
     if (!r.ok) return;
-    const summary = String(r.text || '').trim().slice(0, 600);
+    const summary = brainRedactPii(String(r.text || '').trim().slice(0, 600)); // Pack PM4 (PB2-03R N4): redact AGAIN before storing — the model can restate an identifier from any field; a stored raw summary re-injects it into every later prompt
     if (!summary) return;
     await env.LEADS.put('brain:mem:lead:' + leadId, JSON.stringify({ leadId: leadId, name: lead.name || '', summary: summary, events: ((prev && prev.events) || 0) + 1, updatedAt: new Date().toISOString(), why: String(why || '').slice(0, 40) }));
     /* Pack PM3 (PB2-03R N6): the summary is NO LONGER mirrored into the
@@ -5869,11 +5902,24 @@ async function brainWithCritic(env, opts) {
 
 /* ---- compliance pass (deterministic): BCFSA / not-licensed rules ---- */
 const BRAIN_LICENCE_LINE = '— Erfan Hakimian, licensed REALTOR® in British Columbia.';
-function brainCompliance(text) {
+/* Pack PM4 (PB2-03R S6): the disclosure line is LOCALISED — the old code
+   appended the English line to Persian/Hindi/Chinese/Spanish bodies.
+   Non-EN lines are agent translations (FA flagged for Erfan's native
+   review, as with all site copy). */
+const BRAIN_LICENCE_LINES = { en: BRAIN_LICENCE_LINE, fa: '— عرفان حکیمیان، مشاور املاک دارای مجوز (REALTOR®) در بریتیش کلمبیا.', hi: '— Erfan Hakimian, ब्रिटिश कोलंबिया में लाइसेंसशुदा REALTOR®।', zh: '— Erfan Hakimian，BC 省持牌 REALTOR®。', es: '— Erfan Hakimian, REALTOR® con licencia en Columbia Británica.' };
+function brainCompliance(text, lang) {
   const issues = [];
   let t = String(text || '');
-  if (/\bguarantee(d|s)?\b[^.]{0,40}\b(return|profit|appreciation|growth)\b/i.test(t) || /\byou will (make|earn|profit)\b/i.test(t) || /\brisk[- ]free\b/i.test(t)) issues.push('contains a guarantee / financial-promise claim');
-  if (!/licensed REALTOR/i.test(t)) { t += '\n\n' + BRAIN_LICENCE_LINE; issues.push('licensing disclosure appended'); }
+  /* Pack PM4 (PB2-03R S6): the guarantee net is wider than the original
+     three patterns — common variants (assured returns, no-risk,
+     can't-lose, will-definitely-appreciate) slipped past it. */
+  if (/\bguarantee(d|s)?\b[^.]{0,40}\b(return|profit|appreciation|growth|income|gains?)\b/i.test(t) || /\byou will (make|earn|profit)\b/i.test(t) || /\brisk[- ]free\b/i.test(t) || /\b(no|zero)[- ]risk\b/i.test(t) || /\bcan'?t lose\b/i.test(t) || /\bassured (return|profit|gains?|income)\b/i.test(t) || /\bwill definitely (appreciate|grow|increase)\b/i.test(t) || /\bcertain to (appreciate|rise|grow)\b/i.test(t)) issues.push('contains a guarantee / financial-promise claim');
+  /* Pack PM4 (PB2-03R S6): presence is tested against the EXACT
+     disclosure lines — the old /licensed REALTOR/i test was satisfied
+     by a NEGATION ("I'm not a licensed REALTOR"), so a body denying
+     licensure skipped the disclosure entirely. */
+  const knownLines = Object.keys(BRAIN_LICENCE_LINES).map(function (k) { return BRAIN_LICENCE_LINES[k]; });
+  if (!knownLines.some(function (ln) { return t.indexOf(ln) !== -1; })) { t += '\n\n' + (BRAIN_LICENCE_LINES[lang] || BRAIN_LICENCE_LINE); issues.push('licensing disclosure appended'); }
   return { text: t, issues: issues };
 }
 
@@ -5903,14 +5949,14 @@ async function brainPrepareEmail(env, params) {
   if (await isBanned(env, contact.email)) return { action: 'prepare_email', ok: false, error: 'suppressed' };
   const lang = (contact.ai && contact.ai.lang && BRAIN_LANG_NAMES[contact.ai.lang]) ? contact.ai.lang : ((contact.lang && BRAIN_LANG_NAMES[contact.lang]) ? contact.lang : 'en');
   if (kind === 'lead') await brainLeadCtxMerge(env, contact); // Pack PM3 (N6)
-  const ctxObj = kind === 'lead' ? brainLeadCtx(contact) : { name: brainStr(contact.name || contact.title, 80), area: brainStr(contact.area, 80), title: brainStr(contact.title, 120), message: brainStr(contact.message || contact.summary || '', 400) };
+  const ctxObj = kind === 'lead' ? brainLeadCtx(contact) : { name: brainStr(contact.name || contact.title, 80), area: brainStr(contact.area, 80), title: brainStr(contact.title, 120), message: brainRedactPii(brainStr(contact.message || contact.summary || '', 400)) }; // PM4/N4: market-contact free text gets the same redaction as brainLeadCtx
   const style = await brainStyleBlock(env);
   const sys = 'You write a complete email for a real-estate advisor named Erfan in British Columbia, Canada, to the contact in the data. Write in ' + (BRAIN_LANG_NAMES[lang] || 'English') + '. Reply with ONLY a JSON object: {"subject":"...","body":"..."}. The body: warm, professional, 80-140 words, first person as Erfan, one clear next step, no placeholders. ' + BRAIN_GROUND + style;
   const w = await brainWithCritic(env, { task: 'draft', system: sys, prompt: 'Contact data (JSON):\n' + JSON.stringify(ctxObj), maxTokens: 700, ctxJson: JSON.stringify(ctxObj) });
   if (!w.ok) return { action: 'prepare_email', ok: false, error: w.error || 'ai_unavailable' };
   const p = brainJson(w.text);
   if (!p || !p.body) return { action: 'prepare_email', ok: false, error: 'ai_parse' };
-  const comp = brainCompliance(String(p.body).slice(0, 2400));
+  const comp = brainCompliance(String(p.body).slice(0, 2400), lang);
   const subject = String(p.subject || '').slice(0, 160) || 'Following up';
   const cfg = await brainCfg(env);
   // Pack K: a corrupt rules config must not break the email chain —
