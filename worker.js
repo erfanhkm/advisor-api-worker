@@ -2189,6 +2189,14 @@ async function queueMail(env, item, opts) {
   const consentBasis = (opts.consentBasis || (item && item.consentBasis) || MAIL_CONSENT_BY_KIND[kind0] || 'intake');
   const polStamp = { policy: { v: 1 }, consentBasis: consentBasis };
   if (item) { item.policy = polStamp.policy; item.consentBasis = consentBasis; }
+  /* Pack PMV3 amendment (2026-11-09, caught at reconcile): brain drafts
+     carry their AI text in item.aiText, and an EDITED held draft later
+     overwrites aiText with the human text (draft-edit) — without a
+     frozen original, the outbox's "AI original" view could never show
+     what the model actually wrote for brain mail. Freeze it here, once,
+     at queue time (manual composer records pass aiOriginal explicitly
+     and are untouched). */
+  if (item && item.aiText && !item.aiOriginal) item.aiOriginal = item.aiText;
 
   if (opts.key) {
     // Pack E (R-03 L2): the stored id/key must not embed the readable
