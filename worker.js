@@ -77,8 +77,8 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // Pack A (F-03 M3): the charset excludes <, >, quotes and backtick —
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
-const EMAIL_RE = /^[^\s@<>"'`]+@[^\s@<>"'`]+\.[^\s@<>"'`]+$/;
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush']; // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push']; // Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'muse.ai'];
 
@@ -230,18 +230,119 @@ const BAN_CACHE_TTL = 60000;
 const banCache = new Map(); // normalized email -> { t, banned }
 const TRACK_FLUSH_EVENTS = 25;
 const TRACK_FLUSH_MS = 60000;
-let trackBuf = null; // { day, doc, events, firstTs, loading }
+let trackBuf = null; // Pack PMV1: { day, doc (this isolate's DELTA only), events, firstTs, uvCount }
 let trackFlushChain = Promise.resolve();
+// ---- Pack PMV1: traffic-stat deltas (PM P10 flushTrack fix) ----
+// flushTrack used to write the WHOLE 'stat:<day>' doc per flush: every
+// isolate loaded the day doc once and later overwrote it whole, so
+// concurrent isolates silently lost each other's increments (the same
+// shared-document flaw the perf counters were redesigned away from in
+// F-01). The buffer now accumulates ONLY this isolate's delta and
+// flushes it under its own key 'stat:d:<day>:<isolateId>:<seq>' (TTL
+// 7 days); statFold() in scheduled() is the SOLE writer of
+// 'stat:<day>' and merges every outstanding delta with the same
+// folded-map idempotency as perfFold. The admin stats route reads
+// stat:<day> + outstanding deltas, so the portal never waits for the
+// fold to see today's traffic.
+const STAT_DELTA_TTL = 604800; // 7 days — a delta the fold somehow missed still expires
+let statIsoId = null; // generated LAZILY (crypto.randomUUID at module scope is a disallowed operation — see perfIso)
+function statIso() { if (!statIsoId) statIsoId = crypto.randomUUID(); return statIsoId; }
+let statSeq = 0;
+let statFlushChain = Promise.resolve();
+function statEmptyDoc() { return { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} }; }
+function statAddInto(dst, src) {
+  for (const sec of ['pv', 'ev', 'li', 'lang', 'ref']) {
+    const sm = (src && src[sec]) || {};
+    for (const k of Object.keys(sm)) { const v = sm[k]; if (typeof v === 'number' && isFinite(v)) dst[sec][k] = (dst[sec][k] || 0) + v; }
+  }
+  const uv = (src && src.uv) || {};
+  for (const h of Object.keys(uv)) dst.uv[h] = 1;
+}
 function flushTrack(env) {
   const buf = trackBuf;
   if (!buf || buf.events === 0) return trackFlushChain;
-  if (buf.loadFailed) { buf.events = 0; buf.firstTs = 0; return trackFlushChain; } // day doc never loaded: drop this buffer rather than overwrite the stored stats (cycle 26, Claude M6)
-  const key = 'stat:' + buf.day;
+  // The delta accumulates in buf.doc from an EMPTY doc (see /api/track):
+  // nothing is loaded from KV any more, so the old loadFailed overwrite
+  // guard has no work left — a flush writes only this isolate's own key.
+  const key = 'stat:d:' + buf.day + ':' + statIso() + ':' + (++statSeq);
   const snapshot = JSON.stringify(buf.doc);
   buf.events = 0;
   buf.firstTs = 0;
-  trackFlushChain = trackFlushChain.then(function () { return env.LEADS.put(key, snapshot); }).catch(function () {});
+  buf.doc = statEmptyDoc();
+  buf.uvCount = 0;
+  trackFlushChain = trackFlushChain.then(function () { return env.LEADS.put(key, snapshot, { expirationTtl: STAT_DELTA_TTL }); }).catch(function () {});
   return trackFlushChain;
+}
+/* The fold — runs ONLY from scheduled(), the sole writer of
+   'stat:<day>'. Mirrors perfFold's contract: a delta key already in
+   the stored doc's `folded` map is re-DELETED without re-adding (the
+   totals put lands before the deletes, so a failed delete must not
+   double-count next run); a delta whose read returns null (propagation
+   lag) is left in place — never deleted unfolded. */
+async function statFold(env) {
+  try {
+    const days = new Set([vancouverDay()]);
+    let cursor;
+    const deltaKeys = [];
+    do {
+      const page = await kvList(env, { prefix: 'stat:d:', limit: 1000, cursor: cursor });
+      for (const k of page.keys) { deltaKeys.push(k.name); const m = /^stat:d:(\d{4}-\d{2}-\d{2}):/.exec(k.name); if (m) days.add(m[1]); }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+    let foldedTotal = 0;
+    for (const day of days) {
+      const raw = await env.LEADS.get('stat:' + day, { type: 'json' }).catch(function () { return null; });
+      const doc = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : statEmptyDoc();
+      for (const sec of ['pv', 'ev', 'li', 'lang', 'ref']) if (!doc[sec] || typeof doc[sec] !== 'object') doc[sec] = {};
+      if (!doc.uv || typeof doc.uv !== 'object') doc.uv = {};
+      const foldedMap = Object.create(null);
+      if (doc.folded && typeof doc.folded === 'object' && !Array.isArray(doc.folded)) { for (const fk of Object.keys(doc.folded)) if (/^stat:d:[A-Za-z0-9:_-]{1,120}$/.test(fk)) foldedMap[fk] = 1; }
+      const mine = deltaKeys.filter(function (k) { return k.indexOf('stat:d:' + day + ':') === 0; });
+      const toDelete = [];
+      let changed = false;
+      for (const k of mine) {
+        if (Object.hasOwn(foldedMap, k)) { toDelete.push(k); continue; } // already counted: retry the delete only
+        let d = null;
+        try { d = await env.LEADS.get(k, { type: 'json' }); } catch (e) { d = null; }
+        if (!d) continue; // unreadable / vanished: leave it — never delete unfolded
+        statAddInto(doc, d);
+        foldedMap[k] = 1;
+        toDelete.push(k);
+        changed = true;
+      }
+      if (changed) {
+        // Keep the folded map bounded: it only needs names whose
+        // deletes might still be outstanding — cap at the newest 400.
+        const names = Object.keys(foldedMap).slice(-400);
+        doc.folded = Object.create(null);
+        for (const n of names) doc.folded[n] = 1;
+        await env.LEADS.put('stat:' + day, JSON.stringify(doc));
+        foldedTotal += toDelete.length;
+      }
+      for (const k of toDelete) { try { await env.LEADS.delete(k); } catch (e) {} }
+    }
+    return { ok: true, folded: foldedTotal };
+  } catch (e) { return { ok: false }; }
+}
+/* Read one day's traffic doc MERGED with any outstanding deltas (the
+   stats route's view: totals + unfolded tails, skipping deltas the
+   stored doc already folded — a delete may still be outstanding). */
+async function statReadMerged(env, day) {
+  const base = await env.LEADS.get('stat:' + day, { type: 'json' }).catch(function () { return null; });
+  const doc = (base && typeof base === 'object' && !Array.isArray(base)) ? base : statEmptyDoc();
+  for (const sec of ['pv', 'ev', 'li', 'lang', 'ref']) if (!doc[sec] || typeof doc[sec] !== 'object') doc[sec] = {};
+  if (!doc.uv || typeof doc.uv !== 'object') doc.uv = {};
+  const foldedMap = (doc.folded && typeof doc.folded === 'object' && !Array.isArray(doc.folded)) ? doc.folded : {};
+  try {
+    const page = await kvList(env, { prefix: 'stat:d:' + day + ':', limit: 1000 });
+    for (const k of page.keys) {
+      if (Object.hasOwn(foldedMap, k.name)) continue;
+      const d = await env.LEADS.get(k.name, { type: 'json' }).catch(function () { return null; });
+      if (d) statAddInto(doc, d);
+    }
+  } catch (e) {}
+  delete doc.folded;
+  return doc;
 }
 
 // ---- listing performance counters (feature build 2026-10-29; single-writer
@@ -817,7 +918,11 @@ function computeMotivation(f) {
   codes.forEach(function (c) { signals.push("'" + (own(MOTIVATION_CODES, c) ? MOTIVATION_CODES[c] : c) + "' in post"); });
   return { score: Math.min(100, score), signals: signals.slice(0, 5), facts: { days: days, daysBasis: basis, priceCuts: cuts, relistCount: f.relistCount || 0, codes: codes } };
 }
-async function radarEnabled(env) { try { const s = await env.LEADS.get('radar:settings', { type: 'json' }); return !!(s && s.enabled === true); } catch (e) { return false; } }
+// Pack PMV1 (PM P11/P24): the licensing interlock belongs HERE, not
+// just in the PUT route — every consumer (the ingest routes, the daily
+// scan) must agree the radar is OFF until the platform is licensed,
+// however the stored switch got set.
+async function radarEnabled(env) { try { if (!(await prPostLicense(env))) return false; const s = await env.LEADS.get('radar:settings', { type: 'json' }); return !!(s && s.enabled === true); } catch (e) { return false; } }
 function timingSafeEqual(a, b) {
   a = String(a == null ? '' : a);
   b = String(b == null ? '' : b);
@@ -827,7 +932,7 @@ function timingSafeEqual(a, b) {
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
 }
-const PBKDF2_ITERS = 20000;
+const PBKDF2_ITERS = 100000; // Pack PMV1 (PM P11): raised from 20000 — applies to NEWLY minted hashes only; checkPassword parses the iteration count from the stored string, so existing hashes keep verifying at their own count
 async function pbkdf2Hex(password, salt, iters) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: new TextEncoder().encode(salt), iterations: iters }, key, 256);
@@ -907,17 +1012,38 @@ async function scopedAuthed(request, env, path, method) {
   if (!cfg || !cfg.token) return false;
   return timingSafeEqual(m[1], String(cfg.token));
 }
+// Pack PMV1 (PM P11/P25): admin session tokens used to BE the KV key
+// ('tok:' + token) and there was no server-side sign-out — a copied
+// token worked until its 24h TTL no matter what the browser did.
+// New logins store ONLY under 'tok:' + sha256hex(token). authed reads
+// the hashed key FIRST and falls back to the legacy raw key, copying
+// the session across on first sight (never deleting it mid-flight —
+// see authed); the raw name ages out on its own ≤24h TTL.
+async function adminTokKeys(token) { return ['tok:' + await sha256hex(token), 'tok:' + token]; }
 async function authed(request, env) {
   const h = request.headers.get('Authorization') || '';
   const m = h.match(/^Bearer ([0-9a-f]{64})$/);
   if (!m) return false;
-  const rawExp = await env.LEADS.get('tok:' + m[1]);
+  const keys = await adminTokKeys(m[1]);
+  let rawExp = await env.LEADS.get(keys[0]);
+  let usedKey = keys[0];
+  if (!rawExp) { rawExp = await env.LEADS.get(keys[1]); usedKey = keys[1]; }
   if (!rawExp) return false;
   const exp = parseInt(rawExp, 10);
   if (!(exp > Date.now())) {
-    await env.LEADS.delete('tok:' + m[1]).catch(() => {});
+    await env.LEADS.delete(usedKey).catch(() => {});
     return false;
   }
+  /* Pack PMV1 migration, corrected in-pack: the legacy key is NOT
+     deleted on sight — the same token is routinely presented by
+     several isolates at once (every portal tab, every cron reader),
+     and KV deletes propagate slowly, so deleting it here made OTHER
+     isolates intermittently 401 a perfectly live session (the suite's
+     parallel blocks reproduced exactly that). Instead the session is
+     COPIED to its hashed key on first sight (same expiry) and the raw
+     key is left to its own TTL — ≤24h and shrinking; new logins never
+     mint one. Nothing about the session changes for its holder. */
+  if (usedKey === keys[1]) { try { await env.LEADS.put(keys[0], rawExp, { expirationTtl: Math.max(1, Math.floor((exp - Date.now()) / 1000)) }); } catch (e) {} }
   return true;
 }
 
@@ -951,15 +1077,55 @@ const CATALOG = [
 function catalogByMls(mls) {
   return mergedCatalog().filter(function (c) { return c.mls === mls; })[0] || null;
 }
-function critNum(v) {
+/* Pack PMV2 (PM P11/P25): ONE shared money parser. parseBudget's unit
+   logic (k/m/million/thousand, bare 5+ digits, range → ceiling) used
+   to live only in budget extraction while critNum stripped everything
+   but digits and dots — "900k" became 900, "$1.2M" became 1.2, and a
+   saved search's maxPrice silently matched almost nothing. parseMoney
+   is the general form: it accepts a number or a string, honours unit
+   suffixes and ranges, and returns NaN when nothing parses. critNum
+   now delegates (keeping its own contract: NaN unless > 0) and the
+   criteria below gain a structured budget pair: parseBudget keeps its
+   call sites and its { min, max } counterpart reads criteria.budget
+   { min, max } numbers when the intake supplies them. */
+function moneyCore(s) {
+  s = String(s || '').replace(/,/g, '');
+  let best = NaN;
+  const um = /(\d+(?:\.\d+)?)\s*(k|mm|m|million|thousand)\b/gi;
+  let m;
+  while ((m = um.exec(s)) !== null) {
+    if (/^\s*from\b/i.test(s.slice(um.lastIndex))) continue; // "2 m from transit" is a distance
+    let v = parseFloat(m[1]);
+    const u = m[2].toLowerCase();
+    v *= (u === 'k' || u === 'thousand') ? 1000 : 1000000;
+    if (isFinite(v) && (isNaN(best) || v > best)) best = v;
+  }
+  if (!isNaN(best)) return best;
+  // Bare amount: 4+ digits NOT glued to a letter (an MLS id like
+  // R2812345 is not money). 4 digits (not parseBudget's 5) so a typed
+  // "5000" still parses; R-digits stay excluded by the letter guard.
+  const bare = s.match(/(?:^|[^A-Za-z0-9])(\d{4,}(?:\.\d+)?)(?![A-Za-z0-9])/);
+  if (bare) { const v = parseFloat(bare[1]); if (isFinite(v)) return v; }
+  return NaN;
+}
+function parseMoney(v) {
   if (v === null || v === undefined || v === '') return NaN;
-  const n = Number(String(v).replace(/[^0-9.]/g, ''));
+  if (typeof v === 'number') return isFinite(v) ? v : NaN;
+  return moneyCore(v);
+}
+function critNum(v) {
+  const n = parseMoney(v);
   return isFinite(n) && n > 0 ? n : NaN;
 }
 function matchSearch(criteria) {
   const c = criteria || {};
   const q = String(c.q || '').toLowerCase();
-  const maxPrice = critNum(c.maxPrice);
+  // Pack PMV2: criteria.budget { min, max } (structured, set by the
+  // intake when the visitor typed a range) wins over the flat maxPrice;
+  // both run through the shared money parser via critNum.
+  const bud = (c.budget && typeof c.budget === 'object') ? c.budget : null;
+  const maxPrice = critNum(bud && bud.max !== undefined ? bud.max : c.maxPrice);
+  const minPrice = bud ? critNum(bud.min) : NaN;
   const minBeds = critNum(c.minBeds);
   const completionBy = critNum(c.completionBy);
   return mergedCatalog().filter(function (l) {
@@ -967,6 +1133,7 @@ function matchSearch(criteria) {
     if (c.city && String(l.city || '').toLowerCase() !== String(c.city).toLowerCase()) return false;
     if (c.type && String(l.type || '').toLowerCase() !== String(c.type).toLowerCase()) return false;
     if (isFinite(maxPrice) && l.price > maxPrice) return false;
+    if (isFinite(minPrice) && l.price < minPrice) return false;
     if (isFinite(minBeds) && l.beds < minBeds) return false;
     if (c.presale === 'only' && l.pt !== 'presale') return false;
     if (c.presale === 'no' && l.pt === 'presale') return false;
@@ -1870,7 +2037,11 @@ function cleanListing(input) {
   if (baths === undefined) return { error: 'baths' };
   const status = ['active', 'pending', 'sold'].indexOf(String(d.status || '')) !== -1 ? String(d.status) : 'active';
   let listed = cs(d.listed, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(listed) || isNaN(Date.parse(listed)) || new Date(Date.parse(listed + 'T00:00:00Z')).toISOString().slice(0, 10) !== listed) listed = new Date().toISOString().slice(0, 10);
+  /* Pack PMV2 (PM P12): an invalid/missing listed date used to be silently
+     replaced with TODAY, which made publicListing report dom: 0 ("listed
+     today") for a listing whose age is actually unknown. Unknown now stays
+     unknown: listed '' and dom null end-to-end. */
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(listed) || isNaN(Date.parse(listed)) || new Date(Date.parse(listed + 'T00:00:00Z')).toISOString().slice(0, 10) !== listed) listed = '';
   const descIn = (d.desc && typeof d.desc === 'object') ? d.desc : {};
   if (d.photo && String(d.photo).length > 600) return { error: 'photo' };
   let photo = cs(d.photo, 600);
@@ -1890,7 +2061,7 @@ function cleanListing(input) {
     depositPct: num(d.depositPct, 0, 100), depositStruct: cs(d.depositStruct, 60),
     assignment: (d.assignment === true || d.assignment === 'yes' || d.assignment === 1),
     originalPrice: (function () { const op = num(d.originalPrice, 1000, 999999999); return (op === undefined || op === null) ? null : Math.round(op); })(),
-    dom: Math.max(0, Math.floor((Date.now() - Date.parse(listed)) / 86400000) || 0),
+    dom: listed ? Math.max(0, Math.floor((Date.now() - Date.parse(listed)) / 86400000) || 0) : null,
     photo: photo,
     features: Array.isArray(d.features) ? d.features.map(function (f) { return cs(f, 30); }).filter(Boolean).slice(0, 14) : [],
     desc: { en: cs(descIn.en, 2000), fa: cs(descIn.fa, 2000), hi: cs(descIn.hi, 2000), zh: cs(descIn.zh, 2000), es: cs(descIn.es, 2000) },
@@ -1912,7 +2083,8 @@ function publicListing(rec, base) {
   delete out._custom;
   const ver = Date.parse(out.updated_at) || 0;
   delete out.updated_at;
-  out.dom = Math.max(0, Math.floor((Date.now() - Date.parse(out.listed)) / 86400000) || 0);
+  const listedMs = Date.parse(out.listed);
+  out.dom = isFinite(listedMs) ? Math.max(0, Math.floor((Date.now() - listedMs) / 86400000)) : null; // Pack PMV2 (PM P12): an unknown/invalid listed date used to report dom: 0, which reads as "listed today" and hides stale listings from every freshness display; null = unknown
   if (out.photo === 'upload') out.photo = base + '/api/lphoto/' + encodeURIComponent(out.mls) + (ver ? '?v=' + ver : '');
   return out;
 }
@@ -1975,6 +2147,10 @@ function publicSettings(s, base) {
 // Unkeyed callers keep the historic contract: returns the new id.
 const MAIL_TTL_BY_KIND = { verify: 86400, viewing: 14 * 86400, alert: 129600, reminder: 129600, reminder_unconfirmed: 129600 };
 const MAIL_TTL_DEFAULT = 30 * 86400;
+// Pack PMV1: queueMail's recipient-policy tables (see queueMail).
+// Transactional kinds are exempt from the queue-level DNC drop.
+const MAIL_POLICY_TRANSACTIONAL = new Set(['verify', 'viewing', 'alert', 'reminder', 'reminder_unconfirmed']);
+const MAIL_CONSENT_BY_KIND = { verify: 'account', viewing: 'booking', reminder: 'booking', reminder_unconfirmed: 'booking', alert: 'saved_search' };
 async function queueMail(env, item, opts) {
   opts = opts || {};
   // Pack K (PU-01 #11): the recipient is validated at the queue
@@ -1982,7 +2158,37 @@ async function queueMail(env, item, opts) {
   // header downstream. Callers that queue from user input already
   // validate; this is the last line of defence for every caller.
   const mto = String((item && item.to) || '');
-  if (!mto || /[\r\n]/.test(mto) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(mto)) throw new Error('queueMail: invalid recipient');
+  if (!mto || /[\r\n]/.test(mto) || !EMAIL_RE.test(mto) || mto.length > 254) throw new Error('queueMail: invalid recipient'); // Pack PMV1: the shared strict EMAIL_RE + 254 cap replace the looser local pattern (PM P12)
+
+  /* Pack PMV1 (PM P12/P18/P21/P24): ONE recipient policy at the queue
+     boundary — previously ban/DNC checks lived per-route and the rules
+     engine, the brain and the CRM each decided for themselves.
+     - Reserved/undeliverable domains (.local — the @calls.local
+       pseudo-addresses the call pipeline mints — .internal, .invalid,
+       .test, .example, or no valid dot-TLD) can never be queued: a
+       caller bug, so it THROWS like the format check above (the manual
+       composer route pre-checks and answers 400 instead).
+     - A banned recipient is silently dropped (return null — the same
+       contract as a deduped keyed record; callers keep working).
+     - A CRM do-not-contact recipient is dropped for NON-transactional
+       kinds. Transactional kinds (verify, viewing*, alert, reminder*)
+       are exempt here: they are the visitor's own account/booking/
+       opted-in saved-search mail, and their callers already apply
+       their own suppression rules.
+     Every accepted record is stamped with policy:{v:1} and a
+     consentBasis so the outbox (and a future sender) can show WHY
+     this mail may go out. */
+  const mdom = mto.slice(mto.lastIndexOf('@') + 1).toLowerCase();
+  if (/\.(local|internal|invalid|test|example)$/.test(mdom) || !/\.[a-z]{2,}$/.test(mdom)) throw new Error('queueMail: reserved recipient domain');
+  const kind0 = String((item && item.kind) || '');
+  if (await isBanned(env, mto)) return null;
+  if (!MAIL_POLICY_TRANSACTIONAL.has(kind0)) {
+    const cm = await getCMeta(env, normEmail(mto));
+    if (cm && cm.dnc) return null;
+  }
+  const consentBasis = (opts.consentBasis || (item && item.consentBasis) || MAIL_CONSENT_BY_KIND[kind0] || 'intake');
+  const polStamp = { policy: { v: 1 }, consentBasis: consentBasis };
+  if (item) { item.policy = polStamp.policy; item.consentBasis = consentBasis; }
 
   if (opts.key) {
     // Pack E (R-03 L2): the stored id/key must not embed the readable
@@ -2020,17 +2226,28 @@ async function queueMail(env, item, opts) {
   await idxAdd(env, 'mailq', id);
   return id;
 }
+// ---- visitor sessions (usess:) — Pack PMV1 key hashing (PM P12) ----
+// The session token used to BE the KV key ('usess:' + token), so a KV
+// list or dump exposed every live visitor session. New sessions are
+// stored ONLY under 'usess:' + sha256hex(token). userAuth tries the
+// hashed key first and falls back to the legacy raw key, so sessions
+// minted before this pack keep working until their own 30-day TTL
+// expires them. The record itself holds { email, exp } — unchanged.
+async function usessKey(token) { return 'usess:' + await sha256hex(token); }
+
 async function userAuth(request, env) {
   const h = request.headers.get('Authorization') || '';
   const m = h.match(/^Bearer (u_[0-9a-f]{32})$/);
   if (!m) return null;
-  const key = 'usess:' + m[1];
-  const c = sessCache.get(key);
+  const token = m[1];
+  const cKey = 'usess:' + token; // isolate cache key only — never a KV key any more
+  const c = sessCache.get(cKey);
   if (c && Date.now() - c.t < SESS_CACHE_TTL && (!c.exp || Date.now() <= c.exp)) {
     if (c.email && (await isBanned(env, c.email))) return null;
     return c.email;
   }
-  const raw = await env.LEADS.get(key);
+  let raw = await env.LEADS.get(await usessKey(token));
+  if (!raw) raw = await env.LEADS.get('usess:' + token); // legacy pre-hash session
   let email = null;
   let exp = 0;
   if (raw) {
@@ -2039,7 +2256,7 @@ async function userAuth(request, env) {
     if (s && Date.now() <= s.exp) { email = s.email; exp = s.exp; }
   }
   if (sessCache.size > 5000) { let nEv = 0; for (const kk of sessCache.keys()) { sessCache.delete(kk); if (++nEv >= 1000) break; } }
-  sessCache.set(key, { t: Date.now(), email: email, exp: exp });
+  sessCache.set(cKey, { t: Date.now(), email: email, exp: exp });
   if (email && (await isBanned(env, email))) return null;
   return email;
 }
@@ -2648,7 +2865,7 @@ async function idxRemove(env, name, id) {
 // rebuild (it replaces, with an empty-list guard); this is the cheap
 // safety net in between. One list per collection, at most daily —
 // list calls are the scarce resource, so it stays exactly that cheap.
-const IDX_RECONCILE_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:']];
+const IDX_RECONCILE_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:']]; // Pack PMV2: files + pushsubs join the daily union net too
 async function idxReconcile(env) {
   try {
     const last = Number(await env.LEADS.get('idxreconcile:at')) || 0;
@@ -2809,28 +3026,8 @@ async function saveCMeta(env, nk, meta) {
   adminCache.delete('contacts'); adminCache.delete('desk'); adminCache.delete('crmmatches'); adminCache.delete('crmanalytics');
 }
 function parseBudget(text) {
-  const s = String(text || '').replace(/,/g, '');
-  function inRange(v) { return v >= 50000 && v <= 50000000 ? Math.round(v) : 0; }
-  // Unit amounts ("900k", "1.2m", "$2 million"): take the LARGEST in-range
-  // value — in a range like "800k-1.2m" the ceiling is the budget — and skip
-  // a match used as a distance ("2 m from transit").
-  let best = 0;
-  const um = /(\d+(?:\.\d+)?)\s*(k|mm|m|million|thousand)\b/gi;
-  let m;
-  while ((m = um.exec(s)) !== null) {
-    if (/^\s*from\b/i.test(s.slice(um.lastIndex))) continue;
-    let v = parseFloat(m[1]);
-    const u = m[2].toLowerCase();
-    v *= (u === 'k' || u === 'thousand') ? 1000 : 1000000;
-    const r = inRange(v);
-    if (r > best) best = r;
-  }
-  if (best) return best;
-  // Bare amounts: 5+ digits NOT glued to a letter — an MLS id like R2812345
-  // is not a budget.
-  const bare = s.match(/(?:^|[^A-Za-z0-9])(\d{5,}(?:\.\d+)?)(?![A-Za-z0-9])/);
-  if (bare) { const r2 = inRange(parseFloat(bare[1])); if (r2) return r2; }
-  return 0;
+  const v = moneyCore(text); // Pack PMV2: shared parser (see parseMoney)
+  return (isFinite(v) && v >= 50000 && v <= 50000000) ? Math.round(v) : 0;
 }
 function todayVancouver() { try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch (e) { return new Date().toISOString().slice(0, 10); } }
 // Pack E (R-03 L8): current Vancouver wall-clock moment as a comparable
@@ -3570,12 +3767,18 @@ async function buildFollowups(env) {
 
 /* ---- system 8: Web Push (VAPID) for the portal PWA ----
    Keys: an ECDSA P-256 pair generated INSIDE the worker on first use
-   (puEnsurePushKeys) and stored only in cfg:platform.push via
-   read-modify-write, so sibling platform fields (postLicense) survive
-   and the private key never exists in any file, repo or report — the
-   agent never handles it and the user never pastes anything. Sending is
-   therefore live by construction once a subscription exists; the portal
-   Push card shows the state and the public key's fingerprint. */
+   (puEnsurePushKeys). Pack PMV1 (PM P13/P25): the pair now lives in
+   its OWN document 'cfg:push', NOT inside cfg:platform — an admin
+   config save that wrote cfg:platform without merging could erase
+   the VAPID private key (and silently break every portal alert).
+   puPushCfg reads cfg:push first and falls back to the legacy
+   cfg:platform.push (one read, no migration write needed); the first
+   ensure after this pack writes cfg:push and REMOVES push from
+   cfg:platform. The private key never exists in any file, repo or
+   report — the agent never handles it and the user never pastes
+   anything. Sending is therefore live by construction once a
+   subscription exists; the portal Push card shows the state and the
+   public key's fingerprint. */
 function puB64urlToBytes(s) {
   s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
   while (s.length % 4) s += '=';
@@ -3605,6 +3808,10 @@ async function puPushFingerprint(jwk) {
 }
 async function puPushCfg(env) {
   try {
+    const p = await env.LEADS.get('cfg:push', { type: 'json' });
+    if (p && p.vapidPrivateJwk && p.vapidPublicJwk) return p;
+  } catch (e) {}
+  try { // legacy location (pre-PMV1): cfg:platform.push
     const p = await env.LEADS.get('cfg:platform', { type: 'json' });
     if (p && p.push && p.push.vapidPrivateJwk && p.push.vapidPublicJwk) return p.push;
   } catch (e) {}
@@ -3616,17 +3823,23 @@ async function puEnsurePushKeys(env) {
   const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
   const pub = await crypto.subtle.exportKey('jwk', pair.publicKey);
   const priv = await crypto.subtle.exportKey('jwk', pair.privateKey);
-  let plat = {};
-  try { plat = (await env.LEADS.get('cfg:platform', { type: 'json' })) || {}; } catch (e) { plat = {}; }
-  if (plat.push && plat.push.vapidPrivateJwk && plat.push.vapidPublicJwk) return plat.push; // lost a race — adopt the winner
-  plat.push = {
+  // Re-read before writing (lost-race adoption, both locations).
+  const again = await puPushCfg(env);
+  if (again) return again;
+  const push = {
     vapidPublicJwk: { kty: pub.kty, crv: pub.crv, x: pub.x, y: pub.y },
     vapidPrivateJwk: { kty: priv.kty, crv: priv.crv, x: priv.x, y: priv.y, d: priv.d },
     subject: 'mailto:erfanbcrealestate@gmail.com',
     createdAt: new Date().toISOString()
   };
-  await env.LEADS.put('cfg:platform', JSON.stringify(plat));
-  return plat.push;
+  await env.LEADS.put('cfg:push', JSON.stringify(push));
+  // One-time cleanup: strip the legacy copy out of cfg:platform so the
+  // private key exists in exactly one place from here on.
+  try {
+    const plat = await env.LEADS.get('cfg:platform', { type: 'json' });
+    if (plat && plat.push) { delete plat.push; await env.LEADS.put('cfg:platform', JSON.stringify(plat)); }
+  } catch (e) {}
+  return push;
 }
 async function puHkdf(salt, ikm, info, len) {
   const key = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
@@ -3677,7 +3890,8 @@ async function puPushSend(cfg, sub, payloadObj) {
       'TTL': '86400',
       'Urgency': 'high'
     },
-    body: body
+    body: body,
+    signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(8000) : undefined // Pack PMV1 (PM P13): a hung push endpoint must not stall the sequential notify loop
   });
   return res.status;
 }
@@ -5124,7 +5338,12 @@ async function brainCfg(env) {
     // calls (see brainPlanStepCost); a step that would take the plan
     // over this budget is refused in the trace, never half-run. 0 is
     // a valid kill switch for heavy steps. Default 16.
-    planCallCap: (function () { const n = parseInt(b.planCallCap, 10); return isFinite(n) ? Math.max(0, Math.min(200, n)) : 16; })()
+    planCallCap: (function () { const n = parseInt(b.planCallCap, 10); return isFinite(n) ? Math.max(0, Math.min(200, n)) : 16; })(),
+    // Pack PMV1 (PM P18): the assistant's OWN auto-send switch. Default
+    // OFF (absent !== true): a single rule's autoSend can no longer
+    // authorise every agent email — release additionally requires the
+    // critic/compliance review gate and a non-market contact.
+    agentAutoSend: b.agentAutoSend === true
   };
 }
 function brainPaidHints(cfg) {
@@ -6259,6 +6478,9 @@ async function brainPrepareEmail(env, params) {
   }
   if (!contact) return { action: 'prepare_email', ok: false, error: 'not_found' };
   if (await isBanned(env, contact.email)) return { action: 'prepare_email', ok: false, error: 'suppressed' };
+  // Pack PMV1 (PM P18/P21): a do-not-contact lead is suppressed here too,
+  // before any model call is spent on the draft.
+  if (kind === 'lead') { const meta = await getCMeta(env, contact.email); if (meta && meta.dnc) return { action: 'prepare_email', ok: false, error: 'suppressed' }; }
   const lang = (contact.ai && contact.ai.lang && BRAIN_LANG_NAMES[contact.ai.lang]) ? contact.ai.lang : ((contact.lang && BRAIN_LANG_NAMES[contact.lang]) ? contact.lang : 'en');
   if (kind === 'lead') await brainLeadCtxMerge(env, contact); // Pack PM3 (N6)
   const ctxObj = kind === 'lead' ? brainLeadCtx(contact) : { name: brainStr(contact.name || contact.title, 80), area: brainStr(contact.area, 80), title: brainStr(contact.title, 120), message: brainRedactPii(brainStr(contact.message || contact.summary || '', 400)) }; // PM4/N4: market-contact free text gets the same redaction as brainLeadCtx
@@ -6290,15 +6512,30 @@ async function brainPrepareEmail(env, params) {
   const gov = (rules.rules || []).find(function (r) { return r.enabled === true && (r.actions || []).some(function (a) { return a.type === 'queue_draft'; }); });
   const autoSend = !!(gov && gov.autoSend === true);
   const senderOk = !!cfg.sender;
-  const released = senderOk && autoSend;
-  const mid = await queueMail(env, { kind: 'followup', to: contact.email, lang: lang, name: contact.name || '', ref: contact.id || ref, subject: subject, aiText: comp.text, aiVia: w.via, critic: w.critic || null, agentEmail: { gates: { sender: senderOk, autoSend: autoSend, rule: gov ? gov.id : null }, compliance: comp.issues, released: released } }, { key: 'bmail:' + (contact.id || ref) + ':' + Date.now().toString(36) });
-  const gate = released ? null : (!senderOk ? 'sender_not_configured' : 'autosend_off');
-  await puAttentionAdd(env, 'brain-agent', released ? '🧠 Agent email to ' + (contact.name || contact.email) + ' passed both gates and was released to the mailer queue' : '🧠 Agent email to ' + (contact.name || contact.email) + ' is HELD (' + (gate === 'sender_not_configured' ? 'no business sender identity configured' : 'auto-send is off for the governing rule') + ')', contact.id || ref);
+  /* Pack PMV1 (PM P18): gate (b2) the assistant's own switch, and gate
+     (c) the review outcome. The critic/compliance results used to be
+     RECORDED on the queued record but never consulted — a flagged or
+     unchecked draft released exactly like a passed one. Blocking
+     compliance issues = anything except the benign disclosure-append
+     note. Market contacts are held regardless ('market_contact'). */
+  const agentSwitch = cfg.agentAutoSend === true;
+  const criticSt = (w.critic && w.critic.status) || 'unchecked';
+  const blockingIssues = (comp.issues || []).filter(function (i) { return i !== 'licensing disclosure appended'; });
+  const reviewOk = (criticSt === 'passed' || criticSt === 'revised') && blockingIssues.length === 0;
+  const marketBlock = kind === 'market';
+  const released = senderOk && autoSend && agentSwitch && reviewOk && !marketBlock;
+  /* Pack PMV1 (PM P18): the idempotency key is per-contact-per-day
+     (Vancouver), not Date.now() — a retry or a double-fired plan used
+     to queue a second copy of the same email. */
+  const mid = await queueMail(env, { kind: 'followup', to: contact.email, lang: lang, name: contact.name || '', ref: contact.id || ref, subject: subject, aiText: comp.text, aiVia: w.via, critic: w.critic || null, agentEmail: { gates: { sender: senderOk, autoSend: autoSend, agentSwitch: agentSwitch, review: reviewOk, market: !marketBlock, rule: gov ? gov.id : null }, compliance: comp.issues, released: released } }, { key: 'bmail:' + (contact.id || ref) + ':' + todayVancouver(), consentBasis: kind === 'lead' ? 'inquiry' : 'none' });
+  const gate = released ? null : (!senderOk ? 'sender_not_configured' : (!autoSend ? 'autosend_off' : (!agentSwitch ? 'agent_switch_off' : (marketBlock ? 'market_contact' : 'review'))));
+  const gateWhy = { sender_not_configured: 'no business sender identity configured', autosend_off: 'auto-send is off for the governing rule', agent_switch_off: 'the assistant auto-send switch is off', market_contact: 'market contacts always wait for a human', review: 'critic/compliance review did not pass' };
+  await puAttentionAdd(env, 'brain-agent', released ? '🧠 Agent email to ' + (contact.name || contact.email) + ' passed all gates and was released to the mailer queue' : '🧠 Agent email to ' + (contact.name || contact.email) + ' is HELD (' + gateWhy[gate] + ')', contact.id || ref);
   // Pack PM1 (PB2-07c S4): the trace line carries recipient + subject
   // + the held record's id, and the governing rule is NAMED (or its
   // absence stated) — a status line in a two-gate send chain must
   // never be under-informative.
-  return { action: 'prepare_email', ok: true, contactRef: ref, kind: kind, queued: !!mid, held: !released, gate: gate, to: contact.email, subject: subject, mailId: mid, ruleId: gov ? gov.id : null, ruleName: gov ? (gov.name || gov.id) : null, critic: w.critic || null, complianceIssues: comp.issues };
+  return { action: 'prepare_email', ok: true, contactRef: ref, kind: kind, queued: !!mid, deduped: !mid, held: !released, gate: gate, to: contact.email, subject: subject, mailId: mid, ruleId: gov ? gov.id : null, ruleName: gov ? (gov.name || gov.id) : null, critic: w.critic || null, complianceIssues: comp.issues };
 }
 
 /* ---- expanded intent execution (Brain-2 actions + v1 delegation) ---- */
@@ -7329,7 +7566,13 @@ async function handleRequest(request, env, ctx) {
           respR.headers.set('Cache-Control', 'no-store');
           return respR;
         }
-        return json(rates, 200, origin);
+        // Pack PMV3 (PM P12 quick win): the rates doc itself carries
+        // 24h-fresh / 2h-degraded semantics — a 5-minute public cache
+        // is far inside its own staleness contract and takes repeat
+        // loads off the worker entirely.
+        const respOk = json(rates, 200, origin);
+        respOk.headers.set('Cache-Control', 'public, max-age=300');
+        return respOk;
       }
 
       if (path === '/api/valuation' && request.method === 'POST') {
@@ -7469,17 +7712,15 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         d = d || {};
         const day = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Vancouver' });
-        // Aggregate into the in-isolate buffer; flushed to KV in batches by
-        // flushTrack (same 'stat:<day>' key and doc shape as before).
+        // Pack PMV1: the buffer accumulates ONLY this isolate's delta,
+        // starting from an EMPTY doc — flushTrack writes it under its
+        // own 'stat:d:' key and statFold (scheduled) is the sole writer
+        // of 'stat:<day>'. (The day doc used to be loaded here and
+        // written back whole: concurrent isolates overwrote each other.)
         if (!trackBuf || trackBuf.day !== day) {
           if (trackBuf && trackBuf.events > 0) { const p0 = flushTrack(env); if (ctx && ctx.waitUntil) ctx.waitUntil(p0); }
-          const fresh = { day: day, doc: null, events: 0, firstTs: 0, loading: null, uvCount: 0 };
-          fresh.loading = env.LEADS.get('stat:' + day, { type: 'json' })
-            .then(function (dd) { fresh.doc = dd || { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} }; fresh.uvCount = Object.keys(fresh.doc.uv || {}).length; })
-            .catch(function () { fresh.doc = { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, uv: {} }; fresh.loadFailed = true; });
-          trackBuf = fresh;
+          trackBuf = { day: day, doc: statEmptyDoc(), events: 0, firstTs: 0, uvCount: 0 };
         }
-        if (!trackBuf.doc) await trackBuf.loading;
         const doc = trackBuf.doc;
         const type = String(d.type || 'pageview').slice(0, 30);
         const page = String(d.page || '').slice(0, 80);
@@ -7731,7 +7972,7 @@ async function handleRequest(request, env, ctx) {
         if (await isBanned(env, gEmail)) return json({ ok: false, error: 'banned' }, 403, origin);
         if (!(await env.LEADS.get('user:' + gEmail))) return json({ ok: false, error: 'code' }, 401, origin);
         const gtok = 'u_' + randHex(16);
-        await env.LEADS.put('usess:' + gtok, JSON.stringify({ email: gEmail, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 });
+        await env.LEADS.put(await usessKey(gtok), JSON.stringify({ email: gEmail, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
         const grr = json({ ok: true, token: gtok }, 200, origin);
         grr.headers.set('Cache-Control', 'no-store');
         return grr;
@@ -7758,7 +7999,7 @@ async function handleRequest(request, env, ctx) {
         await env.LEADS.put('uverify:' + vt, email, { expirationTtl: 7 * 86400 });
         await queueMail(env, { kind: 'verify', to: email, lang: ulang, name: name, token: vt });
         const token = 'u_' + randHex(16);
-        await env.LEADS.put('usess:' + token, JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 });
+        await env.LEADS.put(await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
         return json({ ok: true, token: token, user: { name: name, email: email, lang: ulang } }, 200, origin);
       }
       if (path === '/api/user/verify' && request.method === 'GET') {
@@ -7802,7 +8043,7 @@ async function handleRequest(request, env, ctx) {
         user.lastLogin = new Date().toISOString();
         if (hashUpgraded || loginStale) await env.LEADS.put('user:' + email, JSON.stringify(user)); // write only on hash upgrade or a >24h-stale lastLogin (cycle 26: fewer writes, narrower verify race)
         const token = 'u_' + randHex(16);
-        await env.LEADS.put('usess:' + token, JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 });
+        await env.LEADS.put(await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
         return json({ ok: true, token: token, user: { name: user.name, email: user.email, lang: user.lang } }, 200, origin);
       }
       if (path === '/api/user/me' && request.method === 'GET') {
@@ -7859,7 +8100,11 @@ async function handleRequest(request, env, ctx) {
           type: String(c.type || '').slice(0, 20), maxPrice: String(c.maxPrice || '').slice(0, 12),
           minBeds: String(c.minBeds || '').slice(0, 4),
           presale: (c.presale === 'only' || c.presale === 'no') ? c.presale : '',
-          completionBy: String(c.completionBy || '').replace(/[^0-9]/g, '').slice(0, 4)
+          completionBy: String(c.completionBy || '').replace(/[^0-9]/g, '').slice(0, 4),
+          // Pack PMV2: structured budget pair { min, max } — raw values
+          // kept verbatim (strings like "900k" included); matchSearch
+          // runs them through the shared money parser.
+          budget: (c.budget && typeof c.budget === 'object') ? { min: (typeof c.budget.min === 'number' || typeof c.budget.min === 'string') ? c.budget.min : undefined, max: (typeof c.budget.max === 'number' || typeof c.budget.max === 'string') ? c.budget.max : undefined } : undefined
         };
         const searches = await userSearches(env, email);
         // Field whitelist (Pack A, F-06 H1): the stored record is
@@ -8124,7 +8369,7 @@ async function handleRequest(request, env, ctx) {
         const time = String(d.time || '').slice(0, 8);
         const vlang = validLang(d.lang);
         if (!name || !EMAIL_RE.test(email) || !validSlot(date, time)) return json({ ok: false, error: 'validation' }, 400, origin);
-        if (await isBanned(env, email)) return json({ ok: false, error: 'banned' }, 403, origin);
+        if (await isBanned(env, email)) return json({ ok: true }, 200, origin); // Pack PMV1 (PM P20): silent success — a 403 {error:'banned'} let anyone probe whether an address is banned; /api/lead already drops silently. Nothing is stored, no mail, no calendar event.
         // Per-email daily cap: a booking spams a calendar invite + mail at the
         // given address, so cap how often one address can be targeted.
         const vcK = 'vc:' + normEmail(email) + ':' + new Date().toISOString().slice(0, 10); // canonical key: +tag/dot variants share one cap (cycle 27, Claude M7a)
@@ -8208,7 +8453,7 @@ async function handleRequest(request, env, ctx) {
           return json({ ok: false, error: 'invalid' }, 401, origin);
         }
         const token = randHex(32);
-        await env.LEADS.put('tok:' + token, String(Date.now() + TOKEN_TTL * 1000), { expirationTtl: TOKEN_TTL });
+        await env.LEADS.put('tok:' + await sha256hex(token), String(Date.now() + TOKEN_TTL * 1000), { expirationTtl: TOKEN_TTL }); // Pack PMV1: hashed session key (see adminTokKeys)
         return json({ ok: true, token: token }, 200, origin);
       }
 
@@ -8320,6 +8565,19 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: stored.ok, id: stored.id, created: stored.created }, stored.ok ? 200 : 400, origin);
       }
 
+      // Pack PMV1 (PM P11): server-side sign-out — deletes the caller's
+      // session record (both the hashed key and any legacy raw key) so a
+      // discarded or copied token stops working immediately, not at its
+      // 24h TTL. Placed BEFORE the auth gate on purpose: the Bearer token
+      // itself is the credential being revoked; an unknown token simply
+      // deletes nothing. Always {ok:true} — no existence oracle.
+      if (path === '/api/logout' && request.method === 'POST') {
+        const lh = request.headers.get('Authorization') || '';
+        const lm = lh.match(/^Bearer ([0-9a-f]{64})$/);
+        if (lm) { const ks = await adminTokKeys(lm[1]); for (const k of ks) { try { await env.LEADS.delete(k); } catch (e) {} } }
+        return json({ ok: true }, 200, origin);
+      }
+
       // ---- auth required below ----
       if (!(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -8376,6 +8634,12 @@ async function handleRequest(request, env, ctx) {
 
       // ---- market radar leads (daily agent ingest + portal review) ----
       if (path === '/api/market-leads' && request.method === 'POST') {
+        // Pack PMV1 (PM verdict #1): the ingest WRITE carries the same
+        // interlock as /api/market-pool POST and /api/radar-seen — this
+        // route was the one radar write the Pack E gate missed, so a
+        // scoped token could ingest while the radar was OFF or the
+        // platform unlicensed. A full admin session may still write.
+        if (!(await authed(request, env)) && !(await radarEnabled(env))) return json({ ok: false, error: 'radar_disabled' }, 409, origin);
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || !Array.isArray(d.leads)) return json({ ok: false, error: 'validation' }, 400, origin); // a malformed batch must fail loudly, not report ok with 0 added (cycle 28, Claude M4)
@@ -9069,8 +9333,12 @@ async function handleRequest(request, env, ctx) {
         const series = [];
         const tot = { pv: {}, ev: {}, li: {}, lang: {}, ref: {}, views: 0, uniques: 0 };
         for (let i = days - 1; i >= 0; i--) {
-          const dk = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
-          const doc = await env.LEADS.get('stat:' + dk, { type: 'json' });
+          // Pack PMV1: days are VANCOUVER days (the writer keys by
+          // Vancouver day; the old UTC toISOString key missed the
+          // evening hours entirely) and the read merges any deltas the
+          // scheduled fold has not landed yet (statReadMerged).
+          const dk = addDaysYmd(todayVancouver(), -i);
+          const doc = await statReadMerged(env, dk);
           let views = 0, uniques = 0;
           if (doc) {
             Object.values(doc.pv || {}).forEach(v => { if (typeof v === 'number') views += v; });
@@ -9270,7 +9538,8 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/admin/settings' && request.method === 'GET') {
         if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
-        return json({ ok: true, settings: await getSiteSettings(env) }, 200, origin);
+        const cur0 = await getSiteSettings(env);
+        return json({ ok: true, settings: cur0, rev: cur0.updated_at || null }, 200, origin); // Pack PMV2: rev = the stored updated_at, the settings concurrency token
       }
       if (path === '/api/admin/settings' && request.method === 'POST') {
         if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -9280,6 +9549,31 @@ async function handleRequest(request, env, ctx) {
         const cs2 = cleanSettings(body.settings);
         if (cs2.error) return json({ ok: false, error: 'validation', field: cs2.error }, 400, origin);
         const st = cs2.settings;
+        /* Pack PMV2 (PM P12): two guards on the whole-overwrite save.
+           (1) Language preservation: the portal form long carried only
+           en/fa/hi/zh while the worker's langObj includes es — every
+           save wiped the Spanish texts to ''. When the INCOMING doc
+           omits a language key entirely from a language object, the
+           STORED value for that language is preserved (an explicit ''
+           still clears it — omission and erasure are different acts).
+           (2) Rev check: when the client sends baseRev and it no
+           longer matches the stored updated_at, the save is a stale
+           overwrite of someone else's edit -> 409 {error:'stale'}.
+           Clients that send no baseRev keep the old behaviour. */
+        const prevSt = await getSiteSettings(env);
+        if (body.baseRev !== undefined && body.baseRev !== null && prevSt.updated_at && body.baseRev !== prevSt.updated_at) return json({ ok: false, error: 'stale' }, 409, origin);
+        /* Omission is judged on the RAW body: cleanSettings() has already
+           materialised '' for every language key of the cleaned doc, so
+           testing the cleaned doc could never see an omission (the first
+           PMV2 cut of this guard never fired — suite PMV-28 caught it). */
+        const rawSt = (body.settings && typeof body.settings === 'object') ? body.settings : {};
+        const langKeep = function (inc, prev, raw) {
+          if (!inc || typeof inc !== 'object' || !prev || typeof prev !== 'object') return inc;
+          for (const lg of ['en', 'fa', 'hi', 'zh', 'es']) { if ((!raw || typeof raw !== 'object' || raw[lg] === undefined) && prev[lg] !== undefined) inc[lg] = prev[lg]; }
+          return inc;
+        };
+        if (prevSt.hero) { st.hero.title = langKeep(st.hero.title, prevSt.hero.title, rawSt.hero && rawSt.hero.title); st.hero.sub = langKeep(st.hero.sub, prevSt.hero.sub, rawSt.hero && rawSt.hero.sub); }
+        st.announcement = langKeep(st.announcement, prevSt.announcement, rawSt.announcement);
         if (body.heroPhotoData !== undefined) {
           if (body.heroPhotoData === '') {
             await env.LEADS.delete('lphoto:__hero');
@@ -9296,7 +9590,7 @@ async function handleRequest(request, env, ctx) {
         }
         st.updated_at = new Date().toISOString();
         await env.LEADS.put('site:settings', JSON.stringify(st));
-        return json({ ok: true, settings: st }, 200, origin);
+        return json({ ok: true, settings: st, rev: st.updated_at }, 200, origin);
       }
 
       // ---- admin: per-listing viewing availability ----
@@ -9490,6 +9784,10 @@ async function handleRequest(request, env, ctx) {
         const banRec = await env.LEADS.get('ban:' + to, { type: 'json' });
         const toMeta = await getCMeta(env, to);
         if (banRec || (toMeta && toMeta.dnc)) return json({ ok: false, error: 'suppressed' }, 403, origin);
+        // Pack PMV1: a reserved/undeliverable domain is a clean 400 here
+        // (queueMail itself throws for internal callers — see its policy).
+        const toDom = to.slice(to.lastIndexOf('@') + 1);
+        if (/\.(local|internal|invalid|test|example)$/.test(toDom) || !/\.[a-z]{2,}$/.test(toDom)) return json({ ok: false, error: 'validation' }, 400, origin);
         const mid = await queueMail(env, { kind: 'manual', to: to, lang: validLang((d || {}).lang), name: String((d || {}).name || '').replace(/[\r\n]+/g, ' ').slice(0, 80), subject: subject, body: body });
         // Portal Brain 2 style learning: the portal sends the AI's
         // original text alongside an edited final; the pair teaches
@@ -9546,6 +9844,13 @@ async function handleRequest(request, env, ctx) {
           if (!c) return json({ ok: false, error: 'not_found' }, 404, origin);
           const aimode = ['brief', 'draft', 'meeting'].indexOf(d.mode) !== -1 ? d.mode : 'brief';
           if (aimode === 'draft' && (c.banned || c.dnc)) return json({ ok: false, error: 'suppressed' }, 403, origin);
+          // Pack PMV1 (PM P21, narrowed): a DNC'd contact gets NO
+          // ai-brief in ANY mode — brief/meeting outputs draft the
+          // follow-up language for a person who said do-not-contact,
+          // and the prepared draft flows straight into the composer.
+          // (Internal note: briefs never SEND mail themselves; this is
+          // a consistency gate, not an exposure fix.)
+          if (c.dnc && aimode !== 'draft') return json({ ok: false, error: 'suppressed' }, 403, origin);
           const outAi = await aiInternal(env, '/api/internal/brief', { contact: crmBriefPayload(c), mode: aimode });
           if (!outAi.ok) return json(outAi, 502, origin);
           return json(outAi, 200, origin);
@@ -9599,11 +9904,21 @@ async function handleRequest(request, env, ctx) {
 
       // ---- admin: viewings ----
       if (path === '/api/admin/viewings' && request.method === 'GET') {
+        /* Pack PMV2 (PM P21): optional ?status= and ?from=/?to= (on the
+           booking date) filters + a ?limit= (default 100, max 300) —
+           the portal used to load the newest 100 unconditionally and
+           filter in the browser, so older bookings were unreachable.
+           No params = the exact old behaviour. */
+        const fStatus = String(url.searchParams.get('status') || '').slice(0, 20);
+        const fFrom = String(url.searchParams.get('from') || '').slice(0, 10);
+        const fTo = String(url.searchParams.get('to') || '').slice(0, 10);
+        const fLimit = Math.min(300, Math.max(1, parseInt(url.searchParams.get('limit') || '100', 10) || 100));
         const vidx = (await env.LEADS.get('vidx', { type: 'json' })) || [];
         const out = [];
-        for (const id of vidx.slice(0, 100)) {
+        for (const id of vidx) {
+          if (out.length >= fLimit) break;
           const raw = await env.LEADS.get('viewing:' + id);
-          if (raw) { try { const vobj = JSON.parse(raw); try { const ob = await env.LEADS.get('viewing:' + id + ':aibrief', { type: 'json' }); if (ob) vobj.aiBrief = ob; } catch (e) {} out.push(vobj); } catch (e) {} }
+          if (raw) { try { const vobj = JSON.parse(raw); if (fStatus && vobj.status !== fStatus) continue; if (fFrom && String(vobj.date || '') < fFrom) continue; if (fTo && String(vobj.date || '') > fTo) continue; try { const ob = await env.LEADS.get('viewing:' + id + ':aibrief', { type: 'json' }); if (ob) vobj.aiBrief = ob; } catch (e) {} out.push(vobj); } catch (e) {} }
         }
         return json({ ok: true, viewings: out }, 200, origin);
       }
@@ -9799,6 +10114,7 @@ async function handleRequest(request, env, ctx) {
         if (!em) return json({ ok: false, error: 'no_email' }, 400, origin);
         if (await isBanned(env, em)) return json({ ok: false, error: 'suppressed' }, 403, origin);
         if (lead.stage === 'dropped') return json({ ok: false, error: 'lead_dropped' }, 409, origin);
+        const cmDr = await getCMeta(env, em); if (cmDr && cmDr.dnc) return json({ ok: false, error: 'suppressed' }, 403, origin); // Pack PMV1 (PM P22): the one-click Draft route checked ban + stage but never the CRM do-not-contact flag
         let lang = lead.lang || '';
         if (!lang) {
           try { const u = await env.LEADS.get('user:' + em, { type: 'json' }); if (u && u.lang) lang = u.lang; } catch (e) {}
@@ -9972,12 +10288,22 @@ async function handleRequest(request, env, ctx) {
         try { rec = JSON.parse(raw); } catch (e) {}
         if (!rec || rec.sent) return json({ ok: false, error: 'conflict' }, 409, origin);
         const original = String(rec.aiText || rec.body || '');
-        const finalText = d.text.slice(0, 4000);
+        /* Pack PMV2 (PM P22): an edit used to bypass the compliance pass
+           entirely — the advisor (or a pasted text) could remove the
+           licensing disclosure or add a guarantee claim and the record
+           still read as reviewed. The edited text now runs through
+           brainCompliance exactly like a fresh draft: the disclosure is
+           re-appended when missing, blocking issues are stored on the
+           record, and the response reports them. Style learning uses
+           the POST-compliance text (what would actually go out). */
+        const compE = brainCompliance(String(d.text).slice(0, 4000), rec.lang || 'en');
+        const finalText = compE.text.slice(0, 4000);
         rec.aiText = finalText;
         rec.aiEdited = true;
+        rec.compliance = compE.issues;
         await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
         if (original && original.trim() !== finalText.trim()) { try { await brainStyleAdd(env, { original: original, final: finalText, kind: 'held-draft', ref: rec.ref || '' }); } catch (e) {} }
-        return json({ ok: true, learned: !!(original && original.trim() !== finalText.trim()) }, 200, origin);
+        return json({ ok: true, learned: !!(original && original.trim() !== finalText.trim()), compliance: compE.issues }, 200, origin);
       }
       // ---- Portal Brain 2: predictions ----
       if (path === '/api/admin/brain/predictions' && request.method === 'GET') {
@@ -10470,16 +10796,46 @@ async function handleRequest(request, env, ctx) {
 
       // ---- admin: outgoing mail queue (drained by the mailer cron once a sender is configured) ----
       if (path === '/api/admin/mailq' && request.method === 'GET') {
-        const mkeys = (await idxGet(env, 'mailq', 'mailq:')).map(function (id) { return 'mailq:' + id; }).sort().reverse().slice(0, 100);
+        /* Pack PMV2 (PM P23): the list used to sort by KEY NAME reversed
+           — keyed records ('k-…' ids) sorted arbitrarily against
+           created_at, so the outbox order was meaningless. Records
+           now sort by created_at DESC, reads run in parallel batches,
+           and each record carries per-recipient signals (banned / dnc)
+           so the outbox screen can badge a held draft whose recipient
+           has since been suppressed. */
+        const mids = await idxGet(env, 'mailq', 'mailq:');
+        const recs = [];
+        for (let bi = 0; bi < mids.length; bi += 25) {
+          const batch = await Promise.all(mids.slice(bi, bi + 25).map(function (id) { return env.LEADS.get('mailq:' + id, { type: 'json' }).catch(function () { return null; }); }));
+          for (const rec of batch) if (rec) recs.push(rec);
+        }
+        recs.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
         const out = [];
-        for (const key of mkeys) {
-          const raw = await env.LEADS.get(key);
-          if (!raw) continue;
-          try { const rec = JSON.parse(raw); if (rec) { delete rec.token; out.push(rec); } } catch (e) {} // token stripped for every kind, not just verify (cycle 29, Claude H1)
+        for (const rec of recs.slice(0, 100)) {
+          delete rec.token; // token stripped for every kind, not just verify (cycle 29, Claude H1)
+          const emS = normEmail(rec.to || '');
+          let sig = { banned: false, dnc: false };
+          if (emS) { try { sig.banned = await isBanned(env, emS); const cmS = await getCMeta(env, emS); sig.dnc = !!(cmS && cmS.dnc); } catch (e) {} }
+          rec.signals = sig;
+          out.push(rec);
         }
         return json({ ok: true, mail: out }, 200, origin);
       }
       const mqm = path.match(/^\/api\/admin\/mailq\/([A-Za-z0-9-]+)$/);
+      if (mqm && request.method === 'DELETE') {
+        // Pack PMV2 (PM P23): discard a held draft — there was no way to
+        // remove one short of its TTL. A SENT record is history and
+        // refuses (409); an unsent one is deleted + de-indexed + audited.
+        const rawD = await env.LEADS.get('mailq:' + mqm[1]);
+        if (!rawD) return json({ ok: false, error: 'not_found' }, 404, origin);
+        let recD = null;
+        try { recD = JSON.parse(rawD); } catch (e) {}
+        if (recD && recD.sent) return json({ ok: false, error: 'conflict' }, 409, origin);
+        await env.LEADS.delete('mailq:' + mqm[1]);
+        await idxRemove(env, 'mailq', mqm[1]);
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mailq_discard', target: mqm[1], ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true }, 200, origin);
+      }
       if (mqm && request.method === 'PATCH') {
         const raw = await env.LEADS.get('mailq:' + mqm[1]);
         if (!raw) return json({ ok: false, error: 'not_found' }, 404, origin);
@@ -10665,7 +11021,7 @@ async function handleRequest(request, env, ctx) {
           // from ground truth, so any out-of-band KV edit (dashboard fix or
           // restore) self-heals within a day instead of staying invisible.
           try {
-            const IDX_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:']];
+            const IDX_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:']]; // Pack PMV2 (PM P24): files + pushsubs join the rebuild — both are idx: indexes whose lost ids were previously invisible forever
             for (const [nm, pfx] of IDX_DEFS) {
               const names = await listAll(pfx);
               if (!names.length) { const oldIdx = (await env.LEADS.get('idx:' + nm, { type: 'json' })) || []; if (oldIdx.length) { repairs.push('Reindex kept the old ' + nm + ' index — the ground-truth list came back empty'); continue; } } // a transient empty list must not wipe a good index (cycle 30, Claude M4)
@@ -11030,8 +11386,14 @@ async function handleRequest(request, env, ctx) {
         try { d = await request.json(); } catch (e) {}
         if (!d || typeof d.enabled !== 'boolean') return json({ ok: false, error: 'validation' }, 400, origin); // malformed input must not silently switch the radar OFF (cycle 30, Claude Low)
         const enabled = d.enabled;
+        // Pack PMV1 (PM P7/P24): enabling the radar pre-licensing is
+        // refused server-side — the portal toggle alone must never be
+        // able to start scans of market demand data before activation.
+        // Turning OFF is always allowed. Every change is audited.
+        if (enabled && !(await prPostLicense(env))) return json({ ok: false, error: 'licence_required' }, 403, origin);
         const prevSet = (await env.LEADS.get('radar:settings', { type: 'json' })) || {};
         await env.LEADS.put('radar:settings', JSON.stringify({ enabled: enabled, enabledAt: enabled ? (prevSet.enabledAt || new Date().toISOString()) : null, updated_at: new Date().toISOString() })); // Pack PF (PF-04): enabledAt lets the portal grace the empty-ledger alarm for the first ~3h after switch-on
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'radar_toggle', target: 'radar:settings', enabled: enabled, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true, enabled: enabled }, 200, origin);
       }
 
@@ -11094,6 +11456,10 @@ export default {
       // with catalogIsFresh() false and the junk defence stays off.
       try { await refreshCustomCatalog(env, false); } catch (e) {}
       try { await flushPerf(env); await perfFold(env); } catch (e) { console.error(e); }
+      // Pack PMV1: same discipline for traffic stats — flush this
+      // isolate's trailing stat delta, then fold every outstanding
+      // 'stat:d:' key into its day doc (statFold is its sole writer).
+      try { await flushTrack(env); await statFold(env); } catch (e) { console.error(e); }
       // Automations (feature build 2026-10-29; Pack A runner): queue
       // saved-search alerts + viewing reminders through the shared
       // runner — lock, proven-fresh catalog, sequential isolation,
