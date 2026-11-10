@@ -80,7 +80,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push']; // Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe']; // Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -3135,6 +3135,169 @@ async function academyClearEngineKeys(env, ne) {
     await env.LEADS.delete(p + ne);
   }
   return removed;
+}
+
+/* ================= Academy × Stripe (Pack AcademyStripe, 2026-11-10) =====
+   TEST-MODE enrolment automation (spec §1/§3: source "stripe" was always
+   in the schema; this pack is its creator). PRICING IS PROVISIONAL
+   (Erfan 2026-11-10: "build the test version, final prices later").
+   Flow: Stripe Payment Link → checkout.session.completed → POST
+   /api/academy/stripe-webhook (public, own auth — Stripe's HMAC
+   signature, same posture as the Twilio routes) → create-or-extend the
+   academy:<normEmail> record with EXACTLY the admin pack's §4.3
+   semantics and an academy.create / academy.extend audit entry.
+
+   The PURCHASED TIER is resolved ONLY from metadata this platform set
+   on its own Stripe objects — the session's line items' price/product
+   metadata (Payment Links propagate their line items + metadata into
+   the session), then session metadata, then payment-link metadata.
+   A session whose tier cannot be resolved REFUSES (400, no enrolment,
+   no processed-marker — Stripe retries and the failure stays visible)
+   instead of guessing a product. The browser is never trusted for the
+   tier: the public site carries only links.
+
+   The endpoint signing secret lives ONLY in KV cfg:stripe
+   ({webhookSecret}) — written via the one-shot admin provision route
+   (POST /api/admin/academy/stripe-provision; refuses once set, value
+   never returned or logged), read here on every delivery. NOTHING
+   Stripe-secret exists in code. Until cfg:stripe is provisioned the
+   webhook answers 503 not_configured, so a deploy can never
+   half-accept events.
+
+   Idempotency: a verified event is claimed at 'stripe:evt:<eventId>'
+   BEFORE processing (90-day TTL; Stripe event ids are globally
+   unique) — a replayed delivery answers 200 {duplicate:true} and can
+   never double-extend. A processing failure releases the claim so the
+   Stripe retry can succeed; a KV claim-write failure answers 500 so
+   Stripe retries rather than risking a double enrolment. */
+const STRIPE_SIG_TOLERANCE_SEC = 300;
+async function stripeCfg(env) { try { return await env.LEADS.get('cfg:stripe', { type: 'json' }); } catch (e) { return null; } }
+function stripeB64ToBytes(b64) {
+  const bin = atob(String(b64 || ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+async function stripeHmacSha256Hex(secret, payload) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+  return [...new Uint8Array(mac)].map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+async function stripeSignatureOk(secret, sigHeader, rawBody) {
+  // Stripe-Signature: t=<unix>,v1=<hex>[,v1=<hex>…]; the signed payload
+  // is "<t>.<rawBody>", HMAC-SHA256 with the endpoint secret. Any one
+  // matching v1 accepts (Stripe sends several during secret rotation).
+  // A timestamp outside ±5 min refuses (replay window) — Stripe's own
+  // default tolerance.
+  if (!secret || !sigHeader || typeof rawBody !== 'string') return false;
+  let t = null;
+  const v1s = [];
+  for (const part of String(sigHeader).split(',')) {
+    const i = part.indexOf('=');
+    if (i < 1) continue;
+    const k = part.slice(0, i).trim(), v = part.slice(i + 1).trim();
+    if (k === 't' && t === null) t = v;
+    else if (k === 'v1' && v) v1s.push(v);
+  }
+  if (!t || !/^\d+$/.test(t) || !v1s.length) return false;
+  if (Math.abs(Math.floor(Date.now() / 1000) - parseInt(t, 10)) > STRIPE_SIG_TOLERANCE_SEC) return false;
+  const want = await stripeHmacSha256Hex(secret, t + '.' + rawBody);
+  for (const v of v1s) if (timingSafeEqual(want, v)) return true;
+  return false;
+}
+function stripeMetaTier(meta) {
+  // A platform metadata bag → {product, accessMonths} or null. The
+  // product must be a known Academy product and the months a sane
+  // integer — anything else is not ours to enrol from.
+  if (!meta || typeof meta !== 'object') return null;
+  const product = String(meta.product_key || meta.product || '');
+  if (ACADEMY_PRODUCTS.indexOf(product) === -1) return null;
+  const months = parseInt(meta.accessMonths, 10);
+  if (!isFinite(months) || Math.floor(months) !== months || months < 1 || months > 60) return null;
+  return { product: product, accessMonths: months };
+}
+async function stripeSessionTier(env, sess) {
+  // Resolution order (see the block comment): the purchased line
+  // items' price metadata → product metadata → session metadata →
+  // payment-link metadata.
+  const key = (await stripeCfg(env) || {}).apiKey;
+  if (key && sess && sess.id) {
+    try {
+      const r = await fetch('https://api.stripe.com/v1/checkout/sessions/' + encodeURIComponent(sess.id) + '/line_items?expand[]=data.price.product', { headers: { 'Authorization': 'Bearer ' + key } });
+      if (r.ok) {
+        const lj = await r.json();
+        for (const li of (lj && lj.data) || []) {
+          const tier = stripeMetaTier(li && li.price && li.price.metadata) || stripeMetaTier(li && li.price && li.price.product && li.price.product.metadata);
+          if (tier) return tier;
+        }
+      }
+    } catch (e) {}
+  }
+  let tier = stripeMetaTier(sess && sess.metadata);
+  if (tier) return tier;
+  if (key && sess && sess.payment_link) {
+    try {
+      const r = await fetch('https://api.stripe.com/v1/payment_links/' + encodeURIComponent(sess.payment_link), { headers: { 'Authorization': 'Bearer ' + key } });
+      if (r.ok) { tier = stripeMetaTier((await r.json()).metadata); if (tier) return tier; }
+    } catch (e) {}
+  }
+  return null;
+}
+async function academyStripeEnrol(env, sess, eventId, evtCreated, ip) {
+  // checkout.session.completed → create-or-extend, spec §4.3 verbatim:
+  // entitled (window in the future) extends FROM the current expiresAt;
+  // expired runs FROM NOW; blocked keeps the block (window moves by the
+  // same rules, profile stays blocked). A paid product REPLACES the
+  // record's product/accessMonths (they describe the latest grant).
+  const email = String((sess.customer_details && sess.customer_details.email) || sess.customer_email || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) return { status: 400, body: { ok: false, error: 'no_email' } };
+  const tier = await stripeSessionTier(env, sess);
+  if (!tier) return { status: 400, body: { ok: false, error: 'unknown_product' } };
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const staleMs = typeof evtCreated === 'number' && isFinite(evtCreated) ? Math.max(0, nowMs - evtCreated * 1000) : 0;
+  const existing = await academyGet(env, email);
+  if (!existing) {
+    const rec = { email: email, product: tier.product, status: 'active', accessMonths: tier.accessMonths, activatedAt: nowIso, expiresAt: academyAddMonths(nowIso, tier.accessMonths), source: 'stripe', createdBy: 'stripe', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: null };
+    await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
+    await academyAudit(env, 'academy.create', normEmail(email), ip, { product: tier.product, accessMonths: tier.accessMonths, expiresAt: rec.expiresAt, source: 'stripe', stripeEvent: eventId || null, stripeSession: sess.id || null, staleMs: staleMs });
+    return { status: 200, body: { ok: true, enrolled: 'created', email: normEmail(email), product: tier.product, expiresAt: rec.expiresAt } };
+  }
+  const prev = existing.expiresAt;
+  const baseIso = Date.parse(prev) > nowMs ? prev : nowIso;
+  existing.product = tier.product;
+  existing.accessMonths = tier.accessMonths;
+  existing.expiresAt = academyAddMonths(baseIso, tier.accessMonths);
+  await academyPut(env, existing);
+  await academyAudit(env, 'academy.extend', normEmail(email), ip, { months: tier.accessMonths, previousExpiresAt: prev, source: 'stripe', stripeEvent: eventId || null, stripeSession: sess.id || null, staleMs: staleMs });
+  return { status: 200, body: { ok: true, enrolled: 'extended', email: normEmail(email), product: tier.product, expiresAt: existing.expiresAt } };
+}
+async function academyStripeWebhook(request, env, ip) {
+  const cfg = await stripeCfg(env);
+  if (!cfg || !cfg.webhookSecret) return { status: 503, body: { ok: false, error: 'not_configured' } };
+  let raw = '';
+  try { raw = await request.text(); } catch (e) {}
+  if (!(await stripeSignatureOk(cfg.webhookSecret, request.headers.get('Stripe-Signature'), raw))) return { status: 400, body: { ok: false, error: 'bad_signature' } };
+  let evt = null;
+  try { evt = JSON.parse(raw); } catch (e) {}
+  if (!evt || typeof evt !== 'object' || !evt.id || !evt.type) return { status: 400, body: { ok: false, error: 'bad_event' } };
+  if (evt.type !== 'checkout.session.completed') return { status: 200, body: { ok: true, ignored: evt.type } };
+  const sess = (evt.data && evt.data.object) || {};
+  if (sess.payment_status && sess.payment_status !== 'paid' && sess.payment_status !== 'no_payment_required') return { status: 200, body: { ok: true, ignored: 'unpaid_session' } };
+  // Claim BEFORE processing (idempotency): a redelivery of this event
+  // id — Stripe retries, dashboard resends — must never enrol twice.
+  const claimKey = 'stripe:evt:' + evt.id;
+  try { if ((await env.LEADS.get(claimKey)) !== null) return { status: 200, body: { ok: true, duplicate: true } }; } catch (e) {}
+  try { await env.LEADS.put(claimKey, JSON.stringify({ at: new Date().toISOString(), session: sess.id || null }), { expirationTtl: 90 * 86400 }); }
+  catch (e) { return { status: 500, body: { ok: false, error: 'claim_failed' } }; } // no claim, no enrolment — Stripe retries
+  try {
+    const out = await academyStripeEnrol(env, sess, evt.id, evt.created, ip);
+    if (out.status >= 400) { try { await env.LEADS.delete(claimKey); } catch (e) {} } // refuse cleanly: release the claim so the retry can succeed
+    return out;
+  } catch (e) {
+    try { await env.LEADS.delete(claimKey); } catch (e2) {}
+    return { status: 500, body: { ok: false, error: 'processing_failed' } };
+  }
 }
 
 async function buildContacts(env) {
@@ -8960,6 +9123,18 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: stored.ok, id: stored.id, created: stored.created }, stored.ok ? 200 : 400, origin);
       }
 
+      // ---- Academy: Stripe webhook (Pack AcademyStripe, 2026-11-10;
+      // public, own auth — the HMAC signature is the credential, the
+      // Twilio-route posture). Deliberately BEFORE the admin gate: no
+      // session or scoped token is ever involved. Raw-body handling:
+      // the route reads request.text() itself; nothing upstream has
+      // consumed the body (the preamble only inspects Content-Length).
+      if (path === '/api/academy/stripe-webhook' && request.method === 'POST') {
+        if (limited('stripewh:' + ip, 600, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        const out = await academyStripeWebhook(request, env, ip);
+        return json(out.body, out.status, origin);
+      }
+
       // Pack PMV1 (PM P11): server-side sign-out — deletes the caller's
       // session record (both the hashed key and any legacy raw key) so a
       // discarded or copied token stops working immediately, not at its
@@ -10528,6 +10703,35 @@ async function handleRequest(request, env, ctx) {
         const students = [];
         for (const rec of slice) students.push(await academySummary(env, rec, nowMs));
         return json({ students: students, nextCursor: off + limit < matched.length ? String(off + limit) : null }, 200, origin);
+      }
+      // ---- admin: Academy × Stripe config (Pack AcademyStripe) ----
+      // The provision route is the brain-provision pattern verbatim:
+      // ONE-SHOT, merges into cfg:stripe, refuses once a secret exists
+      // (rotation is a deliberate cfg edit afterwards), and the values
+      // are never echoed, logged or returned. webhookSecret = the
+      // Stripe endpoint signing secret (whsec_…); apiKey = a RESTRICTED
+      // read key (Checkout Sessions + Payment Links read) the webhook
+      // resolver uses to read the purchased line items' metadata —
+      // optional, but without it only session-metadata tiers resolve.
+      if (path === '/api/admin/academy/stripe-provision' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const ws = String(d.webhookSecret || '');
+        const ak = d.apiKey === undefined || d.apiKey === null ? '' : String(d.apiKey);
+        if (ws.length < 16 || ws.length > 256 || ak.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
+        const cur = (await env.LEADS.get('cfg:stripe', { type: 'json' })) || {};
+        if (cur.webhookSecret) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+        cur.webhookSecret = ws;
+        if (ak) cur.apiKey = ak;
+        cur.provisionedAt = new Date().toISOString();
+        await env.LEADS.put('cfg:stripe', JSON.stringify(cur));
+        return json({ ok: true, apiKeyStored: !!ak }, 200, origin);
+      }
+      if (path === '/api/admin/academy/stripe-status' && request.method === 'GET') {
+        // Booleans only — no secret material ever leaves this route.
+        const cfg = (await env.LEADS.get('cfg:stripe', { type: 'json' })) || {};
+        return json({ ok: true, configured: !!cfg.webhookSecret, apiKeyConfigured: !!cfg.apiKey, provisionedAt: cfg.provisionedAt || null }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'POST') {
         let d = null;
