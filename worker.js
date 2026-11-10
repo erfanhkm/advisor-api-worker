@@ -80,7 +80,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe']; // Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail']; // Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -1005,6 +1005,13 @@ async function scopedAuthed(request, env, path, method) {
     (method === 'GET' && path === '/api/admin/brain/status') ||
     (method === 'POST' && path === '/api/admin/brain/smoke') ||
     (method === 'POST' && path === '/api/admin/brain/provision') ||
+    // Pack MailSend folded-in item (2026-11-10, parent instruction):
+    // the Academy Stripe provision + status pair joins the SERVICE set
+    // with EXACTLY the brain posture above — the one-shot provision
+    // (the route itself refuses 409 once set, values never echoed) and
+    // the booleans-only status. Nothing else Stripe-related is in scope.
+    (method === 'POST' && path === '/api/admin/academy/stripe-provision') ||
+    (method === 'GET' && path === '/api/admin/academy/stripe-status') ||
     // Pack L (2026-11-02): the monthly newsletter job publishes the
     // Market Pulse dataset with the service token — /api/login is
     // Turnstile-gated server-side, so a job can never hold an admin
@@ -2165,7 +2172,7 @@ const MAIL_TTL_BY_KIND = { verify: 86400, viewing: 14 * 86400, alert: 129600, re
 const MAIL_TTL_DEFAULT = 30 * 86400;
 // Pack PMV1: queueMail's recipient-policy tables (see queueMail).
 // Transactional kinds are exempt from the queue-level DNC drop.
-const MAIL_POLICY_TRANSACTIONAL = new Set(['verify', 'viewing', 'alert', 'reminder', 'reminder_unconfirmed']);
+const MAIL_POLICY_TRANSACTIONAL = new Set(['verify', 'viewing', 'alert', 'reminder', 'reminder_unconfirmed', 'academy_invite']); // Pack MailSend (2026-11-10): 'academy_invite' added — an enrolment invite is transactional by nature (the student paid for access), the same posture as 'verify'; without it queueMail's DNC gate would silently drop invites to any previously-DNC'd address and resend-invite could never send.
 const MAIL_CONSENT_BY_KIND = { verify: 'account', viewing: 'booking', reminder: 'booking', reminder_unconfirmed: 'booking', alert: 'saved_search' };
 async function queueMail(env, item, opts) {
   opts = opts || {};
@@ -2250,6 +2257,233 @@ async function queueMail(env, item, opts) {
   await idxAdd(env, 'mailq', id);
   return id;
 }
+/* ================= Mail SEND path (Pack MailSend, 2026-11-10) =====
+   Erfan activated mail for the site 2026-11-10 and resolved the D4
+   sender decision: the dedicated domain + Resend — from
+   "EH Realty <hello@ehrealtybc.com>" via EH Realty's OWN Resend key
+   (Sending access, scoped to ehrealtybc.com ONLY, held in KV cfg:mail
+   via the one-shot provision route below; never in code, never
+   logged). The Smart Table Resend identity/key is a different
+   business's property and is NEVER referenced here.
+
+   This block is ONLY the provider EXIT behind the existing gate
+   chain — nothing about when mail may leave changes:
+   - queueMail remains the single queue boundary and recipient policy.
+   - The PMV1 prepare_email release gates stay exactly as built;
+     "released" still only flags a record for the mailer.
+   - AUTO-SEND STAYS OFF: cfg:brain.sender is NOT configured by this
+     pack and every rule's autoSend default stays OFF, so in practice
+     every record still only queues. The ONLY send trigger is the
+     owner's explicit per-item release from the portal Outbox
+     (POST /api/admin/mailq/:id/release). scheduled() never sends.
+
+   PU-04F status machine (record fields on mailq:<id>):
+     queued   — sent:false, no sendState (every record as queued)
+     released — sendState:{state:'released', at, by:'owner'} — stamped
+                by the release route BEFORE the provider call, so a
+                crash mid-call never reads as "never attempted"
+     sending  — sendState.state 'sending' (+attempt count) while the
+                provider call is in flight
+     sent     — sent:true + sent_at (the fields the outbox has always
+                read) + providerId + sendState.state 'sent'
+     failed   — sendState:{state:'failed', at, errorClass, attempts}
+                (record stays unsent; a later explicit release retries)
+     held     — sendState:{state:'held', at, reason} when send-time
+                re-validation refuses (below): NOT an error — the mail
+                simply may not go out as it stands any more.
+
+   PB2-04aR M2 / PM verdict item 2 — SEND-TIME RE-VALIDATION: the
+   release route never trusts stored state (not the queue-time policy
+   stamp, not a stored agentEmail.released flag, not yesterday's DNC
+   state). At send time it re-checks, in order: recipient format +
+   reserved domain (the queueMail policy, re-run), banned NOW, CRM
+   do-not-contact NOW (exempting transactional kinds exactly as
+   queueMail does), already-sent (a sent record is never re-sent —
+   the release answers {deduped:true}), and — for brain agent mail —
+   the CURRENT agent release gates re-evaluated from today's
+   cfg:brain + rules (sender configured, governing rule autoSend,
+   agent switch, critic/compliance review, market-contact block).
+   Any refusal leaves the record HELD with the reason stamped;
+   nothing is sent and nothing is silently dropped.
+
+   Provider failure honesty: a non-2xx Resend answer stamps 'failed'
+   with an error CLASS only (http_4xx / http_5xx / network /
+   bad_response) — provider bodies, which can echo recipient data,
+   are never stored on the record or logged. */
+const MAIL_FROM = 'EH Realty <hello@ehrealtybc.com>';
+const MAIL_RESEND_URL = 'https://api.resend.com/emails';
+async function mailCfg(env) { try { return await env.LEADS.get('cfg:mail', { type: 'json' }); } catch (e) { return null; } }
+async function mailSend(env, msg) {
+  const cfg = await mailCfg(env);
+  if (!cfg || cfg.provider !== 'resend' || !cfg.apiKey) return { ok: false, error: 'not_configured' };
+  let res = null;
+  try {
+    res = await fetch(MAIL_RESEND_URL, {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + cfg.apiKey, 'Content-Type': 'application/json', 'User-Agent': 'EHRealty-AdvisorWorker/1.0 (+https://ehrealtybc.com)' },
+      body: JSON.stringify({ from: MAIL_FROM, to: [msg.to], subject: msg.subject, text: msg.text, html: msg.html }),
+      signal: AbortSignal.timeout(15000)
+    });
+  } catch (e) { return { ok: false, errorClass: 'network' }; }
+  if (!res || !res.ok) return { ok: false, errorClass: res ? ('http_' + Math.floor(res.status / 100) + 'xx') : 'network' };
+  let j = null;
+  try { j = await res.json(); } catch (e) {}
+  if (!j || !j.id) return { ok: false, errorClass: 'bad_response' };
+  return { ok: true, id: String(j.id) };
+}
+/* The subject/html a record goes out with. Records carry their text in
+   body (manual composer / invites) or aiText (brain drafts — the
+   compliance-passed text; draft-edit stores the human's final there).
+   Subjects were designed per-kind at queue time in the pre-sender
+   era only for manual/agent mail; transactional kinds get their
+   standing subjects here, and the body renders the record's own
+   fields (all queue-time data — nothing is invented at send time,
+   so a stale record sends stale-but-truthful content or has already
+   died on its per-kind TTL). Brain/agent kinds WITHOUT a subject are
+   never composed here: they stay held (no_subject) until the owner
+   edits one in — inventing a subject at send time is exactly the
+   stored-state trust PB2-04aR M2 forbids. */
+function mailEsc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function mailSubjectFor(rec) {
+  if (rec.subject) return String(rec.subject).slice(0, 300);
+  const nm = rec.name ? ' ' + String(rec.name).split(' ')[0] : '';
+  switch (rec.kind) {
+    case 'verify': return 'Verify your EH Realty account';
+    case 'viewing': return rec.confirmed ? 'Your viewing is confirmed — EH Realty' : 'Your viewing request — EH Realty';
+    case 'alert': return 'New homes matching "' + String(rec.searchName || 'your saved search').slice(0, 80) + '" — EH Realty';
+    case 'reminder': case 'reminder_unconfirmed': return 'Reminder: your viewing' + (rec.date ? ' on ' + rec.date : '') + ' — EH Realty';
+    case 'academy_invite': return 'Your EH Realty Academy access';
+    default: return '';
+  }
+}
+function mailBodyFor(rec) {
+  const text = String(rec.aiText || rec.body || '');
+  if (text) return text;
+  const first = rec.name ? String(rec.name).split(' ')[0] : 'there';
+  const L = [];
+  if (rec.kind === 'verify') {
+    L.push('Hi ' + first + ',', '', 'Welcome to EH Realty. Confirm your email address to finish setting up your account:', '', 'https://ehrealtybc.com/listings.html?verify=' + String(rec.token || ''), '', 'If you did not create this account, you can ignore this email.', '', '— Erfan Hakimian, licensed REALTOR® in British Columbia.');
+  } else if (rec.kind === 'viewing') {
+    L.push('Hi ' + first + ',', '', rec.confirmed ? 'Your viewing is confirmed:' : 'We received your viewing request:', '');
+    if (rec.listing) L.push('Home: ' + (rec.listing.street || '') + (rec.listing.city ? ', ' + rec.listing.city : '') + (rec.listing.mls ? ' (MLS® ' + rec.listing.mls + ')' : ''));
+    if (rec.date) L.push('Date: ' + rec.date + (rec.time ? ' at ' + rec.time : ''));
+    L.push('', rec.confirmed ? 'If you need to change anything, just reply to this email.' : 'We will confirm shortly. If the time does not work, just reply to this email.', '', '— Erfan Hakimian, licensed REALTOR® in British Columbia.');
+  } else if (rec.kind === 'alert') {
+    L.push('Hi ' + first + ',', '', 'New homes matching "' + String(rec.searchName || 'your saved search') + '" (' + (rec.totalFresh || (rec.listings || []).length || 0) + '):', '');
+    for (const l of (rec.listings || []).slice(0, 20)) L.push('- $' + Number(l.price || 0).toLocaleString('en-CA') + ' — ' + (l.street || '') + (l.city ? ', ' + l.city : '') + ' — https://ehrealtybc.com/listing-' + (l.mls || '') + '.html');
+    L.push('', '— Erfan Hakimian, licensed REALTOR® in British Columbia.');
+  } else if (rec.kind === 'reminder' || rec.kind === 'reminder_unconfirmed') {
+    L.push('Hi ' + first + ',', '', 'A friendly reminder about your viewing' + (rec.date ? ' on ' + rec.date : '') + (rec.time ? ' at ' + rec.time : '') + ':', '');
+    if (rec.listing) L.push('Home: ' + (rec.listing.street || '') + (rec.listing.city ? ', ' + rec.listing.city : ''));
+    L.push('', rec.kind === 'reminder_unconfirmed' ? 'This viewing is not confirmed yet — reply to this email to confirm.' : 'See you then — reply to this email if anything changes.', '', '— Erfan Hakimian, licensed REALTOR® in British Columbia.');
+  } else {
+    L.push(text);
+  }
+  return L.join('\n');
+}
+function mailHtmlFor(rec, text) {
+  const ps = String(text || '').split(/\n{2,}/).map(function (p) { return '<p style="margin:0 0 14px;line-height:1.65;color:#15130E">' + mailEsc(p).replace(/\n/g, '<br>') + '</p>'; }).join('');
+  return '<!doctype html><html><body style="margin:0;padding:0;background:#FAFAF8"><div style="max-width:600px;margin:0 auto;padding:28px 22px;font-family:Georgia,\'Times New Roman\',serif">'
+    + '<div style="border-bottom:3px solid #C9A24B;padding-bottom:14px;margin-bottom:20px"><span style="font-size:22px;letter-spacing:.14em;color:#15130E">EH REALTY</span><div style="font-size:11px;letter-spacing:.28em;color:#8a6d1f;margin-top:2px">BY ERFAN HAKIMIAN</div></div>'
+    + ps
+    + '<div style="border-top:1px solid #e5e0d0;margin-top:22px;padding-top:12px;font-size:12px;color:#6b675c">EH Realty — the real estate practice of Erfan Hakimian, licensed REALTOR® in British Columbia, affiliated with [BROKERAGE].</div>'
+    + '</div></body></html>';
+}
+/* The agent release gates, re-evaluated fresh at send time — the
+   brainPrepareEmail computation (PMV1) extracted so the queue-time
+   evaluation and this send-time one can never drift apart. Returns
+   the same shape brainPrepareEmail records: {gates, released, gate}. */
+async function mailAgentGateEval(env, rec) {
+  const cfgB = await brainCfg(env);
+  let rules = { rules: [] };
+  try { rules = await puRulesGet(env); } catch (e) {}
+  const gov = (rules.rules || []).find(function (r) { return r.enabled === true && (r.actions || []).some(function (a) { return a.type === 'queue_draft'; }); });
+  const senderOk = !!cfgB.sender;
+  const autoSend = !!(gov && gov.autoSend === true);
+  const agentSwitch = cfgB.agentAutoSend === true;
+  const criticSt = (rec.critic && rec.critic.status) || (rec.agentEmail && rec.agentEmail.critic) || 'unchecked';
+  const issues = (rec.agentEmail && rec.agentEmail.compliance) || rec.compliance || [];
+  const blockingIssues = issues.filter(function (i) { return i !== 'licensing disclosure appended'; });
+  const reviewOk = (criticSt === 'passed' || criticSt === 'revised') && blockingIssues.length === 0;
+  const marketBlock = !!(rec.ref && String(rec.ref).indexOf('mlead:') === 0);
+  const released = senderOk && autoSend && agentSwitch && reviewOk && !marketBlock;
+  const gate = released ? null : (!senderOk ? 'sender_not_configured' : (!autoSend ? 'autosend_off' : (!agentSwitch ? 'agent_switch_off' : (marketBlock ? 'market_contact' : 'review'))));
+  return { gates: { sender: senderOk, autoSend: autoSend, agentSwitch: agentSwitch, review: reviewOk, market: !marketBlock, rule: gov ? gov.id : null }, released: released, gate: gate };
+}
+/* Send-time re-validation + the send itself (PB2-04aR M2). Mutates +
+   persists the record through every transition; returns an outcome
+   the route answers with. NEVER called by scheduled() — the owner is
+   the only trigger (the release route below). */
+async function mailReleaseSend(env, mid, ip) {
+  const raw = await env.LEADS.get('mailq:' + mid);
+  if (!raw) return { status: 404, body: { ok: false, error: 'not_found' } };
+  let rec = null;
+  try { rec = JSON.parse(raw); } catch (e) {}
+  if (!rec) return { status: 500, body: { ok: false, error: 'corrupt' } };
+  const hold = async function (reason) {
+    rec.sendState = { state: 'held', at: new Date().toISOString(), reason: reason };
+    try { await env.LEADS.put('mailq:' + mid, JSON.stringify(rec)); } catch (e) {}
+    return { status: 409, body: { ok: false, error: 'held', reason: reason } };
+  };
+  // Per-recipient dedupe on release: a sent record is never re-sent,
+  // and a concurrent in-flight release (fresh 'sending' stamp) is a
+  // duplicate attempt, not a second send. A stale 'sending' (>10 min —
+  // the provider timeout is 15s, so this can only be a crashed run)
+  // falls through and may retry.
+  if (rec.sent) return { status: 200, body: { ok: true, deduped: true, sent: true, providerId: rec.providerId || null } };
+  const prev = rec.sendState || {};
+  if (prev.state === 'sending' && prev.at && (Date.now() - Date.parse(prev.at)) < 10 * 60000) return { status: 200, body: { ok: true, deduped: true, sending: true } };
+  const cfgM = await mailCfg(env);
+  if (!cfgM || cfgM.provider !== 'resend' || !cfgM.apiKey) return { status: 503, body: { ok: false, error: 'not_configured' } };
+  /* --- re-validation (fresh reads; stored state is never trusted) --- */
+  const to = String(rec.to || '');
+  if (!to || /[\r\n]/.test(to) || !EMAIL_RE.test(to) || to.length > 254) return hold('invalid_recipient');
+  const dom = to.slice(to.lastIndexOf('@') + 1).toLowerCase();
+  if (/\.(local|internal|invalid|test|example)$/.test(dom) || !/\.[a-z]{2,}$/.test(dom)) return hold('reserved_domain');
+  if (await isBanned(env, to)) return hold('banned');
+  if (!MAIL_POLICY_TRANSACTIONAL.has(String(rec.kind || ''))) {
+    const cm = await getCMeta(env, normEmail(to));
+    if (cm && cm.dnc) return hold('do_not_contact');
+  }
+  if (rec.agentEmail) {
+    const ev = await mailAgentGateEval(env, rec);
+    rec.agentEmail.gates = ev.gates;
+    rec.agentEmail.released = ev.released;
+    rec.agentEmail.sendGate = ev.gate;
+    if (!ev.released) return hold('agent_gate:' + ev.gate);
+  }
+  const subject = mailSubjectFor(rec);
+  if (!subject) return hold('no_subject');
+  const text = mailBodyFor(rec);
+  if (!text.trim()) return hold('empty_body');
+  /* --- the state machine transitions --- */
+  const attempts = (typeof prev.attempts === 'number' ? prev.attempts : 0) + 1;
+  rec.sendState = { state: 'released', at: new Date().toISOString(), by: 'owner', attempts: attempts };
+  await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
+  rec.sendState = { state: 'sending', at: new Date().toISOString(), by: 'owner', attempts: attempts };
+  await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
+  const out = await mailSend(env, { to: to, subject: subject, text: text, html: mailHtmlFor(rec, text) });
+  if (!out.ok && out.error === 'not_configured') { // cfg vanished between the check and the call — unwind to plain held-queue state
+    rec.sendState = { state: 'held', at: new Date().toISOString(), reason: 'not_configured' };
+    await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
+    return { status: 503, body: { ok: false, error: 'not_configured' } };
+  }
+  if (!out.ok) {
+    rec.sendState = { state: 'failed', at: new Date().toISOString(), errorClass: out.errorClass || 'unknown', attempts: attempts };
+    await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
+    try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_release_failed', target: mid, ip: ip, at: new Date().toISOString(), detail: { errorClass: rec.sendState.errorClass, attempts: attempts } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+    return { status: 502, body: { ok: false, error: 'send_failed', errorClass: rec.sendState.errorClass, attempts: attempts } };
+  }
+  rec.sent = true;
+  rec.sent_at = new Date().toISOString();
+  rec.providerId = out.id;
+  rec.sendState = { state: 'sent', at: rec.sent_at, attempts: attempts, providerId: out.id };
+  await env.LEADS.put('mailq:' + mid, JSON.stringify(rec), { expirationTtl: 90 * 86400 }); // the PU-04F convention: sent records age out
+  try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_release_sent', target: mid, ip: ip, at: rec.sent_at, detail: { provider: 'resend', providerId: out.id, kind: rec.kind || '' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+  if (rec.aiText) { try { await brainOutcome(env, { type: 'draft_approved', ref: rec.ref || '', edited: !!rec.aiEdited }); } catch (e) {} } // the PU-04F feedback-loop hook, preserved
+  return { status: 200, body: { ok: true, sent: true, providerId: out.id } };
+}
+
 // ---- visitor sessions (usess:) — Pack PMV1 key hashing (PM P12) ----
 // The session token used to BE the KV key ('usess:' + token), so a KV
 // list or dump exposed every live visitor session. New sessions are
@@ -10822,7 +11056,50 @@ async function handleRequest(request, env, ctx) {
           return json({ deleted: true }, 200, origin);
         }
         if (action && request.method === 'POST') {
-          if (action === 'resend-invite') return json({ error: 'mail_not_configured' }, 501, origin); // spec-only until D4; no audit — nothing happened
+          if (action === 'resend-invite') {
+            /* Pack MailSend (2026-11-10): D4 is resolved — the invite
+               goes through the SAME mailer as everything else (queue
+               via queueMail's policy, then the owner's release
+               machinery performs the send in-line here: this action
+               IS the explicit owner release for this one email).
+               Before cfg:mail exists it answers the honest
+               not_configured (503) — the old 501 "mail undecided"
+               state is gone. A blocked student never gets an invite;
+               an expired one may (the invite is how they renew). */
+            if (!rec) return json({ error: 'not_found' }, 404, origin);
+            const cfgMi = await mailCfg(env);
+            if (!cfgMi || cfgMi.provider !== 'resend' || !cfgMi.apiKey) return json({ ok: false, error: 'not_configured' }, 503, origin);
+            if (rec.status === 'blocked') return json({ error: 'student_blocked' }, 409, origin);
+            const invName = String(rec.email || '').split('@')[0];
+            const invBody = [
+              'Hi ' + invName + ',',
+              '',
+              'Your EH Realty Academy access is ready. Sign in to the student portal with this email address to continue your BC real estate licensing exam preparation:',
+              '',
+              'https://academy.ehrealtybc.com/portal/',
+              '',
+              'Your access window runs until ' + String(rec.expiresAt || '').slice(0, 10) + '. The course is self-paced — lessons, quizzes and mock exams are all inside the portal.',
+              '',
+              'Questions? Just reply to this email.',
+              '',
+              '— Erfan Hakimian, licensed REALTOR® in British Columbia.'
+            ].join('\n');
+            const invMid = await queueMail(env, { kind: 'academy_invite', to: rec.email, lang: 'en', name: invName, subject: 'Your EH Realty Academy access', body: invBody, ref: 'academy:' + ne }, { key: 'academyinv:' + ne + ':' + todayVancouver(), consentBasis: 'enrolment' });
+            // queueMail dedupes per student per day (invMid null) and
+            // drops banned recipients silently (also null) — either
+            // way there is nothing new to release today.
+            if (!invMid) return json({ ok: true, queued: false, deduped: true }, 200, origin);
+            const invRel = await mailReleaseSend(env, invMid, ip);
+            if (invRel.status === 200 && invRel.body && invRel.body.sent) {
+              await academyAudit(env, 'academy.resend_invite', ne, ip, { providerId: invRel.body.providerId || null });
+              return json({ ok: true, queued: true, sent: true, providerId: invRel.body.providerId || null }, 200, origin);
+            }
+            // Queued fine but the send did not complete (provider
+            // failure, or send-time re-validation held it): the record
+            // waits in the Outbox like any other held mail, and the
+            // answer says exactly that — never a fake "sent".
+            return json({ ok: true, queued: true, sent: false, release: invRel.body }, invRel.status === 502 ? 502 : 200, origin);
+          }
           if (!rec) return json({ error: 'not_found' }, 404, origin);
           let d = null;
           try { d = await request.json(); } catch (e) {}
@@ -11701,6 +11978,45 @@ async function handleRequest(request, env, ctx) {
           if (rec.aiText) { try { await brainOutcome(env, { type: 'draft_approved', ref: rec.ref || '', edited: !!rec.aiEdited }); } catch (e) {} } // Portal Brain 2 feedback loop
         }
         return json({ ok: true }, 200, origin);
+      }
+      /* Pack MailSend (2026-11-10): the REAL send — the owner's
+         explicit per-item release from the Outbox. Distinct from the
+         PATCH above, which stays the honest "I sent this outside the
+         platform" bookkeeping mark (its records carry no providerId,
+         so the two histories can never be confused). Release runs the
+         PU-04F state machine + send-time re-validation in
+         mailReleaseSend; it is the ONLY route that transmits mail. */
+      const mqr = path.match(/^\/api\/admin\/mailq\/([A-Za-z0-9-]+)\/release$/);
+      if (mqr && request.method === 'POST') {
+        const rr = await mailReleaseSend(env, mqr[1], ip);
+        return json(rr.body, rr.status, origin);
+      }
+      /* Pack MailSend: mail provider provisioning — the stripe-
+         provision pattern verbatim. cfg:mail {provider:'resend',
+         apiKey} is EH Realty's OWN Resend key (hello@ehrealtybc.com);
+         one-shot (409 once set), values never echoed, logged or
+         returned. Rotation afterwards is a deliberate cfg edit, never
+         a re-provision. */
+      if (path === '/api/admin/mail/provision' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const ak = String(d.apiKey || '');
+        if (ak.length < 16 || ak.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
+        const curM = (await env.LEADS.get('cfg:mail', { type: 'json' })) || {};
+        if (curM.apiKey) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+        curM.provider = 'resend';
+        curM.apiKey = ak;
+        curM.from = MAIL_FROM;
+        curM.provisionedAt = new Date().toISOString();
+        await env.LEADS.put('cfg:mail', JSON.stringify(curM));
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_provision', target: 'cfg:mail', ip: ip, at: new Date().toISOString(), detail: { provider: 'resend' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, provider: 'resend' }, 200, origin);
+      }
+      if (path === '/api/admin/mail/status' && request.method === 'GET') {
+        // Booleans only — no key material ever leaves this route.
+        const cfgMs = (await env.LEADS.get('cfg:mail', { type: 'json' })) || {};
+        return json({ ok: true, configured: !!cfgMs.apiKey, provider: cfgMs.apiKey ? (cfgMs.provider || null) : null, from: cfgMs.apiKey ? MAIL_FROM : null, provisionedAt: cfgMs.provisionedAt || null }, 200, origin);
       }
 
       // ---- admin: config values in KV (e.g. cfg:gcal bridge) ----
