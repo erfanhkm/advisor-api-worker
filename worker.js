@@ -57,6 +57,8 @@
 
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
+  'https://ehrealtybc.com',
+  'https://www.ehrealtybc.com',
   'https://muse.ai',
   // APP (2026-11-02): the Capacitor apps' WebView origins — Android serves
   // the bundled site from https://localhost, iOS from capacitor://localhost.
@@ -80,7 +82,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
 const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push']; // Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
-const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'muse.ai'];
+const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
 function cors(origin) {
   const h = {
