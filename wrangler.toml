@@ -8,17 +8,15 @@ compatibility_date = "2026-10-19"
 binding = "LEADS"
 id = "1ed2126e01ef4891be0ce12890136b03"
 
-# Pack AcademyR2Video (2026-11-10): PRIVATE R2 bucket for Academy lesson
-# HLS — no public access, no r2.dev subdomain, no custom domain. The
-# worker binding is the only reader; playback goes through the signed
-# token routes in worker.js (video-protection spec §2–§3). Until R2 is
-# enabled on the account and this bucket exists, the binding line below
-# must stay COMMENTED OUT (an uncommented binding to a missing bucket
-# fails the deploy). Enable sequence is in
-# hidden_files/pack-academy-r2-video-build-2026-11-10.md.
-# [[r2_buckets]]
-# binding = "ACADEMY_VIDEO"
-# bucket_name = "eh-realty-academy-videos"
+# Pack AcademyB2Video (2026-11-10): the Academy HLS media store is the
+# PRIVATE Backblaze B2 bucket 'eh-realty-academy-videos' (S3 endpoint
+# s3.ca-east-006.backblazeb2.com), reached from worker.js over the
+# S3-compatible API with worker-side SigV4 — NO binding exists or is
+# needed; credentials live in KV cfg:b2 (one-shot bearer-carried
+# provision). The Pack AcademyR2Video R2 binding that used to sit here
+# was REMOVED (never uncommented, never provisioned: R2 activation on
+# this account demands a payment method). Record:
+# hidden_files/pack-academy-b2-video-build-2026-11-10.md.
 
 # Service bindings: worker-to-worker calls (public fetch between *.workers.dev is blocked at the edge, error 1042)
 [[services]]

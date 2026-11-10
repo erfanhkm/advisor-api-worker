@@ -80,7 +80,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video']; // Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2']; // Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -1012,6 +1012,19 @@ async function scopedAuthed(request, env, path, method) {
     // the booleans-only status. Nothing else Stripe-related is in scope.
     (method === 'POST' && path === '/api/admin/academy/stripe-provision') ||
     (method === 'GET' && path === '/api/admin/academy/stripe-status') ||
+    // Pack AcademyB2Video (2026-11-10): the Academy B2 pair + transfer
+    // routes join the SERVICE set with the brain posture — the one-shot
+    // bearer-carried provision (the route itself refuses a part once
+    // set, values never echoed), the booleans-only status, the
+    // object-through-worker upload, and the read-only verify. The
+    // upload/verify routes exist ONLY so the operator's transfer script
+    // can move the packaged HLS set through the worker (the worker is
+    // the only holder of the B2 credentials). Nothing else B2-related
+    // is in scope.
+    (method === 'GET' && path === '/api/admin/academy/b2-status') ||
+    (method === 'PUT' && path === '/api/admin/academy/b2-object') ||
+    (method === 'GET' && path === '/api/admin/academy/b2-object') ||
+    (method === 'GET' && path === '/api/admin/academy/b2-list') ||
     // Pack L (2026-11-02): the monthly newsletter job publishes the
     // Market Pulse dataset with the service token — /api/login is
     // Turnstile-gated server-side, so a job can never hold an admin
@@ -3289,9 +3302,12 @@ function academyAddMonths(iso, months) {
 }
 /* ---- Academy video tokens (Pack AcademyR2Video, 2026-11-10) ----
    Signed-HLS gate to hidden_files/academy-video-protection-2026-11-09.md
-   §2–§3. Objects live in the PRIVATE R2 bucket bound as
-   env.ACADEMY_VIDEO under media/<lessonId>/<lang>/… (HLS renditions
-   only — no MP4 object ever exists in the bucket). Playback is
+   §2–§3. Objects live in the PRIVATE Backblaze B2 bucket
+   'eh-realty-academy-videos' under media/<lessonId>/<lang>/… (HLS
+   renditions only — no MP4 object ever exists in the bucket), read
+   ONLY through the worker's SigV4 B2 client (Pack AcademyB2Video,
+   2026-11-10 — the original R2 binding could never be provisioned:
+   R2 activation on the account demands a payment method). Playback is
    two-step: (1) POST /api/academy/video-token runs the entitlement
    gate above (academyEntitlement with readOnly:false — video tokens
    are NEVER grace-exempt, §4.4/§4.5) and mints a ≤10-minute token;
@@ -3342,6 +3358,157 @@ async function academyVideoVerifyToken(secret, token, nowMs) {
 function academyVideoMediaHeaders(contentType) {
   // Spec §3: segments/playlists must not land in shared caches.
   return { 'Content-Type': contentType, 'Cache-Control': 'private, no-store' };
+}
+
+/* ---- Academy media store = Backblaze B2 (Pack AcademyB2Video,
+   2026-11-10) ----
+   REPLACES the R2 binding of Pack AcademyR2Video: R2 activation on the
+   Cloudflare account demands a payment method (declined by Erfan), so
+   the objects live in the PRIVATE Backblaze B2 bucket
+   'eh-realty-academy-videos' (S3-compatible endpoint
+   s3.ca-east-006.backblazeb2.com) and the WORKER is the only reader —
+   the bucket has no public surface, exactly the video-protection
+   spec's posture. The worker talks to B2 with SigV4 (WebCrypto HMAC
+   chain, service 's3', region derived from the endpoint host —
+   ca-east-006 → ca-east-006 signs fine because B2 validates the
+   credential-scope region against its endpoint region).
+   Credentials live ONLY in KV cfg:b2 {keyId, appKey, bucket, endpoint,
+   provisionedAt} — written via the one-shot bearer-carried provision
+   route (POST /api/admin/academy/b2-provision; the value rides the
+   Authorization: Bearer header because the authd surrogate swap fires
+   for the REGISTERED bearer placement toward this host — the Stripe
+   packs proved body-carried and custom-header-carried surrogates reach
+   the worker VERBATIM, pack-academy-stripe-build-2026-11-10.md
+   §13+§15). Values are never echoed, logged or returned; b2-status is
+   booleans only. The store surface mirrors the old binding exactly:
+   academyB2Get → {body, size, text()} | null; academyB2Head → {size}
+   | null — so the playback route's behaviour (token re-verified on
+   playlist AND every segment, playlist URI rewriting, Range
+   200/206/416, no-store) is unchanged byte-for-byte. */
+const ACADEMY_B2_BUCKET = 'eh-realty-academy-videos';
+const ACADEMY_B2_ENDPOINT = 's3.ca-east-006.backblazeb2.com';
+const ACADEMY_B2_REGION = 'ca-east-006';
+const ACADEMY_B2_KEY_RE = /^media\/[a-z0-9]+(?:-[a-z0-9]+)*\/(?:en|fa|hi|zh|es)\/[A-Za-z0-9._-]+$/;
+async function academyB2Cfg(env) { try { return await env.LEADS.get('cfg:b2', { type: 'json' }); } catch (e) { return null; } }
+function academyB2Ready(cfg) { return !!(cfg && cfg.keyId && cfg.appKey); }
+async function academyB2Sha256HexBytes(bytes) {
+  const buf = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function academyB2Hmac(keyBytes, data) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
+}
+function academyB2AmzDates(nowMs) {
+  const iso = new Date(nowMs).toISOString(); // 2026-11-10T21:23:45.678Z
+  const amz = iso.replace(/[:-]|\.\d{3}/g, '');
+  return { amz: amz, day: amz.slice(0, 8) };
+}
+async function academyB2Sign(cfg, o) {
+  // SigV4 core. o = {method, host, region, path, query:[[k,v]…] (already
+  // percent-encoded pairs), signedHeaders:{lowerName: value}, payloadHash}
+  // → {url, headers} with the Authorization header attached. The
+  // canonical URI keeps '/' separators unencoded (the S3/B2 style;
+  // each segment is encodeURIComponent'd).
+  const dates = academyB2AmzDates(o.nowMs);
+  const names = Object.keys(o.signedHeaders).sort();
+  let canonicalHeaders = '';
+  for (const n of names) canonicalHeaders += n + ':' + String(o.signedHeaders[n]).trim() + '\n';
+  const signedNames = names.join(';');
+  const canonUri = o.path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/').replace(/%2F/g, '/'); // SigV4: '/' separators stay literal (a key's slashes are path structure, not data — B2/S3 canonicalise them unencoded; the query VALUES keep their encoding, prefix=media%2F included)
+  const canonPairs = (o.query || []).slice().sort(function (a, b) { return a[0] < b[0] ? -1 : (a[0] > b[0] ? 1 : (a[1] < b[1] ? -1 : (a[1] > b[1] ? 1 : 0))); });
+  const canonQuery = canonPairs.map(function (p) { return p[0] + '=' + p[1]; }).join('&'); // SigV4 canonical query = pairs SORTED by name (then value); the URL below uses the same sorted order
+  const canonReq = [o.method, canonUri, canonQuery, canonicalHeaders, signedNames, o.payloadHash].join('\n');
+  const scope = dates.day + '/' + o.region + '/s3/aws4_request';
+  const stringToSign = ['AWS4-HMAC-SHA256', dates.amz, scope, await academyB2Sha256HexBytes(new TextEncoder().encode(canonReq))].join('\n');
+  const enc = new TextEncoder();
+  const kDate = await academyB2Hmac(enc.encode('AWS4' + cfg.appKey), dates.day);
+  const kRegion = await academyB2Hmac(kDate, o.region);
+  const kService = await academyB2Hmac(kRegion, 's3');
+  const kSigning = await academyB2Hmac(kService, 'aws4_request');
+  const sigKey = await crypto.subtle.importKey('raw', kSigning, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = [...new Uint8Array(await crypto.subtle.sign('HMAC', sigKey, enc.encode(stringToSign)))].map(b => b.toString(16).padStart(2, '0')).join('');
+  const headers = {};
+  for (const n of names) headers[n] = o.signedHeaders[n];
+  headers['Authorization'] = 'AWS4-HMAC-SHA256 Credential=' + cfg.keyId + '/' + scope + ', SignedHeaders=' + signedNames + ', Signature=' + sig;
+  const url = 'https://' + o.host + canonUri + (canonQuery ? '?' + canonQuery : '');
+  return { url: url, headers: headers };
+}
+async function academyB2Request(env, method, key, opts) {
+  // One signed B2 S3 call. opts: {body (Uint8Array), contentType,
+  // rangeHeader, query ([[k,v]…]), payloadHash}. Returns the raw fetch
+  // Response; callers own the status interpretation. Throws only when
+  // cfg:b2 is not provisioned.
+  const o = opts || {};
+  const cfg = await academyB2Cfg(env);
+  if (!academyB2Ready(cfg)) throw new Error('b2_not_configured');
+  const bucket = String(cfg.bucket || ACADEMY_B2_BUCKET);
+  const host = String(cfg.endpoint || ACADEMY_B2_ENDPOINT);
+  const region = host.split('.')[1] || ACADEMY_B2_REGION;
+  const path = '/' + bucket + (key ? '/' + key : '');
+  const body = o.body || null;
+  const payloadHash = o.payloadHash || (body ? await academyB2Sha256HexBytes(body) : await academyB2Sha256HexBytes(new Uint8Array(0)));
+  const dates = academyB2AmzDates(Date.now());
+  const signedHeaders = { 'host': host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': dates.amz };
+  if (body && o.contentType) signedHeaders['content-type'] = o.contentType;
+  if (o.rangeHeader) signedHeaders['range'] = o.rangeHeader;
+  const signed = await academyB2Sign(cfg, { method: method, host: host, region: region, path: path, query: o.query || [], signedHeaders: signedHeaders, payloadHash: payloadHash, nowMs: Date.now() });
+  const init = { method: method, headers: signed.headers };
+  if (body) init.body = body;
+  if (o.rangeHeader) init.headers['Range'] = o.rangeHeader;
+  return await fetch(signed.url, init);
+}
+async function academyB2Get(env, key, range) {
+  // Mirrors the R2 binding's get(): range = {offset, length} → the
+  // same byte slice (B2 honours the Range header; a start past the end
+  // answers 416 → null, and the route then answers 404 — the binding
+  // returned the object for the head() probe first, so the 416 branch
+  // still fires in the route before this call).
+  let resp;
+  try {
+    resp = await academyB2Request(env, 'GET', key, range ? { rangeHeader: 'bytes=' + range.offset + '-' + (range.offset + range.length - 1) } : {});
+  } catch (e) { return null; }
+  if (!resp || resp.status === 404 || resp.status === 416) return null;
+  if (resp.status !== 200 && resp.status !== 206) return null;
+  const len = parseInt(resp.headers.get('Content-Length') || '0', 10);
+  return {
+    body: resp.body,
+    size: isFinite(len) && len > 0 ? len : 0,
+    text: async function () { return await resp.clone().text(); }
+  };
+}
+async function academyB2Head(env, key) {
+  let resp;
+  try { resp = await academyB2Request(env, 'HEAD', key, {}); } catch (e) { return null; }
+  if (!resp || resp.status !== 200) return null;
+  const len = parseInt(resp.headers.get('Content-Length') || '0', 10);
+  return { size: isFinite(len) ? len : 0 };
+}
+async function academyB2Put(env, key, bytes, contentType) {
+  let resp;
+  try { resp = await academyB2Request(env, 'PUT', key, { body: bytes, contentType: contentType }); } catch (e) { return { ok: false, status: 0 }; }
+  if (!resp) return { ok: false, status: 0 };
+  return { ok: resp.status === 200, status: resp.status };
+}
+async function academyB2List(env, prefix, maxKeys) {
+  // ListObjectsV2 under a prefix → {keys:[{key,size}], count, bytes,
+  // truncated}. Sizes feed the upload verification totals.
+  const query = [['list-type', '2'], ['max-keys', String(Math.min(Math.max(maxKeys || 1000, 1), 1000))]];
+  if (prefix) query.push(['prefix', encodeURIComponent(prefix)]);
+  let resp;
+  try { resp = await academyB2Request(env, 'GET', '', { query: query }); } catch (e) { return null; }
+  if (!resp || resp.status !== 200) return null;
+  const xml = await resp.text();
+  const keys = [];
+  let bytes = 0;
+  const re = /<Contents>([\s\S]*?)<\/Contents>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const km = m[1].match(/<Key>([\s\S]*?)<\/Key>/);
+    const sm = m[1].match(/<Size>(\d+)<\/Size>/);
+    if (km) { const sz = sm ? parseInt(sm[1], 10) : 0; keys.push({ key: km[1], size: sz }); bytes += sz; }
+  }
+  return { keys: keys, count: keys.length, bytes: bytes, truncated: /<IsTruncated>true<\/IsTruncated>/.test(xml) };
 }
 
 function effectiveStatus(rec, nowMs) {
@@ -8103,7 +8270,7 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { return p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768))))); };
+    const bodyCapFor = function (p) { return p === '/api/admin/academy/b2-object' ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -9483,14 +9650,18 @@ async function handleRequest(request, env, ctx) {
         const vclaims = await academyVideoVerifyToken(String(cfgV2.tokenSecret), url.searchParams.get('t') || '', Date.now());
         if (!vclaims) return json({ ok: false, error: 'invalid_token' }, 403, origin);
         if (vclaims.lesson !== vm[1] || vclaims.lang !== vm[2]) return json({ ok: false, error: 'token_mismatch' }, 403, origin);
-        if (!env.ACADEMY_VIDEO) return json({ ok: false, error: 'media_unavailable' }, 503, origin);
+        // Pack AcademyB2Video: the media store is Backblaze B2 behind
+        // cfg:b2 (the R2 binding was never provisionable — R2
+        // activation needs a payment method). Unprovisioned B2 keeps
+        // the same fail-closed 503 shape the binding check produced.
+        if (!academyB2Ready(await academyB2Cfg(env))) return json({ ok: false, error: 'media_unavailable' }, 503, origin);
         const file = vm[3];
         const fileOk = /^[A-Za-z0-9._-]+$/.test(file) && file.indexOf('..') === -1 &&
           (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file) || /^seg-\d{4}\.ts$/.test(file) || file === 'captions.vtt');
         if (!fileOk) return json({ ok: false, error: 'not_found' }, 404, origin);
         const objKey = 'media/' + vm[1] + '/' + vm[2] + '/' + file;
         if (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file)) {
-          const obj = await env.ACADEMY_VIDEO.get(objKey);
+          const obj = await academyB2Get(env, objKey);
           if (!obj) return json({ ok: false, error: 'not_found' }, 404, origin);
           let text = await obj.text();
           const tok = url.searchParams.get('t');
@@ -9511,21 +9682,22 @@ async function handleRequest(request, env, ctx) {
           return new Response(text, { status: 200, headers: academyVideoMediaHeaders('application/vnd.apple.mpegurl') });
         }
         if (file === 'captions.vtt') {
-          const cap = await env.ACADEMY_VIDEO.get(objKey);
+          const cap = await academyB2Get(env, objKey);
           if (!cap) return json({ ok: false, error: 'not_found' }, 404, origin);
           return new Response(cap.body, { status: 200, headers: academyVideoMediaHeaders('text/vtt; charset=utf-8') });
         }
         // Segment: full-object stream, or a single Range slice when the
-        // player asks (R2's range read keeps the 206 semantics local).
+        // player asks (the B2 range read keeps the 206 semantics local,
+        // exactly as the R2 range read did).
         const rangeH = request.headers.get('Range') || '';
         const rm = rangeH.match(/^bytes=(\d+)-(\d*)$/);
         if (rm) {
-          const head = await env.ACADEMY_VIDEO.head(objKey);
+          const head = await academyB2Head(env, objKey);
           if (!head) return json({ ok: false, error: 'not_found' }, 404, origin);
           const start = parseInt(rm[1], 10);
           if (start >= head.size) return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */' + head.size, 'Cache-Control': 'private, no-store' } });
           const end = rm[2] ? Math.min(parseInt(rm[2], 10), head.size - 1) : head.size - 1;
-          const part = await env.ACADEMY_VIDEO.get(objKey, { range: { offset: start, length: end - start + 1 } });
+          const part = await academyB2Get(env, objKey, { offset: start, length: end - start + 1 });
           if (!part) return json({ ok: false, error: 'not_found' }, 404, origin);
           const h = academyVideoMediaHeaders('video/mp2t');
           h['Content-Range'] = 'bytes ' + start + '-' + end + '/' + head.size;
@@ -9533,7 +9705,7 @@ async function handleRequest(request, env, ctx) {
           h['Content-Length'] = String(end - start + 1);
           return new Response(part.body, { status: 206, headers: h });
         }
-        const seg = await env.ACADEMY_VIDEO.get(objKey);
+        const seg = await academyB2Get(env, objKey);
         if (!seg) return json({ ok: false, error: 'not_found' }, 404, origin);
         const sh = academyVideoMediaHeaders('video/mp2t');
         sh['Accept-Ranges'] = 'bytes';
@@ -9566,7 +9738,13 @@ async function handleRequest(request, env, ctx) {
          the same token). A legitimate owner mistyping never comes
          near 60; a sprayer hits the wall fast. Only FAILURES count —
          a passing authed/scopedAuthed never increments. */
-      if (!(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
+      /* Pack AcademyB2Video: POST /api/admin/academy/b2-provision is
+         EXEMPT from this generic gate — its value call carries the
+         credential in the Bearer slot itself, so the gate cannot
+         test it; the route re-runs the gate's test in-handler with
+         the value-shaped call admitted (one-shot + shape + audit
+         are its controls). All other routes: gate unchanged. */
+      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         const admIp = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
         if (limited('adm:' + admIp, 60, 3600000)) return json({ ok: false, error: 'rate_limited' }, 429, origin);
         return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -11474,8 +11652,128 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/admin/academy/video-status' && request.method === 'GET') {
         // Booleans only — no secret material ever leaves this route.
+        // Pack AcademyB2Video: bucketBound now reports the B2 store
+        // (cfg:b2 complete) — the R2 binding it used to report was
+        // never provisionable.
         const cfg = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
-        return json({ ok: true, configured: !!cfg.tokenSecret, provisionedAt: cfg.provisionedAt || null, bucketBound: !!env.ACADEMY_VIDEO }, 200, origin);
+        const b2cfg = await academyB2Cfg(env);
+        return json({ ok: true, configured: !!cfg.tokenSecret, provisionedAt: cfg.provisionedAt || null, bucketBound: academyB2Ready(b2cfg) }, 200, origin);
+      }
+      // ---- admin: Academy × Backblaze B2 (Pack AcademyB2Video) ----
+      // The B2 credentials arrive in TWO one-shot calls, one per part
+      // (keyId, appKey), each carried in the Authorization: Bearer
+      // header — the REGISTERED bearer placement toward this host, the
+      // one placement the authd surrogate swap provably rewrites (the
+      // Stripe packs proved body + custom-header carriers arrive
+      // verbatim; §13+§15 of that pack record). Each call therefore
+      // presents EITHER a 48-hex SERVICE token (agent provisioning —
+      // scopedAuthed is re-checked in-handler because the Bearer slot
+      // is occupied by the value; the two token shapes, 48-hex scoped
+      // vs 64-hex session, are disjoint from the key shapes) OR a
+      // session token whose body's {part, value?} value is used
+      // (owner path). A part refuses once set (rotation = a deliberate
+      // cfg edit); values are never echoed, logged or returned; every
+      // accepted part writes a b2_provision audit carrying the part
+      // name ONLY.
+      if (path === '/api/admin/academy/b2-provision' && request.method === 'POST') {
+        // PRE-GATE OWNERSHIP (Pack AcademyB2Video fix, same turn): the
+        // generic admin gate above requires a session OR a scoped
+        // token in the Bearer slot — but the agent provision call
+        // carries the VALUE in that slot, so the gate would 401 the
+        // exact call this route exists for (the Stripe packs' lesson:
+        // a value carrier and the gate credential cannot share one
+        // slot). This route therefore repeats the gate's test with
+        // the value-shaped call admitted: session → authenticated;
+        // 48-hex service token → scoped (probe only, never stored);
+        // any other non-empty Bearer on THIS route → the value call,
+        // admitted to the handler, whose one-shot + shape validation
+        // + audit are the control. Every OTHER admin route keeps the
+        // generic gate untouched.
+        {
+          const authH0 = request.headers.get('Authorization') || '';
+          const b0 = (authH0.match(/^Bearer (.+)$/) || [])[1] || '';
+          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method)) || b0.length > 0;
+          if (!admitted) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        }
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const part = String(d.part || '');
+        if (part !== 'keyId' && part !== 'appKey') return json({ ok: false, error: 'validation' }, 400, origin);
+        const cur = (await env.LEADS.get('cfg:b2', { type: 'json' })) || {};
+        if (cur[part]) return json({ ok: false, error: 'already_provisioned', part: part }, 409, origin);
+        const authH = request.headers.get('Authorization') || '';
+        const bm = authH.match(/^Bearer (.+)$/);
+        const bearer = bm ? bm[1] : '';
+        const viaService = await scopedAuthed(request, env, path, request.method);
+        let value = '';
+        if (/^[0-9a-f]{64}$/.test(bearer)) {
+          // An ADMIN SESSION occupies the Bearer slot (the route sits
+          // behind the admin gate, which has already authenticated the
+          // caller): the value rides the BODY — the owner path.
+          value = String(d.value || '');
+        } else if (bearer) {
+          // The Bearer IS the value (the agent path): how the vault
+          // surrogate reaches the worker in its REGISTERED placement.
+          // The scoped token itself (48 hex) must never be stored as a
+          // key part — a bare service call with no distinct value is a
+          // probe, not a provision.
+          if (/^[0-9a-f]{48}$/.test(bearer)) return json({ ok: false, error: 'validation' }, 400, origin);
+          value = bearer;
+        } else {
+          value = String(d.value || '');
+        }
+        if (part === 'keyId' && !/^[0-9a-f]{12,64}$/.test(value)) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (part === 'appKey' && (value.length < 16 || value.length > 128)) return json({ ok: false, error: 'validation' }, 400, origin);
+        cur[part] = value;
+        cur.bucket = ACADEMY_B2_BUCKET;
+        cur.endpoint = ACADEMY_B2_ENDPOINT;
+        if (cur.keyId && cur.appKey && !cur.provisionedAt) cur.provisionedAt = new Date().toISOString();
+        cur.updatedAt = new Date().toISOString();
+        await env.LEADS.put('cfg:b2', JSON.stringify(cur));
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'b2_provision', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { part: part, via: (/^[0-9a-f]{64}$/.test(bearer) || !bearer) ? 'session' : 'service_bearer' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, part: part, complete: !!(cur.keyId && cur.appKey) }, 200, origin);
+      }
+      if (path === '/api/admin/academy/b2-status' && request.method === 'GET') {
+        // Booleans only — no secret material ever leaves this route.
+        const cfg = (await env.LEADS.get('cfg:b2', { type: 'json' })) || {};
+        return json({ ok: true, configured: !!(cfg.keyId && cfg.appKey), keyIdConfigured: !!cfg.keyId, appKeyConfigured: !!cfg.appKey, bucket: cfg.bucket || null, endpoint: cfg.endpoint || null, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+      }
+      // Object transfer through the worker (the worker is the only
+      // holder of the B2 credentials): PUT stores one media object
+      // (the packaged HLS set — playlists + segments + captions; the
+      // route's body cap is 6 MiB, the largest packaged segment is
+      // ~2.7 MB), GET is a head-probe ({exists, size}), and b2-list
+      // returns the bucket inventory under a prefix for verification.
+      // All three sit behind the admin gate; PUT/GET/list are also in
+      // the SERVICE allowlist for the operator's transfer script.
+      if (path === '/api/admin/academy/b2-object' && request.method === 'PUT') {
+        if (limited('acadb2up:' + ip, 5000, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        const key = String(url.searchParams.get('key') || '');
+        if (!ACADEMY_B2_KEY_RE.test(key)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        if (!academyB2Ready(await academyB2Cfg(env))) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const buf = new Uint8Array(await request.arrayBuffer());
+        if (!buf.length) return json({ ok: false, error: 'empty_body' }, 400, origin);
+        const ct = key.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (key.endsWith('.vtt') ? 'text/vtt; charset=utf-8' : 'video/mp2t');
+        const put = await academyB2Put(env, key, buf, ct);
+        if (!put.ok) return json({ ok: false, error: 'b2_put_failed', upstream: put.status }, 502, origin);
+        return json({ ok: true, key: key, size: buf.length }, 200, origin);
+      }
+      if (path === '/api/admin/academy/b2-object' && request.method === 'GET') {
+        const key = String(url.searchParams.get('key') || '');
+        if (!ACADEMY_B2_KEY_RE.test(key)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        if (!academyB2Ready(await academyB2Cfg(env))) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const head = await academyB2Head(env, key);
+        if (!head) return json({ ok: true, exists: false }, 200, origin);
+        return json({ ok: true, exists: true, size: head.size }, 200, origin);
+      }
+      if (path === '/api/admin/academy/b2-list' && request.method === 'GET') {
+        const prefix = String(url.searchParams.get('prefix') || 'media/');
+        if (prefix.indexOf('media/') !== 0 || prefix.indexOf('..') !== -1) return json({ ok: false, error: 'invalid_prefix' }, 400, origin);
+        if (!academyB2Ready(await academyB2Cfg(env))) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const listed = await academyB2List(env, prefix, 1000);
+        if (!listed) return json({ ok: false, error: 'b2_list_failed' }, 502, origin);
+        return json({ ok: true, count: listed.count, bytes: listed.bytes, truncated: listed.truncated, keys: listed.keys }, 200, origin);
       }
       if (path === '/api/admin/brain/provision' && request.method === 'POST') {
         // One-shot: stores the shared secret into cfg:brain (merging
