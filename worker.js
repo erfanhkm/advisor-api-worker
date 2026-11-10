@@ -989,6 +989,11 @@ async function scopedAuthed(request, env, path, method) {
   const SERVICE = (path === '/api/admin/maintenance' && (method === 'GET' || method === 'POST')) ||
     (method === 'POST' && path === '/api/admin/backup-stamp') ||
     (method === 'GET' && (path === '/api/leads' || path === '/api/admin/users' || path === '/api/admin/newsletter' || path === '/api/admin/viewings' || path === '/api/admin/mailq')) ||
+    // Pack AcademyAdmin (2026-11-09): the Academy GET reads (overview,
+    // students list + detail) join the read-only SERVICE set (same
+    // posture as /api/admin/users) so the weekly job can verify the
+    // tab's data path. All Academy MUTATIONS stay session-only.
+    (method === 'GET' && (path === '/api/admin/academy/students' || path === '/api/admin/academy/overview' || path.indexOf('/api/admin/academy/students/') === 0)) ||
     (method === 'POST' && path === '/api/admin/push/ensure-keys') ||
     (method === 'GET' && path === '/api/admin/push/status') ||
     // Portal brain (2026-11-01): the service token may read brain
@@ -3021,6 +3026,115 @@ async function listAllKeysC(env, prefix, cap) {
   } while (cursor);
   return { keys: keys, complete: true };
 }
+/* ================= Academy enrolments (Pack AcademyAdmin, 2026-11-09) =====
+   Built to hidden_files/academy-admin-spec-2026-11-09.md (Erfan-approved
+   build order). Enrolment records live under academy:<normEmail> — the
+   Track C student engine's key (hidden_files/academy-platform/src/
+   schema.js); the engine-owned keys are acprogress:/acmistakes:/
+   acready:<normEmail> (the admin pack reads them, reset deletes exactly
+   those three). Stored status is active|blocked ONLY; expiry is DERIVED
+   by effectiveStatus() — the single predicate every consumer uses
+   (admin list filters, the entitlement gate, and the future
+   video-token issuer). Grace (§4.5): 7 days of READ-ONLY access after
+   expiry — a PROPOSAL defaulted ON, flagged in the pack record;
+   video tokens are never grace-exempt. */
+const ACADEMY_PRODUCTS = ['exam_pass', 'exam_pass_shield', 'math_track'];
+const ACADEMY_PRODUCT_DEFAULTS = { exam_pass: 6, exam_pass_shield: 6, math_track: 4 }; // §5: 6 = Erfan-approved standard/fallback; math_track 4 = proposal, prefilled+editable
+const ACADEMY_GRACE_DAYS = 7;
+function academyAddMonths(iso, months) {
+  // UTC calendar months with day clamping (§4.2): Jan 31 + 1 → Feb 28/29.
+  const d = new Date(iso);
+  const day = d.getUTCDate();
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() + months);
+  const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+  d.setUTCDate(Math.min(day, last));
+  return d.toISOString();
+}
+function effectiveStatus(rec, nowMs) {
+  // Spec §4.1 verbatim semantics: blocked outranks the clock; expiry at
+  // expiresAt == now already counts as expired.
+  if (!rec) return 'none';
+  if (rec.status === 'blocked') return 'blocked';
+  if (Date.parse(rec.expiresAt) <= nowMs) return 'expired';
+  return 'active';
+}
+async function academyGet(env, email) {
+  if (!email) return null;
+  return await env.LEADS.get('academy:' + normEmail(email), { type: 'json' });
+}
+async function academyPut(env, rec) {
+  rec.updatedAt = new Date().toISOString();
+  await env.LEADS.put('academy:' + normEmail(rec.email), JSON.stringify(rec));
+}
+async function academyEntitlement(env, email, opts) {
+  // THE gate (spec §2.2): requireEntitlement(email, {readOnly}) →
+  // {entitled} or {error: not_enrolled|blocked|expired, …}. The future
+  // student API + video-token issuer call this; video-token passes
+  // readOnly:false so grace never mints a token (§4.4/§4.5).
+  const o = opts || {};
+  const now = typeof o.now === 'number' ? o.now : Date.now();
+  const rec = await academyGet(env, email);
+  if (!rec) return { entitled: false, error: 'not_enrolled' };
+  const st = effectiveStatus(rec, now);
+  if (st === 'blocked') return { entitled: false, error: 'blocked', enrolment: rec };
+  if (st === 'expired') {
+    const graceEndsAt = Date.parse(rec.expiresAt) + ACADEMY_GRACE_DAYS * 86400000;
+    if (o.readOnly && now <= graceEndsAt) return { entitled: true, grace: true, graceEndsAt: new Date(graceEndsAt).toISOString(), enrolment: rec };
+    return { entitled: false, error: 'expired', expiresAt: rec.expiresAt, enrolment: rec };
+  }
+  return { entitled: true, grace: false, enrolment: rec };
+}
+async function academySummary(env, rec, nowMs) {
+  // Spec §2.1 summary shape — progress fields come from the
+  // engine-owned keys and are null until the student has studied.
+  const ne = normEmail(rec.email);
+  const daysLeft = Math.ceil((Date.parse(rec.expiresAt) - nowMs) / 86400000);
+  const sum = { email: rec.email, product: rec.product, status: effectiveStatus(rec, nowMs), accessMonths: rec.accessMonths, activatedAt: rec.activatedAt, expiresAt: rec.expiresAt, daysLeft: daysLeft, readiness: null, progressPct: null, lessonsMastered: null, mistakeCount: null, lastActiveAt: null, source: rec.source || 'manual', createdBy: rec.createdBy || 'admin' };
+  const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
+  const ready = await env.LEADS.get('acready:' + ne, { type: 'json' });
+  const mist = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+  if (prog && prog.lessons) {
+    const ls = Object.values(prog.lessons);
+    if (ls.length) {
+      sum.progressPct = Math.round(ls.reduce(function (s, l) { return s + (l.mastery || 0); }, 0) / ls.length);
+      sum.lessonsMastered = ls.filter(function (l) { return l && l.status === 'mastered'; }).length;
+    }
+    // lastActiveAt = newest lesson completion stamp (approximation —
+    // the engine keeps no dedicated activity field; recorded in the
+    // pack record).
+    const stamps = ls.map(function (l) { return l && l.completedAt; }).filter(Boolean);
+    if (stamps.length) sum.lastActiveAt = new Date(Math.max.apply(null, stamps)).toISOString();
+  }
+  if (ready && typeof ready.score === 'number') sum.readiness = ready.score;
+  if (mist && Array.isArray(mist.items)) sum.mistakeCount = mist.items.length;
+  return sum;
+}
+async function academyAudit(env, action, target, ip, detail) {
+  // §6 verbatim: key 'audit:'+Date.now()+':'+randHex(6), value
+  // {action, target, actor, ip, at, detail}, TTL 730 days.
+  try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: action, target: target, actor: 'admin', ip: ip, at: new Date().toISOString(), detail: detail || {} }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+}
+async function academyAuditScan(env, pred, cap) {
+  // §6.3: bounded newest-first scan of the audit: prefix (newest 1,000).
+  const keys = await listAllKeys(env, 'audit:', typeof cap === 'number' ? cap : 1000);
+  const out = [];
+  for (let i = keys.length - 1; i >= 0; i--) {
+    const v = await env.LEADS.get(keys[i].name, { type: 'json' });
+    if (v && pred(v)) out.push(v);
+  }
+  return out;
+}
+async function academyClearEngineKeys(env, ne) {
+  // §4.6: reset deletes EXACTLY the three engine keys.
+  let removed = 0;
+  for (const p of ['acprogress:', 'acmistakes:', 'acready:']) {
+    if (await env.LEADS.get(p + ne) !== null) removed++;
+    await env.LEADS.delete(p + ne);
+  }
+  return removed;
+}
+
 async function buildContacts(env) {
   return adminCachedGen(env, 'contacts', function () { return buildContactsFresh(env); });
 }
@@ -10351,6 +10465,211 @@ async function handleRequest(request, env, ctx) {
           return json({ ok: true }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
+      }
+
+      // ---- admin: Academy (Pack AcademyAdmin, 2026-11-09; spec
+      // hidden_files/academy-admin-spec-2026-11-09.md §2.1) ----
+      // Behind the global admin gate above (session; the GET reads are
+      // also in the read-only SERVICE allowlist, like /api/admin/users).
+      if (path === '/api/admin/academy/overview' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const keys = await listAllKeys(env, 'academy:', 1000);
+        const counts = { total: 0, active: 0, blocked: 0, expired: 0, expiring14: 0 };
+        const expiring = [];
+        for (const k of keys) {
+          const rec = await env.LEADS.get(k.name, { type: 'json' });
+          if (!rec) continue;
+          counts.total++;
+          const st = effectiveStatus(rec, nowMs);
+          counts[st]++;
+          if (st === 'active' && Date.parse(rec.expiresAt) - nowMs <= 14 * 86400000) {
+            counts.expiring14++;
+            expiring.push({ email: rec.email, product: rec.product, expiresAt: rec.expiresAt, daysLeft: Math.ceil((Date.parse(rec.expiresAt) - nowMs) / 86400000) });
+          }
+        }
+        expiring.sort(function (a, b) { return String(a.expiresAt).localeCompare(String(b.expiresAt)); });
+        const recentActions = (await academyAuditScan(env, function (v) { return String(v.action || '').indexOf('academy.') === 0; })).slice(0, 10);
+        return json({ counts: counts, expiring: expiring, recentActions: recentActions }, 200, origin);
+      }
+      if (path === '/api/admin/academy/students' && request.method === 'GET') {
+        const nowMs = Date.now();
+        const qp = new URL(request.url).searchParams;
+        const statusF = ['active', 'blocked', 'expired'].indexOf(qp.get('status') || '') !== -1 ? qp.get('status') : 'all';
+        const q = (qp.get('q') || '').toLowerCase();
+        let limit = parseInt(qp.get('limit') || '50', 10);
+        if (!isFinite(limit) || limit < 1) limit = 50;
+        if (limit > 100) limit = 100;
+        // The search/filter predicates run over the STORED email as
+        // well as the normalized key: a gmail student's record email
+        // keeps the dots/+tag they enrolled with, while its key does
+        // not — matching only one form makes profiles unfindable.
+        // Filters therefore scan the academy: set (bounded: the §6.3
+        // scan posture, fine at Academy scale) and the PAGE is cut
+        // from the filtered set; `cursor` is the opaque offset token
+        // this route issues (nextCursor), not a raw KV cursor.
+        const allKeys = await listAllKeys(env, 'academy:', 1000);
+        const matched = [];
+        for (const k of allKeys) {
+          const rec = await env.LEADS.get(k.name, { type: 'json' });
+          if (!rec) continue;
+          if (statusF !== 'all' && effectiveStatus(rec, nowMs) !== statusF) continue;
+          if (q) {
+            const stored = String(rec.email || '').toLowerCase();
+            const keyed = k.name.slice('academy:'.length);
+            if (stored.indexOf(q) === -1 && keyed.indexOf(q) === -1) continue;
+          }
+          matched.push(rec);
+        }
+        let off = parseInt(qp.get('cursor') || '0', 10);
+        if (!isFinite(off) || off < 0 || off > matched.length) off = 0;
+        const slice = matched.slice(off, off + limit);
+        const students = [];
+        for (const rec of slice) students.push(await academySummary(env, rec, nowMs));
+        return json({ students: students, nextCursor: off + limit < matched.length ? String(off + limit) : null }, 200, origin);
+      }
+      if (path === '/api/admin/academy/students' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ error: 'invalid_email' }, 400, origin);
+        const product = d.product === undefined ? 'exam_pass' : String(d.product);
+        if (ACADEMY_PRODUCTS.indexOf(product) === -1) return json({ error: 'invalid_product' }, 400, origin);
+        if (d.accessMonths !== undefined && d.expiresAt !== undefined) return json({ error: 'invalid_window' }, 400, origin);
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        let months = null, expiresAt = null;
+        if (d.expiresAt !== undefined) {
+          const t = Date.parse(d.expiresAt);
+          if (isNaN(t) || t <= nowMs) return json({ error: 'invalid_window' }, 400, origin);
+          expiresAt = new Date(t).toISOString();
+        } else {
+          months = d.accessMonths === undefined ? (ACADEMY_PRODUCT_DEFAULTS[product] || 6) : Number(d.accessMonths);
+          if (!isFinite(months) || Math.floor(months) !== months || months < 1 || months > 60) return json({ error: 'invalid_window' }, 400, origin);
+          expiresAt = academyAddMonths(nowIso, months);
+        }
+        const existing = await academyGet(env, email);
+        if (existing) return json({ error: 'already_exists' }, 409, origin);
+        const rec = { email: email, product: product, status: 'active', accessMonths: months, activatedAt: nowIso, expiresAt: expiresAt, source: ['manual', 'stripe', 'founding'].indexOf(String(d.source || '')) !== -1 ? String(d.source) : 'manual', createdBy: 'admin', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: d.note ? String(d.note).slice(0, 500) : null };
+        await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
+        // Audit target = the NORMALIZED identity (the KV key suffix) —
+        // the same form the detail route's trail lookup uses, so a
+        // gmail student's trail is complete (their stored email keeps
+        // the dots/+tag they enrolled with).
+        await academyAudit(env, 'academy.create', normEmail(email), ip, { product: product, accessMonths: months, expiresAt: expiresAt, source: rec.source });
+        return json({ student: await academySummary(env, rec, nowMs) }, 201, origin);
+      }
+      const acm = path.match(/^\/api\/admin\/academy\/students\/(.+)$/);
+      if (acm) {
+        let seg = '';
+        try { seg = decodeURIComponent(acm[1]); } catch (e) { return json({ error: 'invalid_email' }, 400, origin); }
+        const parts = seg.split('/');
+        const target = (parts[0] || '').trim().toLowerCase();
+        const action = parts.length > 1 ? parts[1] : '';
+        if (parts.length > 2 || !EMAIL_RE.test(target)) return json({ error: 'invalid_email' }, 400, origin);
+        const ne = normEmail(target);
+        const rec = await academyGet(env, target);
+        const nowMs = Date.now();
+        if (!action && request.method === 'GET') {
+          if (!rec) return json({ error: 'not_found' }, 404, origin);
+          const summary = await academySummary(env, rec, nowMs);
+          const student = Object.assign({}, summary, { createdAt: rec.createdAt || rec.activatedAt, updatedAt: rec.updatedAt || null, blockedAt: rec.blockedAt || null, blockReason: rec.blockReason || null, note: rec.note || null });
+          const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
+          const perModuleMap = {};
+          if (prog && prog.lessons) {
+            for (const lid of Object.keys(prog.lessons)) {
+              const mid = lid.split('-')[0];
+              const lp = prog.lessons[lid] || {};
+              if (!perModuleMap[mid]) perModuleMap[mid] = { moduleId: mid, mastered: 0, total: 0 };
+              perModuleMap[mid].total++;
+              if (lp.status === 'mastered') perModuleMap[mid].mastered++;
+            }
+          }
+          const perModule = Object.values(perModuleMap).map(function (m) { return { moduleId: m.moduleId, mastered: m.mastered, total: m.total, pct: m.total ? Math.round((m.mastered / m.total) * 100) : 0 }; });
+          const quizHistory = [];
+          const mocks = [];
+          for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 200)) {
+            const arec = await env.LEADS.get(ak.name, { type: 'json' });
+            if (!arec) continue;
+            for (const a of arec.history || []) {
+              if (a.score === null || a.score === undefined) continue;
+              const entry = { lessonId: arec.lessonId, at: new Date(a.at).toISOString(), scorePct: a.score, served: (a.servedIds || []).length };
+              if (String(arec.lessonId || '').indexOf('mock-') === 0) mocks.push({ mockId: arec.lessonId, at: entry.at, scorePct: a.score });
+              else quizHistory.push(entry);
+            }
+          }
+          quizHistory.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
+          mocks.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
+          const mist = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+          const conceptCounts = {};
+          if (mist && Array.isArray(mist.items)) for (const m of mist.items) { if (m && m.concept) conceptCounts[m.concept] = (conceptCounts[m.concept] || 0) + 1; }
+          const topConcepts = Object.keys(conceptCounts).map(function (c) { return { concept: c, count: conceptCounts[c] }; }).sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
+          const auditTrail = (await academyAuditScan(env, function (v) { return v.target === ne; })).slice(0, 25);
+          return json({ student: student, progress: { perModule: perModule, quizHistory: quizHistory.slice(0, 50) }, mistakes: { count: mist && Array.isArray(mist.items) ? mist.items.length : 0, topConcepts: topConcepts }, mocks: mocks, auditTrail: auditTrail }, 200, origin);
+        }
+        if (!action && request.method === 'DELETE') {
+          if (!rec) return json({ error: 'not_found' }, 404, origin);
+          const purge = new URL(request.url).searchParams.get('purgeProgress') === '1';
+          await env.LEADS.delete('academy:' + ne);
+          if (purge) await academyClearEngineKeys(env, ne);
+          await academyAudit(env, 'academy.delete', ne, ip, { purgeProgress: purge });
+          return json({ deleted: true }, 200, origin);
+        }
+        if (action && request.method === 'POST') {
+          if (action === 'resend-invite') return json({ error: 'mail_not_configured' }, 501, origin); // spec-only until D4; no audit — nothing happened
+          if (!rec) return json({ error: 'not_found' }, 404, origin);
+          let d = null;
+          try { d = await request.json(); } catch (e) {}
+          d = d || {};
+          if (action === 'extend') {
+            if (d.months !== undefined && d.expiresAt !== undefined) return json({ error: 'invalid_window' }, 400, origin);
+            const prev = rec.expiresAt;
+            if (d.expiresAt !== undefined) {
+              const t = Date.parse(d.expiresAt);
+              const entitledNow = effectiveStatus(rec, nowMs) === 'active';
+              if (isNaN(t) || (entitledNow ? t <= Date.parse(prev) : t <= nowMs)) return json({ error: 'invalid_window' }, 400, origin);
+              rec.expiresAt = new Date(t).toISOString();
+              await academyPut(env, rec);
+              await academyAudit(env, 'academy.extend', ne, ip, { expiresAt: rec.expiresAt, previousExpiresAt: prev });
+            } else {
+              const months = Number(d.months);
+              if (!isFinite(months) || Math.floor(months) !== months || months < 1 || months > 60) return json({ error: 'invalid_window' }, 400, origin);
+              // §4.3: from the current expiresAt while the window is in
+              // the future (blocked included — extend never unblocks);
+              // from now once expired.
+              const baseIso = Date.parse(prev) > nowMs ? prev : new Date(nowMs).toISOString();
+              rec.expiresAt = academyAddMonths(baseIso, months);
+              rec.accessMonths = months;
+              await academyPut(env, rec);
+              await academyAudit(env, 'academy.extend', ne, ip, { months: months, previousExpiresAt: prev });
+            }
+            return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
+          }
+          if (action === 'block') {
+            rec.status = 'blocked';
+            rec.blockedAt = new Date(nowMs).toISOString();
+            rec.blockReason = d.reason ? String(d.reason).slice(0, 300) : null;
+            await academyPut(env, rec);
+            await academyAudit(env, 'academy.block', ne, ip, rec.blockReason ? { reason: rec.blockReason } : {});
+            return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
+          }
+          if (action === 'unblock') {
+            // §2.1: the blocked period does NOT extend the window.
+            rec.status = 'active'; rec.blockedAt = null; rec.blockReason = null;
+            await academyPut(env, rec);
+            await academyAudit(env, 'academy.unblock', ne, ip, {});
+            return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
+          }
+          if (action === 'reset-progress') {
+            const removed = await academyClearEngineKeys(env, ne);
+            await academyAudit(env, 'academy.reset_progress', ne, ip, { keysRemoved: removed });
+            const keys = [];
+            for (const p of ['acprogress:', 'acmistakes:', 'acready:']) keys.push(p + ne);
+            return json({ reset: removed ? keys : [] }, 200, origin);
+          }
+          return json({ error: 'not_found' }, 404, origin);
+        }
+        return json({ error: 'not_found' }, 404, origin);
       }
 
       // ---- admin: unified contacts + desk overview ----
