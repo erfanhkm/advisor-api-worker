@@ -8,6 +8,18 @@ compatibility_date = "2026-10-19"
 binding = "LEADS"
 id = "1ed2126e01ef4891be0ce12890136b03"
 
+# Pack AcademyR2Video (2026-11-10): PRIVATE R2 bucket for Academy lesson
+# HLS — no public access, no r2.dev subdomain, no custom domain. The
+# worker binding is the only reader; playback goes through the signed
+# token routes in worker.js (video-protection spec §2–§3). Until R2 is
+# enabled on the account and this bucket exists, the binding line below
+# must stay COMMENTED OUT (an uncommented binding to a missing bucket
+# fails the deploy). Enable sequence is in
+# hidden_files/pack-academy-r2-video-build-2026-11-10.md.
+# [[r2_buckets]]
+# binding = "ACADEMY_VIDEO"
+# bucket_name = "eh-realty-academy-videos"
+
 # Service bindings: worker-to-worker calls (public fetch between *.workers.dev is blocked at the edge, error 1042)
 [[services]]
 binding = "SELLER"

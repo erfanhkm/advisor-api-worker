@@ -80,7 +80,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail']; // Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video']; // Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -3287,6 +3287,63 @@ function academyAddMonths(iso, months) {
   d.setUTCDate(Math.min(day, last));
   return d.toISOString();
 }
+/* ---- Academy video tokens (Pack AcademyR2Video, 2026-11-10) ----
+   Signed-HLS gate to hidden_files/academy-video-protection-2026-11-09.md
+   §2–§3. Objects live in the PRIVATE R2 bucket bound as
+   env.ACADEMY_VIDEO under media/<lessonId>/<lang>/… (HLS renditions
+   only — no MP4 object ever exists in the bucket). Playback is
+   two-step: (1) POST /api/academy/video-token runs the entitlement
+   gate above (academyEntitlement with readOnly:false — video tokens
+   are NEVER grace-exempt, §4.4/§4.5) and mints a ≤10-minute token;
+   (2) /api/academy/video/:lessonId/… verifies the token locally (HMAC
+   verify, no KV read) on the playlist AND every segment request.
+   The token-signing secret lives ONLY in KV cfg:video
+   ({tokenSecret}) — written via the one-shot admin provision route
+   (POST /api/admin/academy/video-provision; the cfg:brain/cfg:stripe
+   posture verbatim; value never returned or logged). Until
+   cfg:video is provisioned, video-token answers 503 not_configured,
+   so a deploy can never half-serve video. */
+const ACADEMY_VIDEO_TOKEN_TTL_MS = 600000; // 10 minutes — spec §3 ceiling
+const ACADEMY_VIDEO_LESSON_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const ACADEMY_VIDEO_LANGS = ['en', 'fa', 'hi', 'zh', 'es'];
+async function academyVideoCfg(env) { try { return await env.LEADS.get('cfg:video', { type: 'json' }); } catch (e) { return null; } }
+async function academyVideoHmac(secret, data) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data));
+  return b64urlOf(mac);
+}
+function academyVideoB64urlJson(obj) { return b64urlOf(new TextEncoder().encode(JSON.stringify(obj))); }
+function academyVideoParseB64url(s) {
+  const bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(buf);
+}
+async function academyVideoMintToken(secret, claims) {
+  const payload = academyVideoB64urlJson(claims);
+  return payload + '.' + (await academyVideoHmac(secret, payload));
+}
+async function academyVideoVerifyToken(secret, token, nowMs) {
+  // Returns the claims object or null. Signature + expiry only — the
+  // caller binds lesson/lang to the request path.
+  if (!token || typeof token !== 'string') return null;
+  const dot = token.indexOf('.');
+  if (dot < 1 || token.indexOf('.', dot + 1) !== -1) return null;
+  const payload = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const want = await academyVideoHmac(secret, payload);
+  if (!timingSafeEqual(sig, want)) return null;
+  let claims = null;
+  try { claims = JSON.parse(academyVideoParseB64url(payload)); } catch (e) { return null; }
+  if (!claims || typeof claims.exp !== 'number' || claims.exp <= nowMs) return null;
+  if (typeof claims.lesson !== 'string' || typeof claims.lang !== 'string' || typeof claims.sub !== 'string') return null;
+  return claims;
+}
+function academyVideoMediaHeaders(contentType) {
+  // Spec §3: segments/playlists must not land in shared caches.
+  return { 'Content-Type': contentType, 'Cache-Control': 'private, no-store' };
+}
+
 function effectiveStatus(rec, nowMs) {
   // Spec §4.1 verbatim semantics: blocked outranks the clock; expiry at
   // expiresAt == now already counts as expired.
@@ -9369,6 +9426,125 @@ async function handleRequest(request, env, ctx) {
         return json(out.body, out.status, origin);
       }
 
+      // ---- Academy: signed-HLS video (Pack AcademyR2Video, 2026-11-10;
+      // video-protection spec §3). Own auth on every route — the
+      // student's session is the credential at token issue; the ≤10-min
+      // HMAC token is the credential at playback. Deliberately BEFORE
+      // the admin gate, same posture as the Stripe webhook.
+      if (path === '/api/academy/video-token' && (request.method === 'POST' || request.method === 'GET')) {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('acadvid:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = {};
+        if (request.method === 'POST') { try { d = (await request.json()) || {}; } catch (e) { d = {}; } }
+        const q = url.searchParams;
+        const lessonId = String(d.lessonId || q.get('lessonId') || '').trim().toLowerCase();
+        const lang = String(d.lang || q.get('lang') || 'en').trim().toLowerCase();
+        const email = String(d.email || q.get('email') || '').trim().toLowerCase();
+        // The brief's route shape: POST/GET /api/academy/video-token —
+        // the identity rides the request (the Track C student engine
+        // keys identity by email) and the session above is the
+        // credential; entitlement is checked FRESH against KV.
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
+        if (ACADEMY_VIDEO_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const cfgV = await academyVideoCfg(env);
+        if (!cfgV || !cfgV.tokenSecret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        // THE gate (spec §2.2/§4): readOnly:false — an expired profile
+        // gets NO token even inside the 7-day read grace; blocked is
+        // refused at the predicate, so a block bites within one TTL.
+        const ent = await academyEntitlement(env, email, { readOnly: false });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        const nowMs = Date.now();
+        const sub = (await sha256hex(normEmail(email))).slice(0, 16);
+        const wm = sub.slice(0, 10); // spec §5: watermark id = email-hash prefix
+        const claims = { sub: sub, lesson: lessonId, lang: lang, exp: nowMs + ACADEMY_VIDEO_TOKEN_TTL_MS, wm: wm };
+        const token = await academyVideoMintToken(String(cfgV.tokenSecret), claims);
+        // Spec §5 access log: one aggregate counter per day (no
+        // per-request records; anomaly review reads the daily totals).
+        try {
+          const dayKey = 'academy:watch:' + new Date(nowMs).toISOString().slice(0, 10).replace(/-/g, '');
+          const cur = (await env.LEADS.get(dayKey, { type: 'json' })) || { tokens: 0, students: {} };
+          cur.tokens = (cur.tokens || 0) + 1;
+          cur.students = cur.students || {};
+          cur.students[sub] = (cur.students[sub] || 0) + 1;
+          await env.LEADS.put(dayKey, JSON.stringify(cur), { expirationTtl: 90 * 86400 });
+        } catch (e) {}
+        const base = '/api/academy/video/' + lessonId + '/' + lang + '/master.m3u8?t=' + token;
+        return json({ ok: true, token: token, expiresAt: new Date(claims.exp).toISOString(), playlistUrl: base, wm: 'EH·' + wm }, 200, origin);
+      }
+      const vm = path.match(/^\/api\/academy\/video\/([a-z0-9]+(?:-[a-z0-9]+)*)\/(en|fa|hi|zh|es)\/(.+)$/);
+      if (vm && request.method === 'GET') {
+        const cfgV2 = await academyVideoCfg(env);
+        if (!cfgV2 || !cfgV2.tokenSecret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const vclaims = await academyVideoVerifyToken(String(cfgV2.tokenSecret), url.searchParams.get('t') || '', Date.now());
+        if (!vclaims) return json({ ok: false, error: 'invalid_token' }, 403, origin);
+        if (vclaims.lesson !== vm[1] || vclaims.lang !== vm[2]) return json({ ok: false, error: 'token_mismatch' }, 403, origin);
+        if (!env.ACADEMY_VIDEO) return json({ ok: false, error: 'media_unavailable' }, 503, origin);
+        const file = vm[3];
+        const fileOk = /^[A-Za-z0-9._-]+$/.test(file) && file.indexOf('..') === -1 &&
+          (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file) || /^seg-\d{4}\.ts$/.test(file) || file === 'captions.vtt');
+        if (!fileOk) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const objKey = 'media/' + vm[1] + '/' + vm[2] + '/' + file;
+        if (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file)) {
+          const obj = await env.ACADEMY_VIDEO.get(objKey);
+          if (!obj) return json({ ok: false, error: 'not_found' }, 404, origin);
+          let text = await obj.text();
+          const tok = url.searchParams.get('t');
+          // Spec §3: every URI line in a served playlist carries the
+          // same token (segment lines in variant playlists, variant +
+          // caption lines in the master playlist).
+          text = text.split('\n').map(function (line) {
+            const t = line.trim();
+            if (!t) return line;
+            if (t.charAt(0) === '#') {
+              if (t.indexOf('#EXT-X-MEDIA') === 0 && t.indexOf('TYPE=SUBTITLES') !== -1) {
+                return t.replace(/URI="([^"]+)"/, function (mm, uri) { return 'URI="' + uri + '?t=' + tok + '"'; });
+              }
+              return line;
+            }
+            return t + '?t=' + tok;
+          }).join('\n');
+          return new Response(text, { status: 200, headers: academyVideoMediaHeaders('application/vnd.apple.mpegurl') });
+        }
+        if (file === 'captions.vtt') {
+          const cap = await env.ACADEMY_VIDEO.get(objKey);
+          if (!cap) return json({ ok: false, error: 'not_found' }, 404, origin);
+          return new Response(cap.body, { status: 200, headers: academyVideoMediaHeaders('text/vtt; charset=utf-8') });
+        }
+        // Segment: full-object stream, or a single Range slice when the
+        // player asks (R2's range read keeps the 206 semantics local).
+        const rangeH = request.headers.get('Range') || '';
+        const rm = rangeH.match(/^bytes=(\d+)-(\d*)$/);
+        if (rm) {
+          const head = await env.ACADEMY_VIDEO.head(objKey);
+          if (!head) return json({ ok: false, error: 'not_found' }, 404, origin);
+          const start = parseInt(rm[1], 10);
+          if (start >= head.size) return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */' + head.size, 'Cache-Control': 'private, no-store' } });
+          const end = rm[2] ? Math.min(parseInt(rm[2], 10), head.size - 1) : head.size - 1;
+          const part = await env.ACADEMY_VIDEO.get(objKey, { range: { offset: start, length: end - start + 1 } });
+          if (!part) return json({ ok: false, error: 'not_found' }, 404, origin);
+          const h = academyVideoMediaHeaders('video/mp2t');
+          h['Content-Range'] = 'bytes ' + start + '-' + end + '/' + head.size;
+          h['Accept-Ranges'] = 'bytes';
+          h['Content-Length'] = String(end - start + 1);
+          return new Response(part.body, { status: 206, headers: h });
+        }
+        const seg = await env.ACADEMY_VIDEO.get(objKey);
+        if (!seg) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const sh = academyVideoMediaHeaders('video/mp2t');
+        sh['Accept-Ranges'] = 'bytes';
+        if (typeof seg.size === 'number') sh['Content-Length'] = String(seg.size);
+        return new Response(seg.body, { status: 200, headers: sh });
+      }
+      if ((path === '/api/academy/video' || path.indexOf('/api/academy/video/') === 0) && path !== '/api/academy/video-token') {
+        // No other /api/academy/video/* shape exists (spec §3).
+        return json({ ok: false, error: 'not_found' }, 404, origin);
+      }
+
       // Pack PMV1 (PM P11): server-side sign-out — deletes the caller's
       // session record (both the hashed key and any legacy raw key) so a
       // discarded or copied token stops working immediately, not at its
@@ -10942,20 +11118,49 @@ async function handleRequest(request, env, ctx) {
       // The provision route is the brain-provision pattern verbatim:
       // ONE-SHOT, merges into cfg:stripe, refuses once a secret exists
       // (rotation is a deliberate cfg edit afterwards), and the values
-      // are never echoed, logged or returned. webhookSecret = the
+      // are never echoed, logged or returned. Pack StripeProv2 adds
+      // the header-carried value path + the SERVICE-scope repair
+      // overwrite (audited stripe_provision_repair) — see the handler.
+      // webhookSecret = the
       // Stripe endpoint signing secret (whsec_…); apiKey = a RESTRICTED
       // read key (Checkout Sessions + Payment Links read) the webhook
       // resolver uses to read the purchased line items' metadata —
       // optional, but without it only session-metadata tiers resolve.
       if (path === '/api/admin/academy/stripe-provision' && request.method === 'POST') {
+        /* Pack StripeProv2 (2026-11-10): the two values are ALSO
+           accepted via the dedicated headers X-Stripe-Webhook-Secret /
+           X-Stripe-Api-Key — the authd surrogate swap rewrites
+           header-carried surrogates but NOT body-carried ones (the
+           first live provision stored the literal surrogate strings;
+           pack record §13), so the agent provisioning path rides the
+           headers while the owner/portal path keeps the JSON body.
+           REPAIR: a SERVICE-scope request carrying BOTH headers may
+           overwrite an existing cfg:stripe — the deliberate repair
+           path for a surrogate-poisoned cfg — and is audited
+           distinctly as stripe_provision_repair (cfg audit shape, cf.
+           mail_provision). Session-scope behaviour is unchanged: 409
+           once set. Values are never echoed, logged or returned. */
+        const hdrWs = request.headers.get('X-Stripe-Webhook-Secret') || '';
+        const hdrAk = request.headers.get('X-Stripe-Api-Key') || '';
+        const hdrMode = hdrWs.length > 0;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
-        const ws = String(d.webhookSecret || '');
-        const ak = d.apiKey === undefined || d.apiKey === null ? '' : String(d.apiKey);
+        const ws = hdrMode ? hdrWs : String(d.webhookSecret || '');
+        const ak = hdrMode ? hdrAk : (d.apiKey === undefined || d.apiKey === null ? '' : String(d.apiKey));
         if (ws.length < 16 || ws.length > 256 || ak.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
         const cur = (await env.LEADS.get('cfg:stripe', { type: 'json' })) || {};
-        if (cur.webhookSecret) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+        if (cur.webhookSecret) {
+          const viaService = await scopedAuthed(request, env, path, request.method);
+          if (!(viaService && hdrMode && hdrAk.length > 0)) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+          cur.webhookSecret = ws;
+          cur.apiKey = ak;
+          cur.provisionedAt = new Date().toISOString();
+          cur.repairedAt = cur.provisionedAt;
+          await env.LEADS.put('cfg:stripe', JSON.stringify(cur));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_provision_repair', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'service_headers' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          return json({ ok: true, apiKeyStored: true, repaired: true }, 200, origin);
+        }
         cur.webhookSecret = ws;
         if (ak) cur.apiKey = ak;
         cur.provisionedAt = new Date().toISOString();
@@ -11249,6 +11454,28 @@ async function handleRequest(request, env, ctx) {
         let predCheck = null;
         try { predCheck = await env.LEADS.get('brain:predcheck', { type: 'json' }); } catch (e) {}
         return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), binding: !!(env.AICHAT && typeof env.AICHAT.fetch === 'function'), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, predictionAccuracy: predCheck, log: log.slice(0, 10) }, 200, origin);
+      }
+      if (path === '/api/admin/academy/video-provision' && request.method === 'POST') {
+        // Pack AcademyR2Video (2026-11-10): ONE-SHOT provision of the
+        // Academy video-token signing secret into cfg:video — the
+        // cfg:brain/cfg:stripe pattern verbatim (refuses once set;
+        // value never echoed, logged or returned). Until this runs,
+        // /api/academy/video-token answers 503 not_configured.
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const sec = String((d && d.secret) || '');
+        if (sec.length < 16 || sec.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
+        const cur = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
+        if (cur.tokenSecret) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+        cur.tokenSecret = sec;
+        cur.provisionedAt = new Date().toISOString();
+        await env.LEADS.put('cfg:video', JSON.stringify(cur));
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/admin/academy/video-status' && request.method === 'GET') {
+        // Booleans only — no secret material ever leaves this route.
+        const cfg = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
+        return json({ ok: true, configured: !!cfg.tokenSecret, provisionedAt: cfg.provisionedAt || null, bucketBound: !!env.ACADEMY_VIDEO }, 200, origin);
       }
       if (path === '/api/admin/brain/provision' && request.method === 'POST') {
         // One-shot: stores the shared secret into cfg:brain (merging
