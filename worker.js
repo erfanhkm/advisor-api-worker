@@ -1068,13 +1068,13 @@ async function authed(request, env) {
   const negAt = admNegCache.get(keys[0]);
   if (negAt && Date.now() - negAt < 30000) return false;
   let rawExp = await env.LEADS.get(keys[0]);
-  /* Pack SessFix (2026-11-10): live probe today showed KV reads on this
-     namespace intermittently inconsistent — a record written seconds
-     earlier flapped hit/miss/hit across reads for over a minute. A
-     single miss on a JUST-MINTED admin session made the portal's boot
-     wave 401, and the portal answers any 401 with an instant sign-out
-     that also revokes the session server-side (POST /api/logout), so a
-     transient read miss became a permanent kick-out for the owner.
+  /* Pack SessFix (2026-11-10): a single KV miss on a JUST-MINTED admin
+     session makes the portal's boot wave 401, and the portal answers
+     any 401 with an instant sign-out that also revokes the session
+     server-side (POST /api/logout) — so any transient read miss (e.g.
+     KV read-after-write lag on a seconds-old record) becomes a
+     permanent kick-out for the owner. See portal-session-bug-2026-11-10.md
+     (including its evidence correction).
      Re-read a miss with backoff before believing it; the negative
      cache is written only after the ladder exhausts, so a genuinely
      unknown token still costs one ladder per isolate per 30s and the
@@ -1091,6 +1091,13 @@ async function authed(request, env) {
   }
   const usedKey = keys[0];
   if (!rawExp) {
+    /* Free Split (2026-11-10): on the ACADEMY deployment the session
+       record lives on the SITE deployment — ask the bridge BEFORE
+       negative-caching the miss (a bridged positive must not be
+       shadowed by a neg entry, and a miss here is the NORMAL case for
+       a valid owner session, not a spray). The bridge has its own
+       positive cache; negatives fall through to the neg cache below. */
+    if (await bridgeAuthed(request, env)) return true;
     if (admNegCache.size > 512) admNegCache.clear();
     admNegCache.set(keys[0], Date.now());
     return false;
@@ -3341,6 +3348,62 @@ function academyAddMonths(iso, months) {
    posture verbatim; value never returned or logged). Until
    cfg:video is provisioned, video-token answers 503 not_configured,
    so a deploy can never half-serve video. */
+/* ---- Free Split (2026-11-10): SCOPE + session bridge ----
+   The SAME source deploys twice: the personal account as advisor-api
+   (SCOPE unset or 'site' — today's behaviour) and the business account
+   as advisor-academy (SCOPE='academy', its own ACADEMY KV namespace).
+   scopeOf(): 'academy' | 'site' | null (unset = both, back-compat for
+   the suite and for the pre-cutover personal deployment). On an
+   academy-scoped deployment, site-family routes answer 404 and
+   scheduled() no-ops; on a site-scoped deployment the academy families
+   answer 404 (Step 4 flip). Academy route families:
+   /api/academy/* (student) + /api/admin/academy/* (admin) +
+   /api/health. The session introspection endpoint
+   /api/internal/session-check is a SITE-family route: admin sessions
+   are minted ONLY by /api/login on the site deployment (the single
+   session authority), and the academy deployment validates a
+   presented admin token through the bridge (bridgeAuthed below).
+   Record: hidden_files/free-split-plan-2026-11-10.md §2.2/§4. */
+function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; return s === 'academy' || s === 'site' ? s : null; }
+function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+/* Bridge positive cache (per isolate, 60 s): a validated admin token
+   is re-asked at most once a minute; logout on the site side therefore
+   takes ≤60 s to bite on the academy side. Negatives are NEVER cached
+   here — authed()'s own negative cache governs those. The cache key
+   includes the base + the internal secret's own hash, so two DIFFERENT
+   academy configurations sharing one isolate (test envs) can never
+   leak a validation across configs. */
+const bridgePosCache = new Map();
+async function bridgeAuthed(request, env) {
+  try {
+    if (scopeOf(env) !== 'academy') return false;
+    const base = env.SITE_API_BASE ? String(env.SITE_API_BASE) : '';
+    if (!base) return false;
+    const h = request.headers.get('Authorization') || '';
+    const m = h.match(/^Bearer ([0-9a-f]{64})$/);
+    if (!m) return false;
+    const icfg = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+    if (!icfg || !icfg.secret) return false;
+    const ck = base + '|' + (await sha256hex(String(icfg.secret))).slice(0, 12) + '|tok:' + await sha256hex(m[1]);
+    const hit = bridgePosCache.get(ck);
+    if (hit && Date.now() - hit < 60000) return true;
+    const r = await fetch(base.replace(/\/+$/, '') + '/api/internal/session-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfg.secret) },
+      body: JSON.stringify({ token: m[1] }),
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!r.ok) return false;
+    const j = await r.json().catch(() => null);
+    if (j && j.valid === true) {
+      if (bridgePosCache.size > 512) bridgePosCache.clear();
+      bridgePosCache.set(ck, Date.now());
+      return true;
+    }
+    return false;
+  } catch (e) { return false; }
+}
 const ACADEMY_VIDEO_TOKEN_TTL_MS = 600000; // 10 minutes — spec §3 ceiling
 const ACADEMY_VIDEO_LESSON_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const ACADEMY_VIDEO_LANGS = ['en', 'fa', 'hi', 'zh', 'es'];
@@ -8281,6 +8344,30 @@ async function handleRequest(request, env, ctx) {
     if (origin && !ALLOWED_ORIGINS.includes(origin)) {
       return new Response(JSON.stringify({ ok: false, error: 'forbidden' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
+    /* Free Split (2026-11-10): SCOPE gate — a scoped deployment 404s
+       every route outside its family (see the SCOPE block at the
+       Academy video section). Unset SCOPE = both families (today's
+       behaviour), so this is inert until a deployment sets the flag. */
+    if (!scopeAllows(env, path)) return json({ ok: false, error: 'not_found' }, 404, origin);
+
+    /* Free Split (2026-11-10): session introspection bridge — the
+       SITE deployment is the single session authority. The academy
+       deployment POSTs a presented admin token here; the shared
+       cfg:internal secret (X-Internal-Secret, the Turnstile-delegation
+       pattern) is the credential, and the answer is a bare boolean —
+       no session data ever crosses. Fail-closed throughout. */
+    if (path === '/api/internal/session-check' && request.method === 'POST') {
+      const icfgS = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+      const isec = request.headers.get('X-Internal-Secret') || '';
+      if (!icfgS || !icfgS.secret || !isec || !timingSafeEqual(isec, String(icfgS.secret))) return json({ ok: false, valid: false }, 403, origin);
+      let bd = null;
+      try { bd = await request.json(); } catch (e) {}
+      const btok = bd && typeof bd.token === 'string' ? bd.token : '';
+      if (!/^[0-9a-f]{64}$/.test(btok)) return json({ ok: true, valid: false }, 200, origin);
+      const bk = await adminTokKeys(btok);
+      const bexp = parseInt((await env.LEADS.get(bk[0])) || '0', 10);
+      return json({ ok: true, valid: bexp > Date.now() }, 200, origin);
+    }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
@@ -13154,6 +13241,11 @@ export default {
   // the perf fold run on every tick. (Accepted + noted from R-03 L4:
   // idxReconcile's 23h guard is still claimed before its work.)
   async scheduled(event, env, ctx) {
+    /* Free Split (2026-11-10): the ACADEMY deployment ships WITHOUT a
+       [triggers] block, and even if one were added by mistake its
+       scheduled bundle (folds, automations, reconcile, backup) is
+       site-side machinery — no-op outright. */
+    if (scopeOf(env) === 'academy') return;
     const cronStr = (event && typeof event.cron === 'string') ? event.cron : '';
     const minuteField = cronStr ? cronStr.trim().split(/\s+/)[0] : '';
     const fixedMinute = /^\d+$/.test(minuteField) ? parseInt(minuteField, 10) : null;
