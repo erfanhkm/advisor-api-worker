@@ -58,6 +58,7 @@
 const ALLOWED_ORIGINS = [
   'https://real-estate-platform-0aei.onrender.com',
   'https://ehrealtybc.com',
+  'https://academy.ehrealtybc.com',
   'https://www.ehrealtybc.com',
   'https://muse.ai',
   // APP (2026-11-02): the Capacitor apps' WebView origins — Android serves
@@ -3773,7 +3774,7 @@ async function speedCheck(env) {
     try { const r = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(8000) }); const txt = await r.text(); return { ms: Date.now() - st, bytes: new TextEncoder().encode(txt).length, status: r.status }; }
     catch (e) { return { ms: null, bytes: 0, status: 0 }; }
   }
-  const both = await Promise.all([fetchTimed('https://real-estate-platform-0aei.onrender.com/'), fetchTimed('https://real-estate-platform-0aei.onrender.com/listings.html')]);
+  const both = await Promise.all([fetchTimed('https://ehrealtybc.com/'), fetchTimed('https://ehrealtybc.com/listings.html')]);
   const home = both[0], lst = both[1];
   out.homeMs = home.ms; out.homeKB = Math.round(home.bytes / 1024); out.homeStatus = home.status;
   out.listMs = lst.ms; out.listKB = Math.round(lst.bytes / 1024); out.listStatus = lst.status;
@@ -8895,7 +8896,7 @@ async function handleRequest(request, env, ctx) {
       // ---- Google sign-in (public) ----
       if (path === '/api/user/google/start' && request.method === 'GET') {
         // Top-level navigation: errors return to the site as #gerror, never raw JSON.
-        const gfail = () => Response.redirect('https://real-estate-platform-0aei.onrender.com/listings.html#gerror=auth', 302);
+        const gfail = () => Response.redirect('https://ehrealtybc.com/listings.html#gerror=auth', 302);
         if (limited(ip, 30, 3600000)) return gfail();
         const cfg = await env.LEADS.get('cfg:google', { type: 'json' });
         if (!cfg || !cfg.clientId) return gfail();
@@ -8911,7 +8912,7 @@ async function handleRequest(request, env, ctx) {
         return new Response(null, { status: 302, headers: gh });
       }
       if (path === '/api/user/google/callback' && request.method === 'GET') {
-        const SITE = 'https://real-estate-platform-0aei.onrender.com/listings.html';
+        const SITE = 'https://ehrealtybc.com/listings.html';
         const fail = (e) => { const fh = new Headers(); fh.set('Location', SITE + '#gerror=' + e); fh.set('Set-Cookie', 'gst=; Max-Age=0; Path=/api/user/google; HttpOnly; Secure; SameSite=Lax'); fh.set('Cache-Control', 'no-store'); return new Response(null, { status: 302, headers: fh }); };
         const cfg = await env.LEADS.get('cfg:google', { type: 'json' });
         if (!cfg || !cfg.clientId || !cfg.clientSecret) return fail('auth');
@@ -9025,9 +9026,9 @@ async function handleRequest(request, env, ctx) {
           // token intentionally NOT deleted on use: mail scanners prefetch GET links and would burn it before the real click; verification is idempotent and the token dies on its own TTL (cycle 26)
           const raw = await env.LEADS.get('user:' + vem);
           if (raw) { try { const uu = JSON.parse(raw); uu.verified = true; await env.LEADS.put('user:' + vem, JSON.stringify(uu)); } catch (e) {} }
-          return Response.redirect('https://real-estate-platform-0aei.onrender.com/listings.html#verified=1', 302);
+          return Response.redirect('https://ehrealtybc.com/listings.html#verified=1', 302);
         }
-        return Response.redirect('https://real-estate-platform-0aei.onrender.com/listings.html#verified=0', 302);
+        return Response.redirect('https://ehrealtybc.com/listings.html#verified=0', 302);
       }
       if (path === '/api/user/login' && request.method === 'POST') {
         if (limited('auth:' + ip, 20, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin); // namespaced (Pack A): bare-ip buckets are keyed by max+window too, and this route used to share one with viewing cancel/reschedule
@@ -12722,7 +12723,7 @@ async function handleRequest(request, env, ctx) {
             }
             await buildCatalogSnap(env);
           } catch (e) {}
-          const SITE = 'https://real-estate-platform-0aei.onrender.com';
+          const SITE = 'https://ehrealtybc.com';
           const PAGES = ['', 'listings.html', 'mortgage-calculator.html', 'buy-vs-rent.html', 'affordability.html', 'investor-analysis.html', 'ai-assistant.html', 'seller-tools.html', 'first-time-buyers.html', 'knowledge-centre.html', 'contact.html', 'listing-R2991001.html', 'listing-R2991002.html', 'listing-R2991003.html', 'listing-R2991004.html', 'listing-R2991005.html', 'listing-R2991006.html', 'area-burnaby-metrotown.html', 'area-coquitlam-coquitlam-centre.html', 'area-surrey-surrey-city-centre.html', 'area-vancouver-downtown.html', 'area-richmond.html', 'area-port-coquitlam.html'];
           for (const p of PAGES) {
             const label = p || 'index.html';
