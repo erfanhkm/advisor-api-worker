@@ -202,6 +202,8 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/admin/academy/b2-provision'],
   ['POST', '/api/admin/academy/stripe-provision'],
   ['POST', '/api/admin/academy/stripe-clear'],
+  ['POST', '/api/admin/academy/purge-student'],
+  ['POST', '/api/internal/academy/student-delete'],
   ['POST', '/api/admin/academy/video-provision'],
   ['POST', '/api/admin/mail/provision']
 ];
@@ -1069,6 +1071,14 @@ async function scopedAuthed(request, env, path, method) {
     // video-related is in scope.
     (method === 'POST' && path === '/api/admin/academy/video-provision') ||
     (method === 'GET' && path === '/api/admin/academy/video-status') ||
+    // Pack StudentPurge (2026-11-11): the agent-only Academy student
+    // purge proxy joins the SERVICE set — the route itself enforces
+    // scopedAuthed ONLY (an owner session never suffices; the portal
+    // does not use it) and proxies the delete to the ACADEMY
+    // deployment's internal route under cfg:internal. Nothing else
+    // Academy-mutation joins: every other Academy mutation stays
+    // session-only.
+    (method === 'POST' && path === '/api/admin/academy/purge-student') ||
     // Pack AcademyB2Video (2026-11-10): the Academy B2 pair + transfer
     // routes join the SERVICE set with the brain posture — the one-shot
     // bearer-carried provision (the route itself refuses a part once
@@ -3422,7 +3432,7 @@ function academyAddMonths(iso, months) {
    Record: hidden_files/free-split-plan-2026-11-10.md §2.2/§4. */
 function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; return s === 'academy' || s === 'site' ? s : null; }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -8459,6 +8469,37 @@ async function handleRequest(request, env, ctx) {
       const bexp = parseInt((await env.LEADS.get(bk[0])) || '0', 10);
       return json({ ok: true, valid: bexp > Date.now() }, 200, origin);
     }
+    /* Pack StudentPurge (2026-11-11): Academy student delete, INTERNAL
+       family — the mirror image of session-check above. The portal's
+       session DELETE is the only other removal path and its native
+       confirm dialog defeats the automated browser, so the owner
+       directed an agent-reachable one: the SITE deployment's
+       /api/admin/academy/purge-student proxy (SERVICE-scoped) calls
+       this route server-to-server under the SAME cfg:internal secret
+       (X-Internal-Secret, timing-safe compare). Admission is that
+       secret ONLY, and it fails closed: cfg:internal absent → 503
+       not_configured; a wrong or missing secret → 401 and the record
+       is untouched. A successful deletion is re-read to prove
+       absence, and a 730-day audit entry records the target + via —
+       never the secret. */
+    if (path === '/api/internal/academy/student-delete' && request.method === 'POST') {
+      const icfgD = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+      if (!icfgD || !icfgD.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+      const dsec = request.headers.get('X-Internal-Secret') || '';
+      if (!dsec || !timingSafeEqual(dsec, String(icfgD.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+      let dbd = null;
+      try { dbd = await request.json(); } catch (e) {}
+      const dem = dbd && typeof dbd.email === 'string' ? dbd.email.trim().toLowerCase() : '';
+      if (!dem || !EMAIL_RE.test(dem)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+      const dne = normEmail(dem);
+      const dkey = 'academy:' + dne;
+      const dcur = await env.LEADS.get(dkey);
+      if (dcur === null || dcur === undefined) return json({ ok: true, deleted: false }, 200, origin);
+      await env.LEADS.delete(dkey);
+      const dafter = await env.LEADS.get(dkey);
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined }, 200, origin);
+    }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
@@ -11510,6 +11551,37 @@ async function handleRequest(request, env, ctx) {
         const students = [];
         for (const rec of slice) students.push(await academySummary(env, rec, nowMs));
         return json({ students: students, nextCursor: off + limit < matched.length ? String(off + limit) : null }, 200, origin);
+      }
+      // ---- admin: Academy student purge proxy (Pack StudentPurge,
+      // 2026-11-11) — AGENT-ONLY. Admission is scopedAuthed() ONLY,
+      // re-run in-handler: the generic gate above also admits owner
+      // sessions, and a session NEVER suffices here (the portal does
+      // not use this route). The handler reads cfg:internal from THIS
+      // (site) namespace and proxies the delete to the ACADEMY
+      // deployment's internal route under that secret — the profile
+      // lives in the ACADEMY namespace, not here. The secret is never
+      // echoed: responses, audits and logs carry only the target
+      // email and the deleted boolean. An upstream failure surfaces
+      // as a 502 with the upstream status.
+      if (path === '/api/admin/academy/purge-student' && request.method === 'POST') {
+        if (!(await scopedAuthed(request, env, path, request.method))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let pbd = null;
+        try { pbd = await request.json(); } catch (e) {}
+        const pem = pbd && typeof pbd.email === 'string' ? pbd.email.trim().toLowerCase() : '';
+        if (!pem || !EMAIL_RE.test(pem)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const pne = normEmail(pem);
+        const icfgP = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+        if (!icfgP || !icfgP.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let up = null;
+        let upBody = null;
+        try {
+          up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/student-delete', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgP.secret) }, body: JSON.stringify({ email: pem }), signal: AbortSignal.timeout(10000) });
+          upBody = await up.json().catch(() => null);
+        } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
+        if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
+        const pdel = upBody.deleted === true;
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_purge', target: pne, ip: ip, at: new Date().toISOString(), detail: { via: 'service', deleted: pdel } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json(upBody, up.status, origin);
       }
       // ---- admin: Academy × Stripe config (Pack AcademyStripe) ----
       // The provision route is the brain-provision pattern verbatim:
