@@ -168,6 +168,48 @@ function adminCached(name, loader) {
 // freshness is unchanged (the router still clears the whole cache on any
 // write); the plain TTL applies only when the gen read itself fails.
 let genMemo = { t: 0, v: null };
+// Pack KVHygiene (2026-11-10): the fetch wrapper's 'admin:gen' bump is
+// COALESCED per isolate — at most one KV put per GEN_BUMP_WINDOW_MS.
+// The bump's only job is to move the generation token so OTHER isolates
+// rebuild their gen-keyed admin lists; a mutation burst (bulk edits,
+// transfer storms) collapses to a single write per window per isolate.
+// A mutation whose bump is coalesced away still clears THIS isolate's
+// caches immediately (the wrapper does that unconditionally); cross-
+// isolate staleness is bounded by the window plus GEN_CACHE_MAX_AGE.
+// In-memory only — no extra KV read to check (the usage:lists counter
+// discipline: count cheap, flush rare).
+const GEN_BUMP_WINDOW_MS = 60000;
+let genBumpLast = 0;
+function genBumpDue() {
+  const now = Date.now();
+  if (now - genBumpLast < GEN_BUMP_WINDOW_MS) return false;
+  genBumpLast = now;
+  return true;
+}
+// Pack KVHygiene (2026-11-10): routes whose mutations must NEVER bump
+// 'admin:gen' — machine/transfer traffic and one-shot provisions. They
+// mutate no portal-listed data (the b2 transfer routes move bytes to
+// Backblaze; the one-shot provisions write a single cfg: record that no
+// admin LIST cache reads), so a bump on them is a pure KV write tax:
+// the 2026-11-10 B2 upload paid it 3,138 times and exhausted the whole
+// 1,000/day free-plan write pool in ~30 minutes (see
+// kv-quota-investigation-2026-11-10.md). Exact path+method pairs only:
+// the b2 GET probe/list routes never reach the bump (GET), and the
+// Academy admin student mutations keep bumping (they change lists).
+const GEN_BUMP_EXEMPT = [
+  ['PUT', '/api/admin/academy/b2-object'],
+  ['DELETE', '/api/admin/academy/b2-object'],
+  ['POST', '/api/admin/academy/b2-provision'],
+  ['POST', '/api/admin/academy/stripe-provision'],
+  ['POST', '/api/admin/academy/video-provision'],
+  ['POST', '/api/admin/mail/provision']
+];
+function genBumpExempt(method, path) {
+  for (let i = 0; i < GEN_BUMP_EXEMPT.length; i++) {
+    if (GEN_BUMP_EXEMPT[i][0] === method && GEN_BUMP_EXEMPT[i][1] === path) return true;
+  }
+  return false;
+}
 async function currentGen(env) {
   if (genMemo.v !== null && Date.now() - genMemo.t < 5000) return genMemo.v;
   try {
@@ -1013,6 +1055,17 @@ async function scopedAuthed(request, env, path, method) {
     // the booleans-only status. Nothing else Stripe-related is in scope.
     (method === 'POST' && path === '/api/admin/academy/stripe-provision') ||
     (method === 'GET' && path === '/api/admin/academy/stripe-status') ||
+    // Pack AcademyVideoCard (2026-11-10): the Academy video pair joins
+    // the SERVICE set with EXACTLY the brain/Stripe posture above —
+    // the booleans-only status and the one-shot provision. The
+    // provision's mode is decided IN-HANDLER by credential shape: the
+    // service path must mint the secret WORKER-SIDE (no value in any
+    // request the agent emits — a client-supplied value would risk
+    // storing an egress surrogate literal, the Stripe §13 lesson);
+    // the owner session keeps the body {secret} path. Nothing else
+    // video-related is in scope.
+    (method === 'POST' && path === '/api/admin/academy/video-provision') ||
+    (method === 'GET' && path === '/api/admin/academy/video-status') ||
     // Pack AcademyB2Video (2026-11-10): the Academy B2 pair + transfer
     // routes join the SERVICE set with the brain posture — the one-shot
     // bearer-carried provision (the route itself refuses a part once
@@ -4844,8 +4897,12 @@ async function puAttentionAdd(env, kind, text, ref) {
    longer appear under 'Needs attention' (Erfan's ruling 2026-11-10,
    on the market-brief item): 'market-brief' (the brief itself lives
    in the Assistant tab) and 'brain-calibration' (a monthly statistics
-   + proposals digest — returned by its own route, re-derivable at any
-   time). NO producer stops writing: the stored list stays complete as
+   + proposals digest — NOT persisted under any dedicated KV key:
+   brainCalibration() regenerates it on each call and returns it in
+   the /api/admin/brain/calibrate route body, so the attention item
+   is the digest's ONLY persistent trace — which is why this fix
+   filters at read time instead of deleting anything). NO producer
+   stops writing: the stored list stays complete as
    the Assistant context feed (brainChatContext reads it via
    puAttentionList) — only the Today today-payload filter below
    reclassifies. */
@@ -11772,15 +11829,31 @@ async function handleRequest(request, env, ctx) {
         // cfg:brain/cfg:stripe pattern verbatim (refuses once set;
         // value never echoed, logged or returned). Until this runs,
         // /api/academy/video-token answers 503 not_configured.
+        // Pack AcademyVideoCard (2026-11-10): the route joins the
+        // SERVICE set (scopedAuthed above) with the brain/Stripe
+        // posture, and the mode is decided by the CREDENTIAL, never
+        // by a body flag: a SERVICE-token caller gets a secret minted
+        // WORKER-SIDE (randHex(32) = 64 hex) and any body it sends is
+        // IGNORED entirely — the token-signing secret is internal-only
+        // material (HMAC shared by token mint + verify inside this
+        // same worker), so unlike the Stripe keys it never has to
+        // cross the agent egress boundary, and a supplied value could
+        // only ever risk storing an unswapped surrogate literal
+        // (Stripe pack §13). The owner-session path keeps the
+        // original body {secret} contract. Both modes are one-shot
+        // (409 once set) and write a video_provision audit (mode only,
+        // never the value).
+        const viaService = await scopedAuthed(request, env, path, request.method);
         let d = null;
         try { d = await request.json(); } catch (e) {}
-        const sec = String((d && d.secret) || '');
+        const sec = viaService ? randHex(32) : String((d && d.secret) || '');
         if (sec.length < 16 || sec.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
         const cur = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
         if (cur.tokenSecret) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
         cur.tokenSecret = sec;
         cur.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:video', JSON.stringify(cur));
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'video_provision', target: 'cfg:video', ip: ip, at: new Date().toISOString(), detail: { via: viaService ? 'service_generated' : 'session' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/academy/video-status' && request.method === 'GET') {
@@ -13242,13 +13315,21 @@ export default {
     // Pack PH (PH-03R H1): /api/report/ POSTs are contractually
     // side-effect-free (the gated stubs write nothing) — bumping on them
     // burned a KV write + a full admin-cache clear per public report.
+    // Pack KVHygiene (2026-11-10): machine/transfer + one-shot provision
+    // routes (genBumpExempt) skip the clear AND the bump entirely — they
+    // mutate no portal-listed data; every remaining bump is coalesced
+    // to one KV put per 60 s per isolate (genBumpDue) — the in-isolate
+    // clear still fires for every genuine mutation, so same-isolate
+    // freshness is unchanged; only the cross-isolate gen write is
+    // throttled (a lost bump delays other isolates' list invalidation
+    // by at most the window, bounded by GEN_CACHE_MAX_AGE as before).
     try {
       const m = request.method;
       const p = new URL(request.url).pathname;
-      if (m !== 'GET' && m !== 'OPTIONS' && m !== 'HEAD' && p !== '/api/track' && !p.startsWith('/api/report/') && (resp.status < 400 || resp.status >= 500)) {
+      if (m !== 'GET' && m !== 'OPTIONS' && m !== 'HEAD' && p !== '/api/track' && !p.startsWith('/api/report/') && !genBumpExempt(m, p) && (resp.status < 400 || resp.status >= 500)) {
         adminCache.clear();
         genMemo = { t: 0, v: null };
-        if (ctx && ctx.waitUntil) { try { ctx.waitUntil(env.LEADS.put('admin:gen', String(Date.now())).catch(function () {})); } catch (e) {} }
+        if (genBumpDue() && ctx && ctx.waitUntil) { try { ctx.waitUntil(env.LEADS.put('admin:gen', String(Date.now())).catch(function () {})); } catch (e) {} }
       }
     } catch (e) {}
     return resp;
