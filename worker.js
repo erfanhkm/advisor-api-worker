@@ -5179,7 +5179,13 @@ async function puToday(env) {
     try { out[name] = await fn(); out.sources[name] = 'ok'; }
     catch (e) { out[name] = null; out.sources[name] = 'error'; console.error('puToday segment ' + name + ' failed: ' + (e && e.message || e)); }
   };
-  await seg('viewings', async function () {
+  // PortalDeepScan (2026-11-10, portal-speed §5-A): the 10 segments are
+  // independent (each writes only its own out[name]/sources[name]) —
+  // run them concurrently; cold Today latency becomes the slowest
+  // segment instead of the sum. The Pack PK degraded fix-up moves
+  // AFTER the join (it reads hotSm, set inside the hotLeads segment).
+  const segPs = [];
+  segPs.push(seg('viewings', async function () {
     // Pack K (PU-01 #1): rows come from the ONE shared viewing
     // summary — this segment no longer rescans vidx on its own.
     const vs = await puViewingSummary(env);
@@ -5196,14 +5202,14 @@ async function puToday(env) {
     const vres = { today: t, tomorrow: tm, awaiting: awaiting.slice(0, 10), awaitingCount: awaiting.length };
     if (vs.partial) vres.truncated = true;
     return vres;
-  });
-  await seg('predictions', async function () { return await env.LEADS.get('pred:summary', { type: 'json' }); }); // Portal Brain 2
-  await seg('followups', async function () {
+  }));
+  segPs.push(seg('predictions', async function () { return await env.LEADS.get('pred:summary', { type: 'json' }); })); // Portal Brain 2
+  segPs.push(seg('followups', async function () {
     const f = await buildFollowups(env);
     return { newCount: f.newCount, staleCount: f.staleCount, postViewingCount: f.postViewingCount, stale: f.staleLeads.slice(0, 5), post: f.postViewing.slice(0, 5) };
-  });
+  }));
   let hotSm = null; // Pack PK (01-H1): the scores snapshot behind the hotLeads segment, for the sources fix-up below
-  await seg('hotLeads', async function () {
+  segPs.push(seg('hotLeads', async function () {
     const sm = await puLeadScores(env);
     hotSm = sm;
     // Pack K (PU-01 #7): band counts cover ACTIVE leads only — closed
@@ -5227,13 +5233,8 @@ async function puToday(env) {
     if (sm.leadsTruncated) hres.leadsTruncated = true;
     if (sm.viewingsTruncated) hres.viewingsTruncated = true;
     return hres;
-  });
-  // Pack PK (01-H1): when the scores aggregation is degraded, the
-  // hotLeads segment is built from partial inputs — its sources entry
-  // must SAY 'error' (which also keeps the gen cache from storing
-  // this Today payload as truth), never a blanket 'ok'.
-  if (hotSm && hotSm.degraded) out.sources.hotLeads = 'error';
-  await seg('alerts', async function () {
+  }));
+  segPs.push(seg('alerts', async function () {
     const last = (await env.LEADS.get('automation:last', { type: 'json' })) || null;
     let unsentAlerts = 0;
     const mids = await idxGet(env, 'mailq', 'mailq:');
@@ -5250,8 +5251,8 @@ async function puToday(env) {
     const ares = { lastRun: last, unsentAlerts: unsentAlerts };
     if (mids.length > take.length) ares.truncated = true;
     return ares;
-  });
-  await seg('marketPulse', async function () {
+  }));
+  segPs.push(seg('marketPulse', async function () {
     const ds = await mpReadStatsSafe(env);
     const months = (ds && ds.months) || [];
     const cur = months[0] || null, prev = months[1] || null;
@@ -5260,8 +5261,8 @@ async function puToday(env) {
       return Math.round((cur[block][field] - prev[block][field]) * 100) / 100;
     };
     return { month: cur ? cur.month : null, cur: cur, deltas: (cur && prev) ? { gvrBenchmark: delta('gvr', 'benchmark'), fvrebBenchmark: delta('fvreb', 'benchmark'), bcSales: delta('bc', 'sales'), canadaBenchmark: delta('canada', 'benchmark') } : null };
-  });
-  await seg('radar', async function () {
+  }));
+  segPs.push(seg('radar', async function () {
     const st = (await env.LEADS.get('radar:settings', { type: 'json' })) || { enabled: false };
     const keys = await listAllKeys(env, 'mlead:', 2000);
     let pairs = 0, hot = 0;
@@ -5277,8 +5278,8 @@ async function puToday(env) {
       }
     }
     return { enabled: !!st.enabled, pairs: pairs, hotPairs: hot, sampled: Math.min(keys.length, 300), total: keys.length };
-  });
-  await seg('newsletter', async function () {
+  }));
+  segPs.push(seg('newsletter', async function () {
     let total = 0;
     // Null-prototype map (PU-01 #9): keys are stored language strings,
     // so a hostile or corrupt value must never collide with
@@ -5300,13 +5301,19 @@ async function puToday(env) {
     const nres = { total: total, byLang: byLang };
     if (nids.length > take.length) { nres.sampled = true; nres.subscribersTotal = nids.length; }
     return nres;
-  });
-  await seg('tasks', async function () {
+  }));
+  segPs.push(seg('tasks', async function () {
     const all = (await allTasks(env)).filter(function (t) { return !t.done && t.due <= out.tomorrow; });
     all.sort(function (a, b) { return String(a.due).localeCompare(String(b.due)); });
     return { due: all.slice(0, 10), count: all.length, overdue: all.filter(function (t) { return t.due < today; }).length };
-  });
-  await seg('attention', async function () { return { items: puAttentionAlerts(await puAttentionList(env)).slice(0, 15) }; });
+  }));
+  segPs.push(seg('attention', async function () { return { items: puAttentionAlerts(await puAttentionList(env)).slice(0, 15) }; }));
+  await Promise.all(segPs);
+  // Pack PK (01-H1): when the scores aggregation is degraded, the
+  // hotLeads segment is built from partial inputs — its sources entry
+  // must SAY 'error' (which also keeps the gen cache from storing
+  // this Today payload as truth), never a blanket 'ok'.
+  if (hotSm && hotSm.degraded) out.sources.hotLeads = 'error';
   out.generatedAt = new Date().toISOString();
   return out;
 }
