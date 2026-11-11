@@ -201,6 +201,7 @@ const GEN_BUMP_EXEMPT = [
   ['DELETE', '/api/admin/academy/b2-object'],
   ['POST', '/api/admin/academy/b2-provision'],
   ['POST', '/api/admin/academy/stripe-provision'],
+  ['POST', '/api/admin/academy/stripe-clear'],
   ['POST', '/api/admin/academy/video-provision'],
   ['POST', '/api/admin/mail/provision']
 ];
@@ -9952,7 +9953,17 @@ async function handleRequest(request, env, ctx) {
          the route re-runs admission in-handler with the header call
          admitted (one-shot + validation + the service-only repair
          rule are its controls). */
-      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
+      /* Pack StripeClear (2026-11-11): POST
+         /api/admin/academy/stripe-clear joins the exemption — the
+         agent clear call it exists for is BARE (no Authorization
+         header at all: cfg:service is unset in the ACADEMY
+         namespace, so no scoped credential can ever be presented
+         there, and the poisoned record it removes is what blocks
+         every credentialed repair path). The route re-runs
+         admission in-handler: owner session, or the bare shape,
+         gated by the exact {"confirm":"clear-stripe"} body — see
+         the handler. The response is booleans only. */
+      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-clear' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         const admIp = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
         if (limited('adm:' + admIp, 60, 3600000)) return json({ ok: false, error: 'rate_limited' }, 429, origin);
         return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -11576,6 +11587,61 @@ async function handleRequest(request, env, ctx) {
         // Booleans only — no secret material ever leaves this route.
         const cfg = (await env.LEADS.get('cfg:stripe', { type: 'json' })) || {};
         return json({ ok: true, configured: !!cfg.webhookSecret, apiKeyConfigured: !!cfg.apiKey, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+      }
+      if (path === '/api/admin/academy/stripe-clear' && request.method === 'POST') {
+        // Pack StripeClear (2026-11-11): the CLEAR half of the Stripe
+        // repair loop. The portal card's Replace flow clears cfg:stripe
+        // via POST /api/admin/config, but that route's clear is
+        // effectively session-only — and on the ACADEMY deployment
+        // cfg:service is UNSET, so scopedAuthed can never pass there
+        // and no agent path could remove a poisoned record (the §15/§19
+        // surrogate state: a webhook signed with the stored literal
+        // string enrols students). This route deletes cfg:stripe and
+        // nothing else. PRE-GATE OWNERSHIP: exempt from the generic
+        // admin gate above (see the gate comment); admission is
+        // re-run here and admits EITHER an owner session (authed —
+        // incl. the bridged session on the academy deployment; the
+        // portal path) OR a BARE call: no Authorization header AND
+        // neither Stripe value header. The bare shape is admitted
+        // deliberately, on the b2 posture inverted — there the value
+        // rides the Bearer; here the call carries NOTHING sensitive
+        // in either direction (the response is booleans only) and the
+        // blast radius is exactly one config record whose deletion
+        // returns the deployment to not_configured, which FAILS
+        // CLOSED (webhook 503s, enrolments stop) — strictly safer
+        // than a known-literal signing secret. Two controls narrow
+        // the admission past "any request": (1) the body must be
+        // exactly {"confirm":"clear-stripe"}, a deliberate-action
+        // token a stray or crawled POST will not carry — anything
+        // else is 400 and the record is untouched; (2) a call
+        // presenting credential material it cannot validate (a
+        // Bearer that is neither a live session nor the scoped
+        // token, or either value header) is refused 401 rather than
+        // treated as bare, so a credentialed-but-wrong caller fails
+        // closed. scopedAuthed is re-checked for symmetry with the
+        // sibling provision handlers, but the route is deliberately
+        // NOT added to the SERVICE scope set — the two admitted
+        // shapes are session and bare-agent. Idempotent: an absent
+        // record answers cleared:false and writes no audit; a real
+        // delete writes a stripe_clear audit (via only, never any
+        // stored material) with the standard 730-day TTL.
+        let viaClear = null;
+        if (await authed(request, env)) viaClear = 'session';
+        else if (await scopedAuthed(request, env, path, request.method)) viaClear = 'service';
+        else {
+          const authHC = request.headers.get('Authorization') || '';
+          const hasValueHdrC = ((request.headers.get('X-Stripe-Webhook-Secret') || '').length > 0) || ((request.headers.get('X-Stripe-Api-Key') || '').length > 0);
+          if (!authHC && !hasValueHdrC) viaClear = 'agent';
+          else return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        }
+        let dc = null;
+        try { dc = await request.json(); } catch (e) {}
+        if (!dc || dc.confirm !== 'clear-stripe' || Object.keys(dc).length !== 1) return json({ ok: false, error: 'validation' }, 400, origin);
+        const curC = await env.LEADS.get('cfg:stripe');
+        if (curC === null) return json({ ok: true, cleared: false }, 200, origin);
+        await env.LEADS.delete('cfg:stripe');
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_clear', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: viaClear } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, cleared: true }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'POST') {
         let d = null;
