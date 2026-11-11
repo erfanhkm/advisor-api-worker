@@ -9943,7 +9943,16 @@ async function handleRequest(request, env, ctx) {
          test it; the route re-runs the gate's test in-handler with
          the value-shaped call admitted (one-shot + shape + audit
          are its controls). All other routes: gate unchanged. */
-      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
+      /* Pack StripeGate (2026-11-11): POST
+         /api/admin/academy/stripe-provision joins the exemption for
+         the same reason — its value call carries the credential
+         material in the dedicated X-Stripe-Webhook-Secret header
+         while the Bearer slot holds the vault surrogate (neither a
+         session nor the service token), so the gate cannot test it;
+         the route re-runs admission in-handler with the header call
+         admitted (one-shot + validation + the service-only repair
+         rule are its controls). */
+      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         const admIp = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
         if (limited('adm:' + admIp, 60, 3600000)) return json({ ok: false, error: 'rate_limited' }, 429, origin);
         return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -11504,6 +11513,25 @@ async function handleRequest(request, env, ctx) {
       // resolver uses to read the purchased line items' metadata —
       // optional, but without it only session-metadata tiers resolve.
       if (path === '/api/admin/academy/stripe-provision' && request.method === 'POST') {
+        // PRE-GATE OWNERSHIP (Pack StripeGate, 2026-11-11): this
+        // route is exempt from the generic admin gate above — the
+        // gate requires a session OR a scoped token in the Bearer
+        // slot, but the agent provision call (StripeProv2 header
+        // mode) carries the vault surrogate in that slot and the
+        // credential in the dedicated header, so the gate would 401
+        // the exact call this route exists for (the b2-provision
+        // lesson). The route therefore repeats the gate's test with
+        // the header-shaped call admitted: session → authenticated;
+        // 48-hex service token → scoped (repair eligibility is
+        // decided below by the handler's own rule); a non-empty
+        // X-Stripe-Webhook-Secret header → the value call, admitted
+        // to the handler, whose one-shot 409 + value validation +
+        // never-echoed values are the control. Every OTHER admin
+        // route keeps the generic gate untouched.
+        {
+          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method)) || (request.headers.get('X-Stripe-Webhook-Secret') || '').length > 0;
+          if (!admitted) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        }
         /* Pack StripeProv2 (2026-11-10): the two values are ALSO
            accepted via the dedicated headers X-Stripe-Webhook-Secret /
            X-Stripe-Api-Key — the authd surrogate swap rewrites
