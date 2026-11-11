@@ -214,11 +214,25 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/academy/tutor/reset'],
   ['POST', '/api/admin/academy/tutor-provision'],
   ['POST', '/api/admin/academy/tutor-seed'],
+  // Pack Tutor2 (2026-11-11): practice/quiz/debrief/feedback/voice
+  // writes land only on tutor:/ac* keys of the caller's own record.
+  ['POST', '/api/academy/tutor/practice'],
+  ['POST', '/api/academy/tutor/practice-answer'],
+  ['POST', '/api/academy/tutor/quiz/start'],
+  ['POST', '/api/academy/tutor/quiz/answer'],
+  ['POST', '/api/academy/tutor/quiz/stop'],
+  ['POST', '/api/academy/tutor/debrief/start'],
+  ['POST', '/api/academy/tutor/debrief/next'],
+  ['POST', '/api/academy/tutor/feedback'],
+  ['POST', '/api/academy/tutor/voice'],
   // Pack BookletView (2026-11-11): the booklet seed writes only
   // booklet: keys; the student booklet GETs are reads (no bump).
   ['POST', '/api/admin/academy/booklet-seed'],
   ['POST', '/api/internal/academy/booklet-seed'],
-  ['POST', '/api/admin/academy/booklet-seed-proxy']
+  ['POST', '/api/admin/academy/booklet-seed-proxy'],
+  // BookletFix (2026-11-11): the student-session mint writes only its
+  // own stok: record — not portal-listed data.
+  ['POST', '/api/academy/student-session']
 ];
 function genBumpExempt(method, path) {
   for (let i = 0; i < GEN_BUMP_EXEMPT.length; i++) {
@@ -3876,6 +3890,33 @@ async function bookletServiceOk(request, env) {
     return timingSafeEqual(String(svc.token), m[1]);
   } catch (e) { return false; }
 }
+/* Student sessions (BookletFix, 2026-11-11): the student portal signs
+   in with email only (the Track C identity model — identity rides the
+   request, enrolment is the gate), so before this fix it held NO
+   credential the worker could accept: every booklet GET from a real
+   student session went out bare and was refused 401, while the only
+   admitted credentials were the OWNER portal session (authed) and the
+   SERVICE bearer (an operator path whose cfg:service does not even
+   exist on the academy deployment). POST /api/academy/student-session
+   now mints a student session at portal sign-in: a 64-hex token whose
+   record lives in its OWN keyspace — 'stok:' + sha256(token) →
+   {email, exp} — bound to the one email it was minted for. A student
+   token therefore never satisfies authed() or the admin gate (the
+   keyspaces are disjoint); it admits ONLY where a handler explicitly
+   checks studentAuthed, and every such call still re-checks
+   academyEntitlement FRESH, so a block/expiry bites within one call. */
+const STUDENT_SESSION_TTL_MS = 24 * 3600 * 1000; // mirrors TOKEN_TTL (24h)
+async function studentAuthed(request, env, email) {
+  try {
+    if (!email) return false;
+    const h = request.headers.get('Authorization') || '';
+    const m = h.match(/^Bearer ([0-9a-f]{64})$/);
+    if (!m) return false;
+    const rec = await env.LEADS.get('stok:' + await sha256hex(m[1]), { type: 'json' });
+    if (!rec || !rec.email || !(Number(rec.exp) > Date.now())) return false;
+    return normEmail(rec.email) === normEmail(email);
+  } catch (e) { return false; }
+}
 const TUTOR_LANGS = ['en', 'fa'];
 const TUTOR_DEFAULT_PER_STUDENT_DAILY = 40;
 const TUTOR_DEFAULT_GLOBAL_DAILY = 2000;
@@ -3994,7 +4035,12 @@ function tutorThreadTtlSeconds(enrolment) {
 }
 async function tutorThreadPut(env, ne, thread, enrolment) {
   const msgs = thread.messages.slice(-TUTOR_THREAD_CAP);
-  try { await env.LEADS.put('tutor:thread:' + ne, JSON.stringify({ messages: msgs, updatedAt: new Date().toISOString() }), { expirationTtl: tutorThreadTtlSeconds(enrolment) }); } catch (e) {}
+  // Pack Tutor2: the thread record also carries `state` (pending
+  // practice qid, reverse-quiz session, mock-debrief progress) —
+  // preserved across writes so those flows are resumable.
+  const rec = { messages: msgs, updatedAt: new Date().toISOString() };
+  if (thread.state && typeof thread.state === 'object') rec.state = thread.state;
+  try { await env.LEADS.put('tutor:thread:' + ne, JSON.stringify(rec), { expirationTtl: tutorThreadTtlSeconds(enrolment) }); } catch (e) {}
   return msgs;
 }
 async function tutorUsageCount(env, key) {
@@ -4089,6 +4135,469 @@ async function tutorCallChain(env, cfg, turns, attachment) {
     } catch (e) { lastErr = e; }
   }
   throw lastErr || new Error('no_provider');
+}
+
+
+/* ================= Academy Learning Assistant — Pack Tutor2 (2026-11-11) =====
+   The power upgrade of Pack Tutor (Erfan approved ALL THREE TIERS
+   2026-11-11). It EXTENDS v1 — same cfg:tutor, same budgets, same
+   thread — and never touches the site Brain (credits stay separate).
+
+   Tier 1 (stronger brain):
+   (a) Corpus v2 under tutor:corpus:v2:* — concept chunks (concept
+       tags + worked example + trap box + per-question explanations
+       from the 2,100-question bank) beside the v1 lesson chunks,
+       a glossary/synonym map (exam term ↔ plain words ↔ FA
+       equivalents) applied at retrieval, and CROSS-LANGUAGE
+       retrieval: a FA question also searches the EN canonical
+       chunks (answers stay in the student's language; citations
+       keep lesson ids). tutorRetrieve (v1) is the fallback whenever
+       no v2 keys are seeded.
+   (b) Student memory: the chat prompt carries a compact snapshot of
+       the student's OWN engine state (mistake bank, readiness,
+       per-module mastery, last mock/quiz) — own-email only, read
+       server-side; no other student's data can enter it (pin-proven).
+   (c) In-chat practice: the SERVER picks a bank question by concept
+       (never the model's invention), parks the qid in the thread
+       state, and grades the student's answer against the BANK KEY,
+       writing the outcome into the same acmistakes machinery the
+       quizzes use (recordMistake / review-ladder semantics verbatim).
+   (d) Verification pass: every draft is checked by a second provider
+       call against the retrieved excerpts (claim-by-claim
+       supported/unsupported). Unsupported → ONE stricter
+       regeneration → still unsupported → answer with only the
+       supported claims + an honest note. Outcomes land in
+       tutor:verify:<day> counters.
+       BUDGET ACCOUNTING (Tier 1d): budgets count SUCCESSFUL provider
+       replies, exactly as v1. A plain chat message therefore costs
+       2 units (draft + verify); a message whose draft fails
+       verification costs up to 4 (draft + verify + regenerate +
+       re-verify). A verification/regeneration call is only attempted
+       while the student AND global budgets still have room; when the
+       budget runs out mid-turn, verification is SKIPPED (logged
+       skipped_budget) and the draft is delivered — a student never
+       loses an answer to the checker. remainingToday always reflects
+       the units actually consumed. Practice / quiz / debrief /
+       coach / feedback make NO provider calls and consume NO budget.
+
+   Tier 2 (active coach): mock debrief (guided walkthrough of the
+   latest mock's wrong answers, resumable in the thread state),
+   reverse quiz ("Quiz me" — server-selected, server-graded,
+   difficulty follows mastery, session summary), and a deterministic
+   coach suggestion (no provider burn) computed from the same
+   snapshot the chat uses.
+
+   Tier 3 (experience + tutor QC): voice is DEFAULT OFF and
+   cfg-gated (cfg:tutor.voice.enabled) — input via the browser Web
+   Speech API (no server cost), output via ElevenLabs with the
+   Academy's LOCKED voices (EN Roger / FA Arash on eleven_v3, FA
+   SLOW profile) behind its OWN counter tutor:voiceusage:* and a
+   hard daily cap in cfg. Enabling burns the SHARED ElevenLabs pool
+   (~14k credits left 2026-11-11) and requires Erfan's explicit go —
+   this pack ships it DISABLED. Gap analytics: every not-covered /
+   trimmed question is logged to tutor:gaps:<day>; portal thumbs
+   land in tutor:feedback:<day> (+ down-vote excerpts); the owner
+   portal reads it all via GET /api/admin/academy/tutor-insights. */
+
+const TUTOR2_TOP_K = 4;
+const TUTOR_SPACING_DAYS = [1, 3, 7, 14, 30]; // mirrors engine.js SPACING_DAYS
+const TUTOR_DAY_MS = 86400000;
+const TUTOR_GAPS_CAP = 300;
+const TUTOR_FEEDBACK_DOWN_CAP = 100;
+const TUTOR_VOICE_MAX_CHARS = 600;
+const TUTOR_VOICE_DEFAULT_DAILY_CAP = 10;
+const TUTOR_VOICE_DEFAULTS = { enVoice: 'CwhRBWXzGAHq8TQ4Fs17', faVoice: 'Mn0jJ3FC9Ijz7lQe8ELI', model: 'eleven_v3' }; // locked voices (academy-voice-test/TEST.md)
+
+// ---------- shared student gate for the Tutor2 routes ----------
+// Same posture as the v1 chat route: the caller has already passed
+// authed(); this validates the email and re-checks entitlement FRESH.
+async function tutorGate(env, rawEmail, readOnly, origin) {
+  const email = String(rawEmail || '').trim().toLowerCase();
+  if (!EMAIL_RE.test(email)) return { resp: json({ ok: false, error: 'invalid_email' }, 400, origin) };
+  const ent = await academyEntitlement(env, email, { readOnly: !!readOnly });
+  if (!ent.entitled) {
+    if (ent.error === 'not_enrolled') return { resp: json({ error: 'not_enrolled' }, 403, origin) };
+    if (ent.error === 'blocked') return { resp: json({ error: 'blocked' }, 403, origin) };
+    return { resp: json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin) };
+  }
+  return { ne: normEmail(email), ent: ent };
+}
+
+// ---------- Tier 1a: corpus v2 retrieval ----------
+async function tutorCorpusV2Index(env, lang) { try { return await env.LEADS.get('tutor:corpus:v2:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusV2Module(env, lang, moduleId) { try { return await env.LEADS.get('tutor:corpus:v2:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
+async function tutorGlossary(env) { try { return await env.LEADS.get('tutor:corpus:v2:glossary', { type: 'json' }); } catch (e) { return null; } }
+function tutorExpandTokens(tokens, glossary) {
+  const out = new Set(tokens);
+  const map = glossary && glossary.map && typeof glossary.map === 'object' ? glossary.map : null;
+  if (map) for (const t of tokens) { const ex = map[t]; if (Array.isArray(ex)) for (const x of ex) { if (typeof x === 'string' && x) out.add(x); } }
+  return Array.from(out);
+}
+function tutorScoreEntry(e, q, tagWeight, contextLessonId, contextBoost) {
+  let s = 0;
+  const tags = Array.isArray(e.tagsW) ? e.tagsW : [];
+  const title = Array.isArray(e.titleW) ? e.titleW : [];
+  const terms = Array.isArray(e.termsW) ? e.termsW : [];
+  for (const t of q) {
+    if (tags.indexOf(t) !== -1) s += tagWeight;
+    if (title.indexOf(t) !== -1) s += 2;
+    if (terms.indexOf(t) !== -1) s += 1;
+  }
+  if (contextLessonId && e.id === contextLessonId) s += contextBoost;
+  return s;
+}
+async function tutorRetrieve2(env, lang, message, contextLessonId) {
+  // v2 first (own lang + EN canonical for FA), v1 fallback untouched.
+  const langs = lang === 'fa' ? ['fa', 'en'] : [lang];
+  const idxByLang = {};
+  let anyV2 = false;
+  for (const lg of langs) {
+    idxByLang[lg] = await tutorCorpusV2Index(env, lg);
+    const ix = idxByLang[lg];
+    if (ix && ((Array.isArray(ix.lessons) && ix.lessons.length) || (Array.isArray(ix.concepts) && ix.concepts.length))) anyV2 = true;
+  }
+  if (!anyV2) { const r = await tutorRetrieve(env, lang, message, contextLessonId); r.v2 = false; r.topConcept = null; return r; }
+  const glossary = await tutorGlossary(env);
+  const q = tutorExpandTokens(tutorTokenize(message), glossary);
+  const cand = [];
+  for (const lg of langs) {
+    const ix = idxByLang[lg];
+    if (!ix) continue;
+    for (const e of (Array.isArray(ix.lessons) ? ix.lessons : [])) {
+      if (!e || typeof e.id !== 'string') continue;
+      cand.push({ srcLang: lg, kind: 'lesson', id: e.id, module: e.module, title: e.title, tag: null, score: tutorScoreEntry(e, q, 3, contextLessonId, 100) });
+    }
+    for (const c of (Array.isArray(ix.concepts) ? ix.concepts : [])) {
+      if (!c || typeof c.lessonId !== 'string' || typeof c.tag !== 'string') continue;
+      cand.push({ srcLang: lg, kind: 'concept', id: c.lessonId, module: c.module, title: c.title || c.tag, tag: c.tag, score: tutorScoreEntry({ tagsW: c.tagsW, titleW: c.titleW, termsW: c.termsW, id: c.lessonId }, q, 5, contextLessonId, 50) });
+    }
+  }
+  cand.sort(function (a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+    const ta = String(a.tag || ''), tb = String(b.tag || '');
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return a.srcLang < b.srcLang ? -1 : 1;
+  });
+  const strong = [];
+  const modCache = {};
+  for (const c of cand) {
+    if (strong.length >= TUTOR2_TOP_K || c.score < 3) break;
+    const key = c.srcLang + ':' + c.module;
+    if (!(key in modCache)) modCache[key] = await tutorCorpusV2Module(env, c.srcLang, c.module);
+    const mod = modCache[key];
+    if (!mod) continue;
+    if (c.kind === 'lesson') {
+      const rec = (Array.isArray(mod.lessons) ? mod.lessons : []).find(function (l) { return l && l.id === c.id; });
+      if (rec && typeof rec.text === 'string') strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'lesson' });
+    } else {
+      const rec = (Array.isArray(mod.concepts) ? mod.concepts : []).find(function (x) { return x && x.tag === c.tag && x.lessonId === c.id; });
+      if (rec && typeof rec.text === 'string') strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'concept', concept: c.tag });
+    }
+  }
+  let nearest = null;
+  if (cand.length && cand[0].score > 0) nearest = { id: cand[0].id, title: cand[0].title };
+  else if (contextLessonId) { const hit = cand.find(function (c) { return c.id === contextLessonId; }); if (hit) nearest = { id: hit.id, title: hit.title }; }
+  const topC = strong.find(function (s) { return s.kind === 'concept'; });
+  return { seeded: true, v2: true, strong: strong, nearest: nearest, topConcept: topC ? topC.concept : null };
+}
+
+// ---------- Tier 1b: the student's OWN snapshot ----------
+async function tutorStudentSnapshot(env, ne) {
+  // Server-side assembly from the engine's existing state shapes,
+  // keyed by the CALLER's normalised email only — by construction no
+  // other student's record can be read here (isolation pin TUTOR2).
+  const out = { openMistakes: 0, totalEver: 0, resolvedEver: 0, topConcepts: [], openItems: [], dueItems: [], dueReview: 0, misconcepts: [], readiness: null, modules: [], weakestModule: null, lastMock: null, lastQuiz: null, text: '' };
+  const nowMs = Date.now();
+  try {
+    const mk = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+    if (mk && Array.isArray(mk.items)) {
+      out.totalEver = mk.totalEver | 0; out.resolvedEver = mk.resolvedEver | 0;
+      const open = mk.items.filter(function (i) { return i && !i.resolved; });
+      out.openMistakes = open.length;
+      out.dueItems = open.filter(function (i) { return (i.dueAt || 0) <= nowMs; }).sort(function (a, b) { return (a.dueAt || 0) - (b.dueAt || 0); }).slice(0, 10).map(function (i) { return { qid: i.qid, concept: i.concept, lessonId: i.lessonId, moduleId: i.moduleId, dueAt: i.dueAt }; });
+      out.dueReview = out.dueItems.length;
+      out.openItems = open.slice().sort(function (a, b) { return (a.dueAt || 0) - (b.dueAt || 0); }).slice(0, 20).map(function (i) { return { qid: i.qid, concept: i.concept, lessonId: i.lessonId, moduleId: i.moduleId, dueAt: i.dueAt }; });
+      const byConcept = {};
+      for (const i of open) byConcept[i.concept] = (byConcept[i.concept] || 0) + 1;
+      out.topConcepts = Object.keys(byConcept).map(function (c) { return { concept: c, count: byConcept[c] }; }).sort(function (a, b) { return b.count - a.count || (a.concept < b.concept ? -1 : 1); }).slice(0, 5);
+    }
+  } catch (e) {}
+  try { const mc = await env.LEADS.get('tutor:miscon:' + ne, { type: 'json' }); if (mc && Array.isArray(mc.items)) out.misconcepts = mc.items.slice(-5).map(function (i) { return i && i.concept; }).filter(Boolean); } catch (e) {}
+  try { const rd = await env.LEADS.get('acready:' + ne, { type: 'json' }); if (rd && typeof rd.score === 'number') out.readiness = { score: rd.score, components: rd.components || null }; } catch (e) {}
+  try {
+    const pr = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
+    if (pr && pr.lessons && typeof pr.lessons === 'object') {
+      const byMod = {};
+      for (const lid of Object.keys(pr.lessons)) {
+        const lp = pr.lessons[lid]; if (!lp) continue;
+        const m = lid.split('-')[0];
+        if (!byMod[m]) byMod[m] = [];
+        byMod[m].push({ lessonId: lid, mastery: typeof lp.mastery === 'number' ? lp.mastery : 0 });
+      }
+      out.modules = Object.keys(byMod).sort().map(function (m) {
+        const arr = byMod[m];
+        const mean = Math.round(arr.reduce(function (s, x) { return s + x.mastery; }, 0) / arr.length);
+        const weakest = arr.slice().sort(function (a, b) { return a.mastery - b.mastery || (a.lessonId < b.lessonId ? -1 : 1); })[0];
+        return { module: m, mastery: mean, attempted: arr.length, weakestLesson: weakest ? weakest.lessonId : null, weakestMastery: weakest ? weakest.mastery : null };
+      });
+      const attempted = out.modules.filter(function (m) { return m.attempted > 0; });
+      if (attempted.length) out.weakestModule = attempted.slice().sort(function (a, b) { return a.mastery - b.mastery || (a.module < b.module ? -1 : 1); })[0];
+    }
+  } catch (e) {}
+  try {
+    const lst = await env.LEADS.list({ prefix: 'acattempt:' + ne + ':', limit: 200 });
+    const keys = lst && Array.isArray(lst.keys) ? lst.keys : [];
+    for (const k of keys) {
+      const lid = k.name.slice(('acattempt:' + ne + ':').length);
+      let rec = null;
+      try { rec = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) {}
+      if (!rec || !Array.isArray(rec.history) || !rec.history.length) continue;
+      const last = rec.history[rec.history.length - 1];
+      if (!last || typeof last.score !== 'number') continue;
+      if (lid.indexOf('mock-') === 0) { if (!out.lastMock || (last.at || 0) > out.lastMock.at) out.lastMock = { lessonId: lid, score: last.score, correct: last.correctCount, total: last.total, at: last.at || 0, attempt: last }; }
+      else if (!out.lastQuiz || (last.at || 0) > out.lastQuiz.at) out.lastQuiz = { lessonId: lid, score: last.score, at: last.at || 0 };
+    }
+  } catch (e) {}
+  const lines = [];
+  if (out.readiness) {
+    let s = 'Readiness score: ' + out.readiness.score + '/100';
+    const c = out.readiness.components;
+    if (c) s += ' (mastery ' + (c.mastery != null ? c.mastery : '–') + ', mocks ' + (c.mocks != null ? c.mocks : '–') + ', review ' + (c.review != null ? c.review : '–') + ')';
+    s += ' (exam-ready gate: ' + 78 + ')';
+    lines.push(s);
+  }
+  if (out.openMistakes) lines.push('Open mistakes in their personal mistake bank: ' + out.openMistakes + ' (due for spaced review now: ' + out.dueReview + ')' + (out.topConcepts.length ? '; weakest concepts: ' + out.topConcepts.map(function (t) { return t.concept + ' x' + t.count; }).join(', ') : ''));
+  if (out.weakestModule) lines.push('Weakest module so far: ' + String(out.weakestModule.module).toUpperCase() + ' at ' + out.weakestModule.mastery + '% mastery' + (out.weakestModule.weakestLesson ? ' (weakest lesson ' + String(out.weakestModule.weakestLesson).toUpperCase() + ')' : ''));
+  if (out.lastMock) lines.push('Latest mock exam: ' + out.lastMock.score + '%' + (typeof out.lastMock.correct === 'number' && typeof out.lastMock.total === 'number' ? ' (' + out.lastMock.correct + '/' + out.lastMock.total + ' correct)' : ''));
+  if (out.lastQuiz) lines.push('Latest lesson quiz: ' + String(out.lastQuiz.lessonId).toUpperCase() + ' at ' + out.lastQuiz.score + '%');
+  if (out.misconcepts.length) lines.push('Misconceptions you detected in earlier chats: ' + out.misconcepts.join(', '));
+  out.text = lines.join('\n').slice(0, 900);
+  return out;
+}
+
+// ---------- Tier 1c/2b: the seeded question bank + server grading ----------
+async function tutorBankIndex(env, lang) { try { return await env.LEADS.get('tutor:bank:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorBankModule(env, lang, mod) { try { return await env.LEADS.get('tutor:bank:' + lang + ':' + mod, { type: 'json' }); } catch (e) { return null; } }
+async function tutorBankQuestion(env, lang, qid) {
+  const langs = lang === 'fa' ? ['fa', 'en'] : [lang, 'en'];
+  for (const lg of langs) {
+    const ix = await tutorBankIndex(env, lg);
+    const meta = ix && ix.qmeta ? ix.qmeta[qid] : null;
+    if (!meta) continue;
+    const mod = await tutorBankModule(env, lg, meta.m);
+    const rec = mod && Array.isArray(mod.questions) ? mod.questions.find(function (x) { return x && x.id === qid; }) : null;
+    if (rec) return rec;
+  }
+  return null;
+}
+function tutorTagTokens(tag) { return String(tag || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean); }
+async function tutorBankByConcept(env, lang, concept) {
+  // Lesson concept tags and question concepts use the same words in
+  // different orders ('common-mistake' vs 'mistake-common'), so the
+  // match is by TOKEN SET: equal sets first, then supersets, then
+  // (only when both are empty) any overlap of 2+ tokens.
+  const ix = await tutorBankIndex(env, lang);
+  if (!ix || !ix.qmeta) return [];
+  const want = new Set(tutorTagTokens(concept));
+  if (!want.size) return [];
+  const eq = [], sup = [], ovl = [];
+  for (const qid of Object.keys(ix.qmeta)) {
+    const c = new Set(tutorTagTokens(ix.qmeta[qid].c));
+    let inter = 0;
+    want.forEach(function (t) { if (c.has(t)) inter++; });
+    if (inter === want.size && c.size === want.size) eq.push(qid);
+    else if (inter === want.size) sup.push(qid);
+    else if (inter >= 2) ovl.push(qid);
+  }
+  eq.sort(); sup.sort(); ovl.sort();
+  return eq.concat(sup).length ? eq.concat(sup) : ovl;
+}
+function tutorHashStr(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+function tutorPickDeterministic(qids, seedKey, exclude) {
+  const ex = exclude || new Set();
+  const pool = qids.filter(function (x) { return !ex.has(x); });
+  if (!pool.length) return null;
+  pool.sort(function (a, b) { return (tutorHashStr(seedKey + ':' + a) - tutorHashStr(seedKey + ':' + b)) || (a < b ? -1 : 1); });
+  return pool[0];
+}
+function tutorQuestionPayload(q) {
+  // Student-safe projection: the bank KEY and the per-option "why"
+  // explanations NEVER leave the server in a served question.
+  return { qid: q.id, lessonId: q.lessonId, moduleId: q.moduleId, concept: q.concept, difficulty: q.difficulty || null, stem: q.stem, options: (q.options || []).map(function (o) { return { key: o.key, text: o.text }; }) };
+}
+async function tutorLoadMistakes(env, ne) {
+  try { const m = await env.LEADS.get('acmistakes:' + ne, { type: 'json' }); if (m && Array.isArray(m.items)) return m; } catch (e) {}
+  return { items: [], totalEver: 0, resolvedEver: 0 };
+}
+async function tutorGradeBankAnswer(env, ne, q, chosen, nowMs) {
+  // Grades against the BANK KEY and writes the outcome with the quiz
+  // engine's EXACT semantics (academy-platform/src/engine.js):
+  // wrong → recordMistake (an open item resets to stage 0 / due
+  // tomorrow with reviews+1; a new item is pushed, totalEver+1);
+  // correct on an OPEN item → the spaced-review ladder (reviews+1,
+  // streak+1; streak 2 resolves it, resolvedEver+1; otherwise stage
+  // climbs and the due date follows SPACING_DAYS); correct with no
+  // open item → no mistake-bank change. Model text is never the
+  // grader — this function is the only grading path.
+  const correct = chosen === q.correct;
+  const mk = await tutorLoadMistakes(env, ne);
+  let resolvedNow = false;
+  if (!correct) {
+    const ex = mk.items.find(function (i) { return i && i.qid === q.id && !i.resolved; });
+    if (ex) { ex.stage = 0; ex.streak = 0; ex.chosen = chosen; ex.at = nowMs; ex.dueAt = nowMs + TUTOR_DAY_MS; ex.reviews = (ex.reviews || 0) + 1; }
+    else { mk.items.push({ qid: q.id, lessonId: q.lessonId, moduleId: q.moduleId, concept: q.concept, trap: q.trap || null, chosen: chosen, at: nowMs, stage: 0, dueAt: nowMs + TUTOR_SPACING_DAYS[0] * TUTOR_DAY_MS, streak: 0, resolved: false, resolvedAt: null, reviews: 0 }); mk.totalEver = (mk.totalEver || 0) + 1; }
+    try { await env.LEADS.put('acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
+  } else {
+    const ex = mk.items.find(function (i) { return i && i.qid === q.id && !i.resolved; });
+    if (ex) {
+      ex.reviews = (ex.reviews || 0) + 1;
+      ex.streak = (ex.streak || 0) + 1;
+      if (ex.streak >= 2) { ex.resolved = true; ex.resolvedAt = nowMs; mk.resolvedEver = (mk.resolvedEver || 0) + 1; resolvedNow = true; }
+      else { ex.stage = Math.min((ex.stage || 0) + 1, TUTOR_SPACING_DAYS.length - 1); ex.dueAt = nowMs + TUTOR_SPACING_DAYS[ex.stage] * TUTOR_DAY_MS; }
+      try { await env.LEADS.put('acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
+    }
+  }
+  return { correct: correct, correctKey: q.correct, explain: q.explain || '', resolvedNow: resolvedNow, options: (q.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === q.correct }; }) };
+}
+function tutorFeedbackText(lang, grade, q) {
+  if (grade.correct) return (lang === 'fa' ? 'درست است. ' : 'Correct. ') + grade.explain;
+  return (lang === 'fa' ? 'نه — پاسخ درست ' + grade.correctKey + ' است. ' : 'Not quite — the correct answer is ' + grade.correctKey + '. ') + grade.explain;
+}
+
+// ---------- Tier 2a: mock debrief ----------
+async function tutorLatestMockAttempt(env, ne) {
+  let best = null;
+  try {
+    const lst = await env.LEADS.list({ prefix: 'acattempt:' + ne + ':', limit: 200 });
+    const keys = lst && Array.isArray(lst.keys) ? lst.keys : [];
+    for (const k of keys) {
+      const lid = k.name.slice(('acattempt:' + ne + ':').length);
+      if (lid.indexOf('mock-') !== 0) continue;
+      let rec = null;
+      try { rec = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) {}
+      if (!rec || !Array.isArray(rec.history)) continue;
+      for (const h of rec.history) {
+        if (h && h.answers && Array.isArray(h.servedIds) && typeof h.at === 'number') { if (!best || h.at > best.at) best = { lessonId: lid, at: h.at, attempt: h }; }
+      }
+    }
+  } catch (e) {}
+  return best;
+}
+async function tutorDebriefItem(env, state) {
+  const d = state.debrief;
+  const qid = d.queue[d.idx];
+  const q = await tutorBankQuestion(env, d.lang || 'en', qid);
+  if (!q) return null;
+  return { position: d.idx + 1, total: d.queue.length, qid: q.id, lessonId: q.lessonId, concept: q.concept, stem: q.stem, options: (q.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === q.correct }; }), chosenKey: d.answers[qid] || null, correctKey: q.correct, explain: q.explain || '' };
+}
+
+// ---------- Tier 2b: reverse-quiz picking ----------
+async function tutorQuizTiers(env, lang, ne, snap) {
+  const ix = await tutorBankIndex(env, lang);
+  if (!ix || !ix.qmeta || !Object.keys(ix.qmeta).length) return null;
+  const all = Object.keys(ix.qmeta).sort();
+  const tiers = [];
+  const openQids = (snap.openItems || []).map(function (i) { return i.qid; }).filter(function (x) { return ix.qmeta[x]; });
+  if (openQids.length) tiers.push(openQids);
+  if (snap.topConcepts && snap.topConcepts.length) { const pool = await tutorBankByConcept(env, lang, snap.topConcepts[0].concept); if (pool.length) tiers.push(pool); }
+  if (snap.weakestModule && snap.weakestModule.weakestLesson) { const lp = all.filter(function (x) { return ix.qmeta[x].l === snap.weakestModule.weakestLesson; }); if (lp.length) tiers.push(lp); }
+  tiers.push(all);
+  return { qmeta: ix.qmeta, tiers: tiers };
+}
+function tutorQuizPick(tiersObj, ne, quiz) {
+  const served = new Set(quiz.served || []);
+  for (const tier of tiersObj.tiers) {
+    const pref = tier.filter(function (x) { return !served.has(x) && tiersObj.qmeta[x] && tiersObj.qmeta[x].d === quiz.difficulty; });
+    const any = tier.filter(function (x) { return !served.has(x); });
+    const pool = pref.length ? pref : any;
+    if (pool.length) return tutorPickDeterministic(pool, ne + ':quiz:' + quiz.asked, served);
+  }
+  return null;
+}
+
+// ---------- Tier 1d: verification pass ----------
+const TUTOR_VERIFY_NOTE = '\n\nVERIFICATION TASK (this call only — do not answer the student): the user message is a DRAFT ANSWER written by another assistant. Check EVERY factual claim in the draft against the COURSE EXCERPTS above. Reply with ONLY a JSON object of exactly this shape: {"claims":[{"t":"<one factual claim from the draft>","s":true}]} — use "s":false for any claim the excerpts do not support, and true only when the excerpts support it. No prose, no markdown fences, nothing but the JSON.';
+function tutorParseVerdict(text) {
+  const s = String(text || '');
+  const a = s.indexOf('{'), b = s.lastIndexOf('}');
+  if (a === -1 || b <= a) return null;
+  let j = null;
+  try { j = JSON.parse(s.slice(a, b + 1)); } catch (e) { return null; }
+  if (!j || !Array.isArray(j.claims) || !j.claims.length) return null;
+  const claims = [];
+  for (const c of j.claims) { if (c && typeof c.t === 'string' && typeof c.s === 'boolean') claims.push({ t: c.t.slice(0, 400), s: c.s }); }
+  if (!claims.length) return null;
+  const supported = claims.filter(function (c) { return c.s; }).map(function (c) { return c.t; });
+  const unsupported = claims.filter(function (c) { return !c.s; }).map(function (c) { return c.t; });
+  return { status: unsupported.length ? 'unsupported' : 'clean', supported: supported, unsupported: unsupported };
+}
+async function tutorVerifyDraft(env, cfg, lang, excerpts, nearest, draftText, preferKind, attachment) {
+  // One verification call through the tutor's OWN chain, restricted
+  // to the draft's provider kind (an attachment answer is verified
+  // by the vision provider, with the attachment attached). Returns
+  // {called:false} when no provider produced a reply — the caller
+  // then spends NO budget, matching v1's "counted on success only".
+  const turns = [{ role: 'system', text: tutorSystemPrompt(lang, excerpts, nearest) + TUTOR_VERIFY_NOTE }, { role: 'user', text: 'DRAFT ANSWER TO CHECK:\n' + draftText }];
+  let provs = tutorProviders(cfg).filter(tutorProviderUsable);
+  if (attachment) provs = provs.filter(function (p) { return p.kind === 'gemini'; });
+  else if (preferKind) { const pref = provs.filter(function (p) { return p.kind === preferKind; }); if (pref.length) provs = pref; }
+  for (const p of provs) {
+    try {
+      const text = p.kind === 'groq' ? await tutorCallGroq(p, turns) : (p.kind === 'gemini' ? await tutorCallGemini(p, turns, attachment) : await tutorCallWorkersAi(env, p, turns));
+      const v = tutorParseVerdict(text);
+      if (v) return { called: true, status: v.status, supported: v.supported, unsupported: v.unsupported };
+      return { called: true, status: 'inconclusive', supported: [], unsupported: [] };
+    } catch (e) {}
+  }
+  return { called: false, status: 'inconclusive', supported: [], unsupported: [] };
+}
+async function tutorVerifyLog(env, outcome) {
+  const key = 'tutor:verify:' + todayVancouver();
+  let cur = { drafts: 0, clean: 0, regenerated: 0, trimmed: 0, inconclusive: 0, skippedBudget: 0 };
+  try { const v = await env.LEADS.get(key, { type: 'json' }); if (v && typeof v === 'object') cur = Object.assign(cur, v); } catch (e) {}
+  cur.drafts++;
+  if (outcome === 'clean') cur.clean++; else if (outcome === 'regenerated') cur.regenerated++; else if (outcome === 'trimmed') cur.trimmed++; else if (outcome === 'inconclusive') cur.inconclusive++; else if (outcome === 'skipped_budget') cur.skippedBudget++;
+  try { await env.LEADS.put(key, JSON.stringify(cur), { expirationTtl: 45 * 86400 }); } catch (e) {}
+}
+
+// ---------- Tier 3b: gap analytics ----------
+async function tutorLogGap(env, entry) {
+  const key = 'tutor:gaps:' + todayVancouver();
+  let cur = { items: [] };
+  try { const v = await env.LEADS.get(key, { type: 'json' }); if (v && Array.isArray(v.items)) cur = v; } catch (e) {}
+  cur.items.push({ q: String(entry.q || '').slice(0, 500), lang: entry.lang || 'en', lessonId: entry.lessonId || null, reason: entry.reason || 'not_covered', at: new Date().toISOString() });
+  if (cur.items.length > TUTOR_GAPS_CAP) cur.items = cur.items.slice(-TUTOR_GAPS_CAP);
+  try { await env.LEADS.put(key, JSON.stringify(cur), { expirationTtl: 45 * 86400 }); } catch (e) {}
+}
+
+// ---------- Tier 3a: voice (DEFAULT OFF, cfg-gated) ----------
+function tutorVoiceCfg(cfg) {
+  const v = cfg && cfg.voice && typeof cfg.voice === 'object' ? cfg.voice : {};
+  return {
+    enabled: v.enabled === true,
+    hasKey: typeof v.apiKey === 'string' && v.apiKey.length >= 8,
+    apiKey: typeof v.apiKey === 'string' ? v.apiKey : '',
+    dailyCap: Number.isInteger(v.dailyCap) && v.dailyCap > 0 ? v.dailyCap : TUTOR_VOICE_DEFAULT_DAILY_CAP,
+    enVoice: typeof v.enVoice === 'string' && v.enVoice ? v.enVoice : TUTOR_VOICE_DEFAULTS.enVoice,
+    faVoice: typeof v.faVoice === 'string' && v.faVoice ? v.faVoice : TUTOR_VOICE_DEFAULTS.faVoice,
+    model: typeof v.model === 'string' && v.model ? v.model : TUTOR_VOICE_DEFAULTS.model
+  };
+}
+async function tutorCallElevenLabs(vc, text, lang) {
+  const voiceId = lang === 'fa' ? vc.faVoice : vc.enVoice;
+  const body = { text: text, model_id: vc.model };
+  if (lang === 'fa') body.voice_settings = { stability: 0.50, similarity_boost: 0.85, style: 0.00, speed: 0.90 }; // the LOCKED FA SLOW profile (2026-11-09)
+  const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(voiceId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'xi-api-key': vc.apiKey },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(25000)
+  });
+  if (!r.ok) throw new Error('elevenlabs_' + r.status);
+  const buf = await r.arrayBuffer();
+  if (!buf || !buf.byteLength) throw new Error('elevenlabs_empty');
+  return buf;
 }
 
 /* ================= Academy × Stripe (Pack AcademyStripe, 2026-11-10) =====
@@ -10399,35 +10908,100 @@ async function handleRequest(request, env, ctx) {
         const usedGlobal = await tutorUsageCount(env, 'tutor:usage:' + day + ':_global');
         if (usedStudent >= caps.perStudent) return json({ ok: false, error: 'daily_cap', remainingToday: 0 }, 429, origin);
         if (usedGlobal >= caps.global) return json({ ok: false, error: 'global_cap', remainingToday: Math.max(0, caps.perStudent - usedStudent) }, 429, origin);
-        const ret = await tutorRetrieve(env, lang, message, lessonId || null);
+        const ret = await tutorRetrieve2(env, lang, message, lessonId || null);
         if (!ret.seeded) return json({ ok: false, error: 'corpus_not_seeded' }, 503, origin);
         const thread = await tutorThreadGet(env, ne);
+        if (!thread.state || typeof thread.state !== 'object') thread.state = {};
         if (!ret.strong.length) {
           // Retrieval empty/weak: the honest not-covered reply, no
           // provider call, no budget burned — the turn still lands in
           // the student's thread so the conversation stays coherent.
+          // Pack Tutor2: the question is also logged to the gap
+          // analytics (tutor:gaps:<day>) so content blind spots are
+          // visible in the owner portal.
           const reply = tutorNotCoveredReply(lang, ret.nearest);
           thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
           thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: ret.nearest ? [ret.nearest.id] : [] });
           await tutorThreadPut(env, ne, thread, ent.enrolment);
-          return json({ ok: true, reply: reply, citations: ret.nearest ? [ret.nearest.id] : [], notCovered: true, remainingToday: Math.max(0, caps.perStudent - usedStudent) }, 200, origin);
+          await tutorLogGap(env, { q: message, lang: lang, lessonId: lessonId || null, reason: 'not_covered' });
+          return json({ ok: true, reply: reply, citations: ret.nearest ? [ret.nearest.id] : [], notCovered: true, remainingToday: Math.max(0, caps.perStudent - usedStudent), voiceEnabled: tutorVoiceCfg(cfg).enabled }, 200, origin);
         }
-        const turns = [{ role: 'system', text: tutorSystemPrompt(lang, ret.strong, ret.nearest) }];
+        // Tier 1b: the student's OWN snapshot personalises the prompt.
+        const snap = await tutorStudentSnapshot(env, ne);
+        let sysText = tutorSystemPrompt(lang, ret.strong, ret.nearest);
+        if (snap.text) sysText += '\n\nTHIS STUDENT\'S OWN PROGRESS SNAPSHOT (from their Academy record — use it to personalise the answer: reference their real weak points and recent results when relevant; it is their data only):\n' + snap.text;
+        const practiceConcept = ret.topConcept && !thread.state.practice ? ret.topConcept : null;
+        if (practiceConcept) sysText += '\n\nThe portal will offer this student a graded practice question on the concept "' + practiceConcept + '" right after your answer — you may point them to it in one short line.';
+        const turns = [{ role: 'system', text: sysText }];
         for (const m of thread.messages.slice(-TUTOR_HISTORY_PROMPT_TURNS)) turns.push({ role: m.role === 'assistant' ? 'assistant' : 'user', text: String(m.text || '').slice(0, 2000) });
         turns.push({ role: 'user', text: message });
+        let usedS = usedStudent, usedG = usedGlobal;
+        const budgetLeft = function () { return usedS < caps.perStudent && usedG < caps.global; };
+        const spendUnit = async function () { usedS = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne); usedG = await tutorUsageBump(env, 'tutor:usage:' + day + ':_global'); };
         let out = null;
         try { out = await tutorCallChain(env, cfg, turns, attachment); } catch (e) { out = null; }
         if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
-        const stripped = tutorStripMisconception(out.text);
-        const reply = stripped.text || out.text.trim();
-        const citations = ret.strong.map(function (e) { return e.id; });
-        const newUsed = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne);
-        await tutorUsageBump(env, 'tutor:usage:' + day + ':_global');
+        await spendUnit();
+        let stripped = tutorStripMisconception(out.text);
+        let reply = stripped.text || out.text.trim();
+        let concept = stripped.concept;
+        // ---- Tier 1d: verification pass. The draft is checked
+        // claim-by-claim against the SAME excerpts before the student
+        // sees it. Accounting (successful replies only): draft 1 +
+        // verify 1 (+ regenerate 1 + re-verify 1 when the first check
+        // fails). Any step is skipped when the budget is exhausted —
+        // verification never eats the student's answer.
+        let verifyOutcome = null;
+        if (!budgetLeft()) { verifyOutcome = 'skipped_budget'; await tutorVerifyLog(env, 'skipped_budget'); }
+        else {
+          const v1res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply, out.kind, attachment);
+          if (!v1res.called) { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
+          else {
+            await spendUnit();
+            if (v1res.status === 'clean') { verifyOutcome = 'clean'; await tutorVerifyLog(env, 'clean'); }
+            else if (v1res.status === 'inconclusive') { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
+            else {
+              let trimmedFrom = v1res;
+              let regenOk = false;
+              if (budgetLeft()) {
+                const strictTurns = [{ role: 'system', text: sysText + '\n\nSTRICT REWRITE: your previous draft contained claims the excerpts do not support (' + v1res.unsupported.slice(0, 3).join(' | ') + '). Rewrite the answer using ONLY claims the excerpts support; drop everything else.' }].concat(turns.slice(1));
+                let out2 = null;
+                try { out2 = await tutorCallChain(env, cfg, strictTurns, attachment); } catch (e) { out2 = null; }
+                if (out2) {
+                  await spendUnit();
+                  const s2 = tutorStripMisconception(out2.text);
+                  const reply2 = s2.text || out2.text.trim();
+                  let accepted = true;
+                  if (budgetLeft()) {
+                    const v2res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply2, out2.kind, attachment);
+                    if (v2res.called) {
+                      await spendUnit();
+                      if (v2res.status === 'unsupported') { trimmedFrom = v2res; accepted = false; }
+                    }
+                  }
+                  if (accepted) { reply = reply2; concept = s2.concept || concept; regenOk = true; }
+                  else { reply = reply2; concept = s2.concept || concept; }
+                }
+              }
+              if (regenOk) { verifyOutcome = 'regenerated'; await tutorVerifyLog(env, 'regenerated'); }
+              else {
+                const supported = (trimmedFrom.supported || []).filter(Boolean);
+                const note = lang === 'fa' ? 'بخشی از پاسخ را نتوانستم با متن درس تأیید کنم و حذفش کردم.' : 'Part of the answer could not be verified against the lesson excerpts, so I removed it.';
+                reply = supported.length ? supported.join('\n\n') + '\n\n' + note : note + (lang === 'fa' ? ' لطفاً سؤالت را دقیق‌تر بپرس تا فقط از متن درس جواب بدهم.' : ' Please ask the question more precisely and I will answer strictly from the lesson text.');
+                verifyOutcome = 'trimmed'; await tutorVerifyLog(env, 'trimmed');
+                await tutorLogGap(env, { q: message, lang: lang, lessonId: lessonId || null, reason: 'unverified_claims' });
+              }
+            }
+          }
+        }
+        const citations = Array.from(new Set(ret.strong.map(function (e) { return e.id; }))); // v2 can return a concept chunk + the lesson chunk for one lesson — cite it once
         thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
         thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: citations });
         await tutorThreadPut(env, ne, thread, ent.enrolment);
-        if (stripped.concept) await tutorRecordMisconception(env, ne, stripped.concept, lessonId || citations[0] || null);
-        return json({ ok: true, reply: reply, citations: citations, remainingToday: Math.max(0, caps.perStudent - newUsed) }, 200, origin);
+        if (concept) await tutorRecordMisconception(env, ne, concept, lessonId || citations[0] || null);
+        const chatResp = { ok: true, reply: reply, citations: citations, remainingToday: Math.max(0, caps.perStudent - usedS), voiceEnabled: tutorVoiceCfg(cfg).enabled, verify: verifyOutcome };
+        if (practiceConcept) chatResp.practiceOffer = { concept: practiceConcept };
+        return json(chatResp, 200, origin);
       }
       if (path === '/api/academy/tutor/history' && request.method === 'GET') {
         if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -10443,7 +11017,7 @@ async function handleRequest(request, env, ctx) {
         const cfg = await tutorCfg(env);
         const caps = tutorCaps(cfg);
         const usedStudent = await tutorUsageCount(env, 'tutor:usage:' + todayVancouver() + ':' + normEmail(email));
-        return json({ ok: true, messages: thread.messages, remainingToday: Math.max(0, caps.perStudent - usedStudent), configured: tutorReady(cfg) }, 200, origin);
+        return json({ ok: true, messages: thread.messages, remainingToday: Math.max(0, caps.perStudent - usedStudent), configured: tutorReady(cfg), voiceEnabled: tutorVoiceCfg(cfg).enabled }, 200, origin);
       }
       if (path === '/api/academy/tutor/reset' && request.method === 'POST') {
         if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -10459,6 +11033,338 @@ async function handleRequest(request, env, ctx) {
         }
         try { await env.LEADS.delete('tutor:thread:' + normEmail(email)); } catch (e) {}
         return json({ ok: true }, 200, origin);
+      }
+
+      // ---- Academy: student session mint (BookletFix, 2026-11-11).
+      // Own auth, BEFORE the admin gate: the caller's credential at
+      // sign-in IS the enrolment — the portal's identity model keys
+      // the student by email and the gate is academyEntitlement,
+      // checked FRESH here with the booklet posture (readOnly:true —
+      // an in-grace student may hold a session; every protected call
+      // still re-checks entitlement with its own posture, so video
+      // tokens keep refusing grace). Success mints a 64-hex token
+      // stored ONLY as 'stok:' + sha256(token) → {email, exp} (24h,
+      // KV TTL) — see studentAuthed above for why the keyspace is
+      // disjoint from the owner tok: sessions.
+      if (path === '/api/academy/student-session' && request.method === 'POST') {
+        if (limited('acstudsess:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = {};
+        try { d = (await request.json()) || {}; } catch (e) { d = {}; }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const ent = await academyEntitlement(env, email, { readOnly: true });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        const stoken = randHex(32);
+        const sexp = Date.now() + STUDENT_SESSION_TTL_MS;
+        await env.LEADS.put('stok:' + await sha256hex(stoken), JSON.stringify({ email: normEmail(email), exp: sexp }), { expirationTtl: Math.floor(STUDENT_SESSION_TTL_MS / 1000) });
+        return json({ ok: true, token: stoken, expiresAt: new Date(sexp).toISOString() }, 200, origin);
+      }
+
+
+      // ---- Academy: Learning Assistant — Pack Tutor2 student routes
+      // (2026-11-11). Same posture as the v1 tutor routes: own auth
+      // BEFORE the admin gate, session is the credential, email rides
+      // the request, entitlement re-checked FRESH per call. Practice /
+      // quiz / debrief are interactive writes → readOnly:false; coach
+      // and feedback are reads of / writes about the student's own
+      // state → readOnly:true. NONE of these routes calls a provider
+      // (except voice, which is cfg-gated OFF by default), so none of
+      // them consumes the tutor's chat budget.
+      if (path === '/api/academy/tutor/practice' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const cfg = await tutorCfg(env);
+        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const lang = String(d.lang || 'en').trim().toLowerCase();
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const bix = await tutorBankIndex(env, lang);
+        if (!bix || !bix.qmeta || !Object.keys(bix.qmeta).length) return json({ ok: false, error: 'bank_not_seeded' }, 503, origin);
+        let concept = d.concept ? String(d.concept).trim().toLowerCase().slice(0, 80) : '';
+        let pool = [];
+        if (concept) pool = await tutorBankByConcept(env, lang, concept);
+        if (!pool.length && d.lessonId && ACADEMY_VIDEO_LESSON_RE.test(String(d.lessonId))) {
+          const lid = String(d.lessonId).toLowerCase();
+          pool = Object.keys(bix.qmeta).filter(function (x) { return bix.qmeta[x].l === lid; }).sort();
+          if (pool.length && !concept) concept = bix.qmeta[pool[0]].c;
+        }
+        if (!pool.length) {
+          const snapP = await tutorStudentSnapshot(env, g.ne);
+          if (snapP.topConcepts.length) { concept = snapP.topConcepts[0].concept; pool = await tutorBankByConcept(env, lang, concept); }
+        }
+        if (!pool.length) return json({ ok: false, error: concept ? 'no_questions_for_concept' : 'no_concept' }, concept ? 404 : 400, origin);
+        const thread = await tutorThreadGet(env, g.ne);
+        if (!thread.state || typeof thread.state !== 'object') thread.state = {};
+        const exclude = new Set(thread.state.practice && thread.state.practice.qid ? [thread.state.practice.qid] : []);
+        const qid = tutorPickDeterministic(pool, g.ne + ':' + (thread.state.practiceCount || 0), exclude) || pool[0];
+        const q = await tutorBankQuestion(env, lang, qid);
+        if (!q) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        thread.state.practice = { qid: q.id, concept: q.concept, lessonId: q.lessonId, lang: lang, at: new Date().toISOString() };
+        thread.state.practiceCount = (thread.state.practiceCount || 0) + 1;
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        return json({ ok: true, question: tutorQuestionPayload(q), concept: q.concept }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/practice-answer' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const qid = String(d.qid || '').trim().toLowerCase();
+        const chosen = String(d.chosen || '').trim().toUpperCase();
+        if (!ACADEMY_VIDEO_LESSON_RE.test(qid) || qid.length > 40 || !/^[A-E]$/.test(chosen)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const thread = await tutorThreadGet(env, g.ne);
+        const pend = thread.state && thread.state.practice ? thread.state.practice : null;
+        if (!pend || pend.qid !== qid) return json({ ok: false, error: 'no_pending_practice' }, 409, origin);
+        const q = await tutorBankQuestion(env, pend.lang || 'en', qid);
+        if (!q) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        const grade = await tutorGradeBankAnswer(env, g.ne, q, chosen, Date.now());
+        thread.state.practice = null;
+        const fbText = tutorFeedbackText(pend.lang || 'en', grade, q);
+        thread.messages.push({ role: 'assistant', text: fbText, at: new Date().toISOString(), citations: [q.lessonId], kind: 'practice' });
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, resolvedNow: grade.resolvedNow }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/quiz/start' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const cfg = await tutorCfg(env);
+        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const lang = String(d.lang || 'en').trim().toLowerCase();
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const snapQ = await tutorStudentSnapshot(env, g.ne);
+        const tiersObj = await tutorQuizTiers(env, lang, g.ne, snapQ);
+        if (!tiersObj) return json({ ok: false, error: 'bank_not_seeded' }, 503, origin);
+        let target = Number.isInteger(d.count) ? d.count : 5;
+        target = Math.min(10, Math.max(1, target));
+        let difficulty = 2;
+        if (snapQ.weakestModule) difficulty = snapQ.weakestModule.mastery >= 80 ? 3 : (snapQ.weakestModule.mastery >= 50 ? 2 : 1);
+        const thread = await tutorThreadGet(env, g.ne);
+        if (!thread.state || typeof thread.state !== 'object') thread.state = {};
+        const quiz = { target: target, asked: 0, score: 0, streak: 0, difficulty: difficulty, served: [], currentQid: null, lang: lang, startedAt: new Date().toISOString() };
+        const first = tutorQuizPick(tiersObj, g.ne, quiz);
+        if (!first) return json({ ok: false, error: 'no_questions' }, 404, origin);
+        quiz.currentQid = first; quiz.served.push(first);
+        thread.state.quiz = quiz;
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        const q = await tutorBankQuestion(env, lang, first);
+        if (!q) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        return json({ ok: true, question: tutorQuestionPayload(q), progress: { asked: 0, score: 0, target: target } }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/quiz/answer' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const qid = String(d.qid || '').trim().toLowerCase();
+        const chosen = String(d.chosen || '').trim().toUpperCase();
+        if (!ACADEMY_VIDEO_LESSON_RE.test(qid) || qid.length > 40 || !/^[A-E]$/.test(chosen)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const thread = await tutorThreadGet(env, g.ne);
+        const quiz = thread.state && thread.state.quiz ? thread.state.quiz : null;
+        if (!quiz || quiz.currentQid !== qid) return json({ ok: false, error: 'no_active_quiz_question' }, 409, origin);
+        const q = await tutorBankQuestion(env, quiz.lang || 'en', qid);
+        if (!q) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        const grade = await tutorGradeBankAnswer(env, g.ne, q, chosen, Date.now());
+        quiz.asked++;
+        if (grade.correct) { quiz.score++; quiz.streak++; if (quiz.streak >= 2) { quiz.difficulty = Math.min(3, quiz.difficulty + 1); quiz.streak = 0; } }
+        else { quiz.streak = 0; quiz.difficulty = Math.max(1, quiz.difficulty - 1); }
+        const fbText = tutorFeedbackText(quiz.lang || 'en', grade, q);
+        if (quiz.asked >= quiz.target) {
+          const summary = { asked: quiz.asked, score: quiz.score, target: quiz.target, pct: Math.round(quiz.score / quiz.target * 100) };
+          thread.state.quiz = null;
+          thread.state.quizSummary = Object.assign({ at: new Date().toISOString() }, summary);
+          const sumText = (quiz.lang === 'fa' ? 'پایان کوئیز: ' : 'Quiz complete: ') + summary.score + '/' + summary.asked + ' (' + summary.pct + '%)';
+          thread.messages.push({ role: 'assistant', text: fbText + '\n\n' + sumText, at: new Date().toISOString(), citations: [q.lessonId], kind: 'quiz' });
+          await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+          return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, done: true, summary: summary }, 200, origin);
+        }
+        const snapQ2 = await tutorStudentSnapshot(env, g.ne);
+        const tiersObj2 = await tutorQuizTiers(env, quiz.lang || 'en', g.ne, snapQ2);
+        const nextQid = tiersObj2 ? tutorQuizPick(tiersObj2, g.ne, quiz) : null;
+        if (!nextQid) {
+          const summary = { asked: quiz.asked, score: quiz.score, target: quiz.target, pct: Math.round(quiz.score / Math.max(1, quiz.asked) * 100), endedEarly: true };
+          thread.state.quiz = null;
+          thread.state.quizSummary = Object.assign({ at: new Date().toISOString() }, summary);
+          thread.messages.push({ role: 'assistant', text: fbText, at: new Date().toISOString(), citations: [q.lessonId], kind: 'quiz' });
+          await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+          return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, done: true, summary: summary }, 200, origin);
+        }
+        quiz.currentQid = nextQid; quiz.served.push(nextQid);
+        thread.state.quiz = quiz;
+        thread.messages.push({ role: 'assistant', text: fbText, at: new Date().toISOString(), citations: [q.lessonId], kind: 'quiz' });
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        const nq = await tutorBankQuestion(env, quiz.lang || 'en', nextQid);
+        if (!nq) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, done: false, next: tutorQuestionPayload(nq), progress: { asked: quiz.asked, score: quiz.score, target: quiz.target } }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/quiz/stop' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const thread = await tutorThreadGet(env, g.ne);
+        const quiz = thread.state && thread.state.quiz ? thread.state.quiz : null;
+        if (!quiz) return json({ ok: true, summary: null }, 200, origin);
+        const summary = { asked: quiz.asked, score: quiz.score, target: quiz.target, pct: quiz.asked ? Math.round(quiz.score / quiz.asked * 100) : 0, stopped: true };
+        thread.state.quiz = null;
+        thread.state.quizSummary = Object.assign({ at: new Date().toISOString() }, summary);
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        return json({ ok: true, summary: summary }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/debrief/start' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const cfg = await tutorCfg(env);
+        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const lang = String(d.lang || 'en').trim().toLowerCase();
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const thread = await tutorThreadGet(env, g.ne);
+        if (!thread.state || typeof thread.state !== 'object') thread.state = {};
+        if (thread.state.debrief && d.restart !== true) {
+          const cur = await tutorDebriefItem(env, thread.state);
+          if (cur) return json({ ok: true, done: false, resumed: true, item: cur }, 200, origin);
+          thread.state.debrief = null;
+        }
+        const latest = await tutorLatestMockAttempt(env, g.ne);
+        if (!latest) return json({ ok: false, error: 'no_mock_attempt' }, 404, origin);
+        const wrong = [];
+        const answers = {};
+        for (const qid of latest.attempt.servedIds) {
+          const q = await tutorBankQuestion(env, lang, qid);
+          if (!q) continue;
+          const chosen = latest.attempt.answers[qid];
+          if (chosen !== q.correct) { wrong.push(qid); answers[qid] = chosen || null; }
+        }
+        if (!wrong.length) return json({ ok: true, done: true, total: 0, perfect: true, mockLesson: latest.lessonId }, 200, origin);
+        thread.state.debrief = { mockLesson: latest.lessonId, attemptAt: latest.at, queue: wrong, idx: 0, lang: lang, answers: answers };
+        const intro = lang === 'fa' ? 'مرور آزمون آزمایشی: ' + wrong.length + ' پاسخ نادرست را یکی‌یکی با هم مرور می‌کنیم.' : 'Mock debrief: let\'s walk through your ' + wrong.length + ' wrong answer' + (wrong.length === 1 ? '' : 's') + ' one at a time.';
+        thread.messages.push({ role: 'assistant', text: intro, at: new Date().toISOString(), citations: [latest.lessonId], kind: 'debrief' });
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        const item = await tutorDebriefItem(env, thread.state);
+        if (!item) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        return json({ ok: true, done: false, item: item }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/debrief/next' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const thread = await tutorThreadGet(env, g.ne);
+        const deb = thread.state && thread.state.debrief ? thread.state.debrief : null;
+        if (!deb) return json({ ok: false, error: 'no_active_debrief' }, 409, origin);
+        deb.idx++;
+        if (deb.idx >= deb.queue.length) {
+          const summary = { reviewed: deb.queue.length, mockLesson: deb.mockLesson };
+          thread.state.debrief = null;
+          thread.state.lastDebrief = Object.assign({ at: new Date().toISOString() }, summary);
+          const doneText = deb.lang === 'fa' ? 'مرور آزمون تمام شد — هر ' + summary.reviewed + ' پاسخ نادرست را دیدی.' : 'Debrief complete — you reviewed all ' + summary.reviewed + ' wrong answers.';
+          thread.messages.push({ role: 'assistant', text: doneText, at: new Date().toISOString(), kind: 'debrief' });
+          await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+          return json({ ok: true, done: true, summary: summary }, 200, origin);
+        }
+        thread.state.debrief = deb;
+        await tutorThreadPut(env, g.ne, thread, g.ent.enrolment);
+        const item = await tutorDebriefItem(env, thread.state);
+        if (!item) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        return json({ ok: true, done: false, item: item }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/coach' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, url.searchParams.get('email'), true, origin);
+        if (g.resp) return g.resp;
+        const snapC = await tutorStudentSnapshot(env, g.ne);
+        let suggestion;
+        if (snapC.dueReview > 0) suggestion = { kind: 'review', concept: snapC.dueItems[0] ? snapC.dueItems[0].concept : null, lessonId: snapC.dueItems[0] ? snapC.dueItems[0].lessonId : null, count: snapC.dueReview };
+        else if (snapC.openMistakes > 0) suggestion = { kind: 'practice', concept: snapC.topConcepts.length ? snapC.topConcepts[0].concept : null, count: snapC.openMistakes };
+        else if (snapC.weakestModule && snapC.weakestModule.mastery < 80) suggestion = { kind: 'lesson', lessonId: snapC.weakestModule.weakestLesson, module: snapC.weakestModule.module, mastery: snapC.weakestModule.mastery };
+        else if (snapC.lastMock) {
+          let wrongCount = 0;
+          const att = snapC.lastMock.attempt;
+          if (att && att.answers && Array.isArray(att.servedIds)) {
+            for (const qid of att.servedIds.slice(0, 100)) { const q = await tutorBankQuestion(env, 'en', qid); if (q && att.answers[qid] !== q.correct) wrongCount++; }
+          }
+          suggestion = wrongCount > 0 ? { kind: 'debrief', mockLesson: snapC.lastMock.lessonId, count: wrongCount } : { kind: 'chat' };
+        }
+        else suggestion = { kind: 'chat' };
+        return json({ ok: true, dueReview: snapC.dueReview, totalOpen: snapC.openMistakes, weakestModule: snapC.weakestModule ? { module: snapC.weakestModule.module, mastery: snapC.weakestModule.mastery } : null, readiness: snapC.readiness ? snapC.readiness.score : null, suggestion: suggestion }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/feedback' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, true, origin);
+        if (g.resp) return g.resp;
+        const vote = String(d.vote || '');
+        if (vote !== 'up' && vote !== 'down') return json({ ok: false, error: 'validation' }, 400, origin);
+        const dayF = todayVancouver();
+        const fkey = 'tutor:feedback:' + dayF;
+        let agg = { up: 0, down: 0 };
+        try { const v = await env.LEADS.get(fkey, { type: 'json' }); if (v && typeof v === 'object') agg = { up: v.up | 0, down: v.down | 0 }; } catch (e) {}
+        agg[vote]++;
+        try { await env.LEADS.put(fkey, JSON.stringify(agg), { expirationTtl: 45 * 86400 }); } catch (e) {}
+        if (vote === 'down' && d.excerpt) {
+          const dkey = 'tutor:feedback-down:' + dayF;
+          let lst = { items: [] };
+          try { const v = await env.LEADS.get(dkey, { type: 'json' }); if (v && Array.isArray(v.items)) lst = v; } catch (e) {}
+          lst.items.push({ excerpt: String(d.excerpt).slice(0, 500), lang: TUTOR_LANGS.indexOf(String(d.lang || '')) !== -1 ? String(d.lang) : 'en', at: new Date().toISOString() });
+          if (lst.items.length > TUTOR_FEEDBACK_DOWN_CAP) lst.items = lst.items.slice(-TUTOR_FEEDBACK_DOWN_CAP);
+          try { await env.LEADS.put(dkey, JSON.stringify(lst), { expirationTtl: 45 * 86400 }); } catch (e) {}
+        }
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/voice' && request.method === 'POST') {
+        // Tier 3a: ElevenLabs read-aloud. DEFAULT OFF — the route is
+        // a hard 403 until cfg:tutor.voice.enabled is set by an owner
+        // provision, and it spends from its OWN counter, never the
+        // chat budget. Enabling burns the shared ElevenLabs credit
+        // pool and requires Erfan's explicit go (see the Tutor2
+        // header comment).
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const g = await tutorGate(env, d.email, false, origin);
+        if (g.resp) return g.resp;
+        const cfg = await tutorCfg(env);
+        const vc = tutorVoiceCfg(cfg);
+        if (!vc.enabled) return json({ ok: false, error: 'voice_disabled' }, 403, origin);
+        if (!vc.hasKey) return json({ ok: false, error: 'voice_not_configured' }, 503, origin);
+        const lang = String(d.lang || 'en').trim().toLowerCase();
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const text = String(d.text || '').trim();
+        if (!text || text.length > TUTOR_VOICE_MAX_CHARS) return json({ ok: false, error: 'invalid_text' }, 400, origin);
+        const dayV = todayVancouver();
+        const usedStu = await tutorUsageCount(env, 'tutor:voiceusage:' + dayV + ':' + g.ne);
+        const usedGlo = await tutorUsageCount(env, 'tutor:voiceusage:' + dayV + ':_global');
+        if (usedStu >= vc.dailyCap || usedGlo >= vc.dailyCap * 100) return json({ ok: false, error: 'voice_cap', remainingToday: Math.max(0, vc.dailyCap - usedStu) }, 429, origin);
+        let buf = null;
+        try { buf = await tutorCallElevenLabs(vc, text, lang); } catch (e) { buf = null; }
+        if (!buf) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
+        await tutorUsageBump(env, 'tutor:voiceusage:' + dayV + ':' + g.ne);
+        await tutorUsageBump(env, 'tutor:voiceusage:' + dayV + ':_global');
+        return new Response(buf, { status: 200, headers: { 'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, no-store', 'Access-Control-Allow-Origin': origin || '*', 'Vary': 'Origin' } });
       }
 
       // ---- Academy: lesson/module booklets (Pack BookletView,
@@ -10478,11 +11384,17 @@ async function handleRequest(request, env, ctx) {
         const blang = String(bp[5] || '').toLowerCase();
         const idOk = (bkind === 'module' && /^m[0-8]$/.test(bid)) || (bkind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bid) && bid.length <= 40);
         if (!idOk || BOOKLET_LANGS.indexOf(blang) === -1) return json({ ok: false, error: 'not_found' }, 404, origin);
-        const sessionOk = await authed(request, env);
-        const serviceOk = sessionOk ? false : await bookletServiceOk(request, env);
-        if (!sessionOk && !serviceOk) return json({ ok: false, error: 'unauthorized' }, 401, origin);
-        if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        const sessionOk = await authed(request, env);
+        // BookletFix (2026-11-11): a STUDENT session (stok:, minted by
+        // POST /api/academy/student-session at portal sign-in and bound
+        // to this exact email) is a first-class credential here — it is
+        // what a real student session actually presents. The owner
+        // session and the SERVICE bearer remain the operator paths.
+        const studentOk = sessionOk ? false : await studentAuthed(request, env, email);
+        const serviceOk = (sessionOk || studentOk) ? false : await bookletServiceOk(request, env);
+        if (!sessionOk && !studentOk && !serviceOk) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
         const ent = await academyEntitlement(env, email, { readOnly: true });
         if (!ent.entitled) {
@@ -12675,12 +13587,33 @@ async function handleRequest(request, env, ctx) {
           clean.push(e);
         }
         const next = { providers: clean, provisionedAt: new Date().toISOString() };
+        // Pack Tutor2 (Tier 3a): optional voice block {enabled,
+        // apiKey?, enVoice?, faVoice?, model?, dailyCap?} — DEFAULT
+        // OFF. Stored under cfg:tutor.voice; the key is never echoed.
+        // When the block is absent, any previously stored voice
+        // block is carried over untouched (a provider rotation must
+        // not silently drop the voice config, and vice versa).
+        if (d.voice !== undefined) {
+          if (!d.voice || typeof d.voice !== 'object' || Array.isArray(d.voice)) return json({ ok: false, error: 'validation' }, 400, origin);
+          const prevV = cur.voice && typeof cur.voice === 'object' ? cur.voice : {};
+          const vv = { enabled: d.voice.enabled === true };
+          const vk = String(d.voice.apiKey || '');
+          if (vk) { if (vk.length < 8 || vk.length > 512) return json({ ok: false, error: 'validation' }, 400, origin); vv.apiKey = vk; }
+          else if (typeof prevV.apiKey === 'string' && prevV.apiKey) vv.apiKey = prevV.apiKey;
+          const vStr = function (nm) { if (typeof d.voice[nm] === 'string' && d.voice[nm]) return d.voice[nm].slice(0, 80); if (typeof prevV[nm] === 'string' && prevV[nm]) return prevV[nm]; return null; };
+          const evv = vStr('enVoice'); if (evv) vv.enVoice = evv;
+          const fvv = vStr('faVoice'); if (fvv) vv.faVoice = fvv;
+          const mdv = vStr('model'); if (mdv) vv.model = mdv;
+          if (Number.isInteger(d.voice.dailyCap) && d.voice.dailyCap > 0 && d.voice.dailyCap <= 1000) vv.dailyCap = d.voice.dailyCap;
+          else if (Number.isInteger(prevV.dailyCap)) vv.dailyCap = prevV.dailyCap;
+          next.voice = vv;
+        } else if (cur.voice && typeof cur.voice === 'object') next.voice = cur.voice;
         const psd = Number.isInteger(d.perStudentDaily) ? d.perStudentDaily : (Number.isInteger(cur.perStudentDaily) ? cur.perStudentDaily : null);
         const gd = Number.isInteger(d.globalDaily) ? d.globalDaily : (Number.isInteger(cur.globalDaily) ? cur.globalDaily : null);
         if (psd !== null && psd > 0 && psd <= 10000) next.perStudentDaily = psd;
         if (gd !== null && gd > 0 && gd <= 100000) next.globalDaily = gd;
         await env.LEADS.put('cfg:tutor', JSON.stringify(next));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_provision', target: 'cfg:tutor', ip: ip, at: new Date().toISOString(), detail: { providers: clean.map(function (p) { return p.kind; }), replace: d.replace === true } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_provision', target: 'cfg:tutor', ip: ip, at: new Date().toISOString(), detail: { providers: clean.map(function (p) { return p.kind; }), replace: d.replace === true, voiceEnabled: !!(next.voice && next.voice.enabled) } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/academy/tutor-status' && request.method === 'GET') {
@@ -12689,7 +13622,37 @@ async function handleRequest(request, env, ctx) {
         const caps = tutorCaps(cfg);
         const corpus = {};
         for (const lg of TUTOR_LANGS) { const ix = await tutorCorpusIndex(env, lg); corpus[lg] = !!(ix && Array.isArray(ix.lessons) && ix.lessons.length); }
-        return json({ ok: true, configured: tutorReady(cfg), providers: tutorProviders(cfg).map(function (p) { return { kind: p.kind, model: p.model || null, hasKey: p.kind === 'workers-ai' ? true : !!p.apiKey }; }), perStudentDaily: caps.perStudent, globalDaily: caps.global, corpusSeeded: corpus, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+        const corpusV2 = {};
+        const bankSeeded = {};
+        for (const lg of TUTOR_LANGS) { const ix2 = await tutorCorpusV2Index(env, lg); corpusV2[lg] = !!(ix2 && ((Array.isArray(ix2.lessons) && ix2.lessons.length) || (Array.isArray(ix2.concepts) && ix2.concepts.length))); const bx = await tutorBankIndex(env, lg); bankSeeded[lg] = !!(bx && bx.qmeta && Object.keys(bx.qmeta).length); }
+        const vcS = tutorVoiceCfg(cfg);
+        return json({ ok: true, configured: tutorReady(cfg), providers: tutorProviders(cfg).map(function (p) { return { kind: p.kind, model: p.model || null, hasKey: p.kind === 'workers-ai' ? true : !!p.apiKey }; }), perStudentDaily: caps.perStudent, globalDaily: caps.global, corpusSeeded: corpus, corpusV2Seeded: corpusV2, bankSeeded: bankSeeded, voice: { enabled: vcS.enabled, hasKey: vcS.hasKey, dailyCap: vcS.dailyCap }, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+      }
+      if (path === '/api/admin/academy/tutor-insights' && request.method === 'GET') {
+        // Pack Tutor2 (Tier 3b): the owner read of the tutor QC
+        // signals — gap analytics (questions retrieval could not
+        // cover, or whose answers failed verification), student
+        // feedback tallies + down-vote excerpts, verification-pass
+        // outcomes and voice usage, over the last 7 Vancouver days.
+        // Read-only; aggregates only — no student email appears in
+        // any of these stores by construction.
+        const fmtDayI = function (dt) { try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(dt); } catch (e) { return dt.toISOString().slice(0, 10); } };
+        const daysI = [];
+        for (let i = 0; i < 7; i++) daysI.push(fmtDayI(new Date(Date.now() - i * 86400000)));
+        let gapsTotalI = 0; const gapsByReasonI = {}; const recentGapsI = [];
+        let fbUpI = 0, fbDownI = 0; const downExcerptsI = [];
+        const verifyI = { drafts: 0, clean: 0, regenerated: 0, trimmed: 0, inconclusive: 0, skippedBudget: 0 };
+        for (const dy of daysI) {
+          try { const gv = await env.LEADS.get('tutor:gaps:' + dy, { type: 'json' }); if (gv && Array.isArray(gv.items)) { gapsTotalI += gv.items.length; for (const it of gv.items) { const rsn = it.reason || 'not_covered'; gapsByReasonI[rsn] = (gapsByReasonI[rsn] || 0) + 1; recentGapsI.push({ q: it.q, lang: it.lang, lessonId: it.lessonId, reason: it.reason, at: it.at, day: dy }); } } } catch (e) {}
+          try { const fv = await env.LEADS.get('tutor:feedback:' + dy, { type: 'json' }); if (fv) { fbUpI += fv.up | 0; fbDownI += fv.down | 0; } } catch (e) {}
+          try { const dv = await env.LEADS.get('tutor:feedback-down:' + dy, { type: 'json' }); if (dv && Array.isArray(dv.items)) for (const it of dv.items) downExcerptsI.push({ excerpt: it.excerpt, lang: it.lang, at: it.at, day: dy }); } catch (e) {}
+          try { const vv = await env.LEADS.get('tutor:verify:' + dy, { type: 'json' }); if (vv) for (const k of Object.keys(verifyI)) verifyI[k] += vv[k] | 0; } catch (e) {}
+        }
+        recentGapsI.sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); });
+        downExcerptsI.sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); });
+        const vcI = tutorVoiceCfg(await tutorCfg(env));
+        const voiceUsedTodayI = await tutorUsageCount(env, 'tutor:voiceusage:' + todayVancouver() + ':_global');
+        return json({ ok: true, days: daysI, gaps: { total7d: gapsTotalI, byReason: gapsByReasonI, recent: recentGapsI.slice(0, 20) }, feedback: { up: fbUpI, down: fbDownI, downExcerpts: downExcerptsI.slice(0, 10) }, verify: verifyI, voice: { enabled: vcI.enabled, hasKey: vcI.hasKey, dailyCapPerStudent: vcI.dailyCap, usageTodayGlobal: voiceUsedTodayI } }, 200, origin);
       }
       if (path === '/api/admin/academy/tutor-seed' && request.method === 'POST') {
         // Corpus seeding (Pack Tutor): the operator's build script
@@ -12706,6 +13669,45 @@ async function handleRequest(request, env, ctx) {
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
         const lang = String(d.lang || '');
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Pack Tutor2 parts: corpus v2 (concept chunks + glossary)
+        // and the graded question bank. Each part validates its own
+        // payload shape; the v1 lessons validation below does not
+        // apply to them (bank-index/glossary carry no lessons array).
+        if (d.part === 'v2-index' || d.part === 'v2-module' || d.part === 'glossary' || d.part === 'bank-index' || d.part === 'bank-module') {
+          if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
+          if (d.part === 'glossary') {
+            if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:glossary', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { part: 'glossary', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
+          }
+          if (d.part === 'v2-index') {
+            if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
+          }
+          if (d.part === 'v2-module') {
+            const mod2 = String(d.module || '');
+            if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
+            if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-module', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
+          }
+          if (d.part === 'bank-index') {
+            if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:bank:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-index', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
+          }
+          const modB = String(d.module || '');
+          if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
+          if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-module', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
+        }
         if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
         if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
         if (d.part === 'index') {
