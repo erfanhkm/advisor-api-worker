@@ -3066,36 +3066,6 @@ async function countListOp(env) {
   }
 }
 async function kvList(env, opts) { await countListOp(env); return env.LEADS.list(opts); }
-// ---- KV write-usage counter (FreeSplit hygiene C9, 2026-11-10) ----
-// Mirrors the list counter above: the worker counts its OWN LEADS puts
-// (all 200+ put sites funnel through the kvPut wrapper below — the
-// fetch/scheduled preamble rebinds env per invocation, so every put in
-// a request passes it exactly once) and flushes coalesced every 20
-// puts to usage:writes:<utcDay> (7-day TTL), surfaced beside the list
-// usage in the maintenance tail. The counter's own flush writes through
-// the RAW binding so it never counts itself. Deletes are not counted
-// (a separate 1,000/day pool; not the binding constraint today).
-let writeOpsToday = -1, writeOpsDay = '', writeOpsDirty = 0;
-async function countWriteOp(env) {
-  const day = utcDay();
-  if (writeOpsDay !== day) { writeOpsDay = day; writeOpsToday = -1; writeOpsDirty = 0; }
-  if (writeOpsToday < 0) {
-    try { const u = await env.LEADS.get('usage:writes:' + day, { type: 'json' }); writeOpsToday = (u && typeof u.count === 'number') ? u.count : 0; } catch (e) { writeOpsToday = 0; }
-  }
-  writeOpsToday++; writeOpsDirty++;
-  if (writeOpsDirty >= 20) {
-    writeOpsDirty = 0;
-    try { await env.LEADS.put('usage:writes:' + day, JSON.stringify({ count: writeOpsToday, at: new Date().toISOString() }), { expirationTtl: 7 * 86400 }); } catch (e) {}
-  }
-}
-function kvCountingEnv(env) {
-  if (!env || !env.LEADS || typeof env.LEADS.put !== 'function' || env.__kvCounted) return env;
-  const raw = env.LEADS;
-  const wrapped = Object.assign({}, raw, {
-    put: function (k, v, opts) { const p = raw.put(k, v, opts); countWriteOp(env).catch(function () {}); return p; }
-  });
-  return Object.assign({}, env, { LEADS: wrapped, __kvCounted: true });
-}
 // ---- automatic whole-site backup (Cloudflare cron trigger) ----
 // Erfan's rule (2026-10-23): from 2026-12-01 the worker backs ITSELF up
 // nightly with zero human or agent involvement — a full dump of the LEADS
@@ -12951,10 +12921,6 @@ async function handleRequest(request, env, ctx) {
           let listUsage = 0;
           try { const u2 = await env.LEADS.get('usage:lists:' + utcDay(), { type: 'json' }); if (u2 && typeof u2.count === 'number') listUsage = u2.count; } catch (e) {}
           if (listUsage >= 700) issues.push('KV list usage high — ' + listUsage + '/1000 today');
-          // FreeSplit C9: the writes twin — same 700/1000 early-warning line.
-          let writeUsage = 0;
-          try { const w2 = await env.LEADS.get('usage:writes:' + utcDay(), { type: 'json' }); if (w2 && typeof w2.count === 'number') writeUsage = w2.count; } catch (e) {}
-          if (writeUsage >= 700) issues.push('KV write usage high — ' + writeUsage + '/1000 today');
           // Auto-backup freshness (cycle 25): runFullBackup can be killed by
           // platform limits BEFORE it can write its own failure log, so this
           // nightly check is the alarm — from the Dec 1 start, the newest
@@ -13242,7 +13208,6 @@ async function handleRequest(request, env, ctx) {
 
 export default {
   async fetch(request, env, ctx) {
-    env = kvCountingEnv(env); // FreeSplit C9: count every LEADS put this invocation (see countWriteOp)
     let resp;
     try { resp = await handleRequest(request, env, ctx); } catch (e) { console.error(e); resp = new Response(JSON.stringify({ ok: false, error: 'server' }), { status: 500, headers: { 'Content-Type': 'application/json' } }); } // a preamble throw must not surface as a raw platform error (cycle 30, Claude M8)
     // Cycle 26 (Claude H1): this bump used to run pre-routing on EVERY
@@ -13281,7 +13246,6 @@ export default {
        scheduled bundle (folds, automations, reconcile, backup) is
        site-side machinery — no-op outright. */
     if (scopeOf(env) === 'academy') return;
-    env = kvCountingEnv(env); // FreeSplit C9: scheduled puts count too (folds/backups are top writers)
     const cronStr = (event && typeof event.cron === 'string') ? event.cron : '';
     const minuteField = cronStr ? cronStr.trim().split(/\s+/)[0] : '';
     const fixedMinute = /^\d+$/.test(minuteField) ? parseInt(minuteField, 10) : null;
