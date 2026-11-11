@@ -1068,6 +1068,27 @@ async function authed(request, env) {
   const negAt = admNegCache.get(keys[0]);
   if (negAt && Date.now() - negAt < 30000) return false;
   let rawExp = await env.LEADS.get(keys[0]);
+  /* Pack SessFix (2026-11-10): live probe today showed KV reads on this
+     namespace intermittently inconsistent — a record written seconds
+     earlier flapped hit/miss/hit across reads for over a minute. A
+     single miss on a JUST-MINTED admin session made the portal's boot
+     wave 401, and the portal answers any 401 with an instant sign-out
+     that also revokes the session server-side (POST /api/logout), so a
+     transient read miss became a permanent kick-out for the owner.
+     Re-read a miss with backoff before believing it; the negative
+     cache is written only after the ladder exhausts, so a genuinely
+     unknown token still costs one ladder per isolate per 30s and the
+     gate's per-IP failure limit still bounds spray cost. A hit at any
+     rung proceeds exactly as before; an expired VALUE is non-null and
+     never enters the ladder. */
+  if (!rawExp) {
+    const waits = [200, 500, 1000];
+    for (const w of waits) {
+      await new Promise(function (r) { setTimeout(r, w); });
+      rawExp = await env.LEADS.get(keys[0]);
+      if (rawExp) break;
+    }
+  }
   const usedKey = keys[0];
   if (!rawExp) {
     if (admNegCache.size > 512) admNegCache.clear();
