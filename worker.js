@@ -11540,7 +11540,17 @@ async function handleRequest(request, env, ctx) {
         // never-echoed values are the control. Every OTHER admin
         // route keeps the generic gate untouched.
         {
-          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method)) || (request.headers.get('X-Stripe-Webhook-Secret') || '').length > 0;
+          // Pack StripeBearer (2026-11-11): bearer-mode admission —
+          // when the webhook-secret header is ABSENT, an Authorization
+          // Bearer whose value starts with "whsec_" is itself the
+          // value carrier (the vault bearer_header placement is the
+          // one placement proven to be swapped for the real value en
+          // route — the B2 precedent; a manually duplicated custom
+          // header was NOT swapped and stored the literal surrogate,
+          // pack record §22). The handler below takes the secret
+          // from the Bearer in this mode, first provision ONLY.
+          const bearerAdm = ((request.headers.get('X-Stripe-Webhook-Secret') || '').length === 0) && /^Bearer whsec_\S+$/.test(request.headers.get('Authorization') || '');
+          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method)) || (request.headers.get('X-Stripe-Webhook-Secret') || '').length > 0 || bearerAdm;
           if (!admitted) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         }
         /* Pack StripeProv2 (2026-11-10): the two values are ALSO
@@ -11559,14 +11569,31 @@ async function handleRequest(request, env, ctx) {
         const hdrWs = request.headers.get('X-Stripe-Webhook-Secret') || '';
         const hdrAk = request.headers.get('X-Stripe-Api-Key') || '';
         const hdrMode = hdrWs.length > 0;
+        /* Pack StripeBearer (2026-11-11): bearer mode — header
+           ABSENT + Bearer value starting "whsec_" → the Bearer IS
+           the webhook secret (see the admission comment above).
+           Bearer mode is first-provision ONLY: the cfg-present
+           branch below refuses it 409 ahead of the repair rule, so
+           it can never overwrite an existing record. In bearer mode
+           the apiKey still comes from X-Stripe-Api-Key when that
+           header is present (existing optional behaviour), else
+           none is stored. */
+        const bearerM = (request.headers.get('Authorization') || '').match(/^Bearer (\S+)$/);
+        const bearerWs = (!hdrMode && bearerM && bearerM[1].indexOf('whsec_') === 0) ? bearerM[1] : '';
+        const bearerMode = bearerWs.length > 0;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
-        const ws = hdrMode ? hdrWs : String(d.webhookSecret || '');
-        const ak = hdrMode ? hdrAk : (d.apiKey === undefined || d.apiKey === null ? '' : String(d.apiKey));
+        const ws = hdrMode ? hdrWs : (bearerMode ? bearerWs : String(d.webhookSecret || ''));
+        const ak = hdrMode ? hdrAk : (bearerMode ? hdrAk : (d.apiKey === undefined || d.apiKey === null ? '' : String(d.apiKey)));
         if (ws.length < 16 || ws.length > 256 || ak.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
         const cur = (await env.LEADS.get('cfg:stripe', { type: 'json' })) || {};
         if (cur.webhookSecret) {
+          // Pack StripeBearer: bearer mode NEVER overwrites — first
+          // provision only; an existing record refuses it here,
+          // untouched, ahead of the service repair rule below (which
+          // is unchanged: scopedAuthed + BOTH headers).
+          if (bearerMode) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
           const viaService = await scopedAuthed(request, env, path, request.method);
           if (!(viaService && hdrMode && hdrAk.length > 0)) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
           cur.webhookSecret = ws;
@@ -11581,6 +11608,7 @@ async function handleRequest(request, env, ctx) {
         if (ak) cur.apiKey = ak;
         cur.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:stripe', JSON.stringify(cur));
+        if (bearerMode) { try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_provision', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'bearer' } }), { expirationTtl: 730 * 86400 }); } catch (e) {} }
         return json({ ok: true, apiKeyStored: !!ak }, 200, origin);
       }
       if (path === '/api/admin/academy/stripe-status' && request.method === 'GET') {
