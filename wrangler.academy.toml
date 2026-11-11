@@ -1,0 +1,41 @@
+# Free Split (2026-11-10): advisor-academy — the ACADEMY-scoped
+# deployment of the shared advisor source (worker.js), running on the
+# BUSINESS Cloudflare account. Build with THIS file
+# (wrangler deploy -c wrangler.academy.toml); the repo's wrangler.toml
+# remains the PERSONAL advisor-api deployment's config and is
+# deliberately untouched. Record: hidden_files/free-split-plan-2026-11-10.md.
+name = "advisor-academy"
+main = "worker.js"
+compatibility_date = "2026-10-19"
+workers_dev = true
+
+[vars]
+# Scope flag: handleRequest 404s every route outside the academy
+# families (/api/academy/*, /api/admin/academy/*, /api/health), and
+# scheduled() no-ops outright. Admin sessions are minted ONLY by the
+# site deployment; this deployment validates presented owner tokens
+# through its session bridge (bridgeAuthed -> SITE_API_BASE
+# /api/internal/session-check, authenticated by the cfg:internal
+# secret held in this deployment's KV) — the bridge fails closed
+# when SITE_API_BASE or the secret is absent.
+SCOPE = "academy"
+SITE_API_BASE = "https://advisor-api.erfanbillion.workers.dev"
+
+# The business account's ACADEMY namespace, bound under the SAME name
+# the code expects (env.LEADS). Academy data only: academy:* student
+# records + the cfg:* keys the academy families read (cfg:b2,
+# cfg:video, cfg:stripe, cfg:mail, cfg:internal).
+[[kv_namespaces]]
+binding = "LEADS"
+id = "4b95ef2b634b49319ada09aefe5fb9c1"
+
+# NO [triggers] section on purpose: no cron is registered on the
+# business account (the personal deployment keeps the nightly one;
+# scheduled() also no-ops under SCOPE=academy as a second guard).
+# NO [[services]] bindings: SELLER / NEWSLETTER / AICHAT exist only on
+# the personal account. Every env.NEWSLETTER / env.AICHAT / env.SELLER
+# read in worker.js is presence-guarded; under academy scope the
+# Turnstile delegation has no path and fails closed (turnstileOk
+# returns false) — acceptable because /api/login is site-family and
+# 404s here — and the ai-chat / seller / newsletter service checks
+# live in site-family maintenance code the scope gate never reaches.
