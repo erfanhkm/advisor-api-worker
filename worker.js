@@ -12926,6 +12926,11 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/admin/maintenance' && request.method === 'POST') {
         if ((await env.LEADS.get('maint:lock')) !== null) return json({ ok: false, error: 'busy' }, 429, origin);
+        // Pack Maint500 (2026-11-11): the lock ACQUIRE stays fatal on a KV
+        // write failure by design — running maintenance unlocked races the
+        // nightly against a portal-triggered run. The 2026-11-11 nightly
+        // 500s came from the (then unguarded) report-persist tail, not
+        // from here; the acquire failure mode is the same 500 either way.
         await env.LEADS.put('maint:lock', '1', { expirationTtl: 240 });
         try {
           const started = new Date().toISOString();
@@ -13109,10 +13114,32 @@ async function handleRequest(request, env, ctx) {
           const backupLog = (await env.LEADS.get('backup:log', { type: 'json' })) || [];
           if (vancouverDay() > BACKUP_START_DAY) { const lastOkB = backupLog.filter(function (b) { return b.ok; })[0]; if (!lastOkB || !(Date.now() - Date.parse(lastOkB.at) <= 36 * 3600000)) issues.push('Auto backup — no successful backup in the last 36h'); } // NaN-safe: an unparseable timestamp fails CLOSED, matching the freshness check (cycle 30, Claude Low)
           const report = { ts: started, finished: new Date().toISOString(), checks: checks, repairs: repairs, issues: issues, counts: counts, speed: speed, usage: { listsToday: listUsage }, ai: aiUsageSnap, gcal: gcalLast, canary: canary, backups: backupLog.slice(0, 30) };
-          await env.LEADS.put('maint:last', JSON.stringify(report));
-          const log = (await env.LEADS.get('maint:log', { type: 'json' })) || [];
-          log.unshift({ ts: started, issues: issues.length, repairs: repairs.length, checksOk: checks.filter(function (c) { return c.ok; }).length, checksTotal: checks.length });
-          await env.LEADS.put('maint:log', JSON.stringify(log.slice(0, 20)));
+          // Pack Maint500 (2026-11-11): the report-persist tail used to be
+          // UNGUARDED — when the account KV write pool is exhausted (the
+          // 2026-11-10 blowout; the pool re-exhausted on the 2026-11-11 UTC
+          // day), the KV binding throws on put and the whole run answered
+          // 500 even though the ~24 s of checks had completed: the 01:05
+          // nightly failed twice with NO fresh report and NO recorded
+          // failure (maint:log is only written on success), while every
+          // KV WRITE route 500'd and every read stayed 200. Persist is now
+          // best-effort: the computed report is returned either way, and a
+          // failed persist is flagged on the report itself
+          // (persistError + issue) instead of destroying it. All earlier
+          // sections already tolerate write failure individually (reindex,
+          // speed:log, cache rebuild are try/caught; purge/orphan/canary
+          // writes are best-effort by section guards); this tail was the
+          // last unguarded write on the run's success path.
+          let maintPersistErr = '';
+          try {
+            await env.LEADS.put('maint:last', JSON.stringify(report));
+            const log = (await env.LEADS.get('maint:log', { type: 'json' })) || [];
+            log.unshift({ ts: started, issues: issues.length, repairs: repairs.length, checksOk: checks.filter(function (c) { return c.ok; }).length, checksTotal: checks.length });
+            await env.LEADS.put('maint:log', JSON.stringify(log.slice(0, 20)));
+          } catch (e) {
+            maintPersistErr = String((e && e.message) || e).slice(0, 160);
+            report.persistError = maintPersistErr;
+            issues.push('Maintenance report could not be persisted (KV write failed: ' + maintPersistErr + ') — checks completed; the report was returned in this response only');
+          }
           return json({ ok: true, report: report }, 200, origin);
         } finally { await env.LEADS.delete('maint:lock').catch(function () {}); } // the lock releases even when a check throws mid-run (cycle 30, Claude M1)
       }
