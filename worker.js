@@ -81,7 +81,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2']; // Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2', 'tutor']; // Pack Tutor (2026-11-11): 'tutor' added — cfg:tutor holds {providers:[{kind:'groq'|'gemini'|'workers-ai', model, apiKey?}], perStudentDaily?, globalDaily?, provisionedAt} for the Academy Learning Assistant's OWN free-provider chain — completely separate from the site Brain (its keys/budgets live in the ai-chat worker; nothing is shared); written ONLY via the one-shot session-gated /api/admin/academy/tutor-provision route (409 once set unless replace:true; values never returned or logged), the cfg:mail posture. Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -205,7 +205,18 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/admin/academy/purge-student'],
   ['POST', '/api/internal/academy/student-delete'],
   ['POST', '/api/admin/academy/video-provision'],
-  ['POST', '/api/admin/mail/provision']
+  ['POST', '/api/admin/mail/provision'],
+  // Pack Tutor (2026-11-11): the Learning Assistant's own writes — a
+  // chat turn mutates only tutor: thread/usage keys, the one-shot
+  // tutor provision writes only cfg:tutor, and a corpus seed writes
+  // only tutor:corpus: keys; none of them is portal-listed data.
+  ['POST', '/api/academy/tutor/chat'],
+  ['POST', '/api/academy/tutor/reset'],
+  ['POST', '/api/admin/academy/tutor-provision'],
+  ['POST', '/api/admin/academy/tutor-seed'],
+  // Pack BookletView (2026-11-11): the booklet seed writes only
+  // booklet: keys; the student booklet GETs are reads (no bump).
+  ['POST', '/api/admin/academy/booklet-seed']
 ];
 function genBumpExempt(method, path) {
   for (let i = 0; i < GEN_BUMP_EXEMPT.length; i++) {
@@ -1079,6 +1090,18 @@ async function scopedAuthed(request, env, path, method) {
     // Academy-mutation joins: every other Academy mutation stays
     // session-only.
     (method === 'POST' && path === '/api/admin/academy/purge-student') ||
+    // Pack Tutor (2026-11-11): the Academy tutor CORPUS SEED joins the
+    // SERVICE set (the provision/status pair does NOT — exactly the
+    // cfg:mail posture, session-only). The seed writes only
+    // tutor:corpus: keys built from the course's canonical lesson
+    // banks; the route itself validates lang/part/shape and audits.
+    (method === 'POST' && path === '/api/admin/academy/tutor-seed') ||
+    // Pack BookletView (2026-11-11): the booklet SEED joins the
+    // SERVICE set (the student booklet GETs do NOT — they run their
+    // own session + fresh-entitlement check, the tutor posture). The
+    // seed writes only booklet: keys, driven by the operator's
+    // booklet-seed-driver.py.
+    (method === 'POST' && path === '/api/admin/academy/booklet-seed') ||
     // Pack AcademyB2Video (2026-11-10): the Academy B2 pair + transfer
     // routes join the SERVICE set with the brain posture — the one-shot
     // bearer-carried provision (the route itself refuses a part once
@@ -3744,6 +3767,319 @@ async function academyClearEngineKeys(env, ne) {
     await env.LEADS.delete(p + ne);
   }
   return removed;
+}
+
+/* ================= Academy Learning Assistant (Pack Tutor, 2026-11-11) =====
+   دستیار یادگیری — a course-grounded tutor inside the student portal,
+   Erfan-approved 2026-11-11 (text Q&A + file attachments from the
+   start). Design rules, all hard:
+   - ACADEMY SCOPE ONLY in effect: the routes live under /api/academy/*
+     and /api/admin/academy/*, so the SCOPE gate 404s them on the site
+     deployment; state lives ONLY in the ACADEMY KV namespace.
+   - CREDITS COMPLETELY SEPARATE from the site Brain: the Brain lives
+     in the ai-chat worker with its own keys and budgets; the tutor has
+     its own provider chain in cfg:tutor (ACADEMY KV) and its own usage
+     counters (tutor:usage:*). Nothing is read from, or shared with,
+     the Brain — not a key, not a counter.
+   - GROUNDED ONLY: answers come from a compact corpus built from the
+     canonical lesson banks (hidden_files/academy-production/data/
+     *.lesson.json, EN + FA) seeded under tutor:corpus:<lang>:<module>
+     plus a tutor:corpus:<lang>:index. Retrieval is deterministic
+     term-overlap in-worker (no external vector service — free tier
+     only). The system prompt forbids outside knowledge, requires
+     lesson-id citations, and when retrieval is empty/weak the route
+     answers with an honest not-covered reply + nearest-lesson pointer
+     WITHOUT calling a provider (no budget burned, nothing invented).
+   - AUTH = the video-token mechanism verbatim: the session is the
+     credential (authed()), the student's email rides the request, and
+     entitlement is re-checked FRESH per call via academyEntitlement.
+     GRACE: chat is a WRITE/interactive feature, so it passes
+     readOnly:false — exactly like video tokens, an expired student
+     inside the 7-day read grace gets NO tutor chat (403 expired);
+     blocked students get 403 blocked. History GET and reset POST are
+     pure reads/cleanup of the student's own thread and pass
+     readOnly:true, so a grace student can still read or clear their
+     thread — the same posture lessons apply to grace reads.
+   - TEACHING = the EH Method: name the student's specific
+     misconception kindly, explain from the excerpts, end with ONE
+     short practice check question. The model may append a final hidden
+     line {"concept":"<tag>"} when it detects a misconception; the
+     worker strips it and records the tag best-effort.
+   - MISCONCEPTION STORE: tags land in 'tutor:miscon:<ne>' {items:[…]},
+     NOT in the quiz engine's 'acmistakes:<ne>'. The engine's items
+     are keyed by bank question id (qid) and drive the spaced-review
+     ladder + the readiness review component; a tutor concept tag has
+     no qid, and injecting qid-less items would inflate the review
+     queue with unservable entries and distort readiness math. The
+     separate store keeps the signal (concept + lesson + when) without
+     corrupting the engine's invariants.
+   - PROVIDERS, FREE + SEPARATE: cfg:tutor {providers:[{kind, model,
+     apiKey?}], perStudentDaily?, globalDaily?, provisionedAt}. Chain
+     order is the cfg order (default intent: groq text → gemini
+     text+vision → workers-ai fallback). Attachments (image/PDF) route
+     ONLY to gemini entries — the one free provider here whose API
+     takes image and PDF document input inline; with no gemini entry
+     configured an attachment is refused honestly (400
+     attachments_unsupported), never silently dropped. Until cfg:tutor
+     holds at least one usable provider, chat answers 503
+     not_configured and the portal shows its coming-soon state — a
+     deploy can never half-serve the tutor.
+   - BUDGETS: 'tutor:usage:<yyyy-mm-dd>:<ne>' + ':_global' sibling
+     (Vancouver day, the worker's daily-counter convention), counted
+     ONLY on a successful provider reply, checked before the call.
+     Defaults: 40 per student per day, 2,000 global per day.
+   Record: hidden_files/pack-academy-tutor-build-2026-11-11.md. */
+/* ---- Academy booklets (Pack BookletView, 2026-11-11) ----
+   Students-only booklet delivery. The PDFs live ONLY as base64
+   strings in ACADEMY KV — booklet:module:<mod>:<lang> and
+   booklet:lesson:<lessonId>:<lang> (module booklets M0–M8 EN+FA,
+   M5 also HI/ZH/ES; per-lesson PDFs extracted from the built module
+   booklets' own lesson sections, so the lesson booklet IS the
+   booklet in the same styles). Nothing sits on public static
+   hosting: every fetch runs the tutor posture — portal session
+   (authed) or the SERVICE bearer (operator verification path) + a
+   FRESH academyEntitlement check on the requested email. Booklets
+   are reads → readOnly:true (the 7-day grace may read its notes,
+   the tutor-history posture; video tokens stay grace-exempt).
+   Language fallback: an unseeded language serves the EN file with
+   X-Booklet-Fallback: en. Seeding: POST
+   /api/admin/academy/booklet-seed (admin gate; SERVICE set). */
+const BOOKLET_LANGS = ['en', 'fa', 'hi', 'zh', 'es'];
+function bookletB64Decode(b64) {
+  try {
+    const bin = atob(String(b64).replace(/\s/g, ''));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch (e) { return null; }
+}
+async function bookletBytesSha256(bytes) {
+  const buf = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(buf)].map(function (b) { return b.toString(16).padStart(2, '0'); }).join('');
+}
+async function bookletServiceOk(request, env) {
+  try {
+    const h = request.headers.get('Authorization') || '';
+    const m = h.match(/^Bearer ([0-9a-f]{48})$/);
+    if (!m) return false;
+    const svc = await env.LEADS.get('cfg:service', { type: 'json' });
+    if (!svc || !svc.token) return false;
+    return timingSafeEqual(String(svc.token), m[1]);
+  } catch (e) { return false; }
+}
+const TUTOR_LANGS = ['en', 'fa'];
+const TUTOR_DEFAULT_PER_STUDENT_DAILY = 40;
+const TUTOR_DEFAULT_GLOBAL_DAILY = 2000;
+const TUTOR_THREAD_CAP = 40;
+const TUTOR_HISTORY_PROMPT_TURNS = 6;
+const TUTOR_TOP_K = 3;
+const TUTOR_ATTACH_MAX_BYTES = 4 * 1024 * 1024;
+const TUTOR_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+const TUTOR_MISCON_CAP = 200;
+const TUTOR_GROQ_DEFAULT_MODEL = 'llama-3.3-70b-versatile';
+const TUTOR_GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash';
+const TUTOR_WAI_DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+async function tutorCfg(env) { try { return await env.LEADS.get('cfg:tutor', { type: 'json' }); } catch (e) { return null; } }
+function tutorProviders(cfg) {
+  if (!cfg || !Array.isArray(cfg.providers)) return [];
+  return cfg.providers.filter(function (p) { return p && (p.kind === 'groq' || p.kind === 'gemini' || p.kind === 'workers-ai'); });
+}
+function tutorProviderUsable(p) { return !!p && (p.kind === 'workers-ai' || (typeof p.apiKey === 'string' && p.apiKey.length >= 8)); }
+function tutorReady(cfg) { return tutorProviders(cfg).some(tutorProviderUsable); }
+function tutorCaps(cfg) {
+  return {
+    perStudent: cfg && Number.isInteger(cfg.perStudentDaily) && cfg.perStudentDaily > 0 ? cfg.perStudentDaily : TUTOR_DEFAULT_PER_STUDENT_DAILY,
+    global: cfg && Number.isInteger(cfg.globalDaily) && cfg.globalDaily > 0 ? cfg.globalDaily : TUTOR_DEFAULT_GLOBAL_DAILY
+  };
+}
+function tutorTokenize(text) {
+  // Deterministic tokenizer for EN + FA: lowercase, ZWNJ → space, keep
+  // Latin/digits and the Arabic-script block (Persian), split on the
+  // rest. Stopwords are dropped so overlap scores track CONTENT terms.
+  const stop = { the: 1, a: 1, an: 1, is: 1, are: 1, was: 1, were: 1, be: 1, been: 1, what: 1, how: 1, does: 1, do: 1, did: 1, in: 1, of: 1, to: 1, and: 1, or: 1, for: 1, on: 1, at: 1, by: 1, if: 1, it: 1, its: 1, this: 1, that: 1, with: 1, from: 1, as: 1, can: 1, could: 1, would: 1, should: 1, when: 1, why: 1, which: 1, who: 1, i: 1, me: 1, my: 1, you: 1, your: 1, we: 1, they: 1, them: 1, he: 1, she: 1, not: 1, no: 1, yes: 1 };
+  const faStop = { 'چیست': 1, 'چه': 1, 'چگونه': 1, 'آیا': 1, 'در': 1, 'به': 1, 'از': 1, 'را': 1, 'و': 1, 'است': 1, 'بود': 1, 'برای': 1, 'این': 1, 'آن': 1, 'که': 1, 'می': 1, 'شود': 1, 'یک': 1, 'من': 1, 'تو': 1, 'او': 1, 'ما': 1, 'شما': 1, 'اگر': 1, 'چرا': 1, 'کدام': 1, 'هر': 1, 'هم': 1, 'تا': 1, 'با': 1, 'بی': 1, 'خواهند': 1, 'خواهد': 1, 'دارند': 1, 'دارد': 1 };
+  const raw = String(text || '').toLowerCase().replace(/‌/g, ' ').split(/[^a-z0-9؀-ۿ]+/);
+  const out = [];
+  for (const t of raw) { if (t.length >= 2 && !stop[t] && !faStop[t]) out.push(t); }
+  return out;
+}
+async function tutorCorpusIndex(env, lang) { try { return await env.LEADS.get('tutor:corpus:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusModule(env, lang, moduleId) { try { return await env.LEADS.get('tutor:corpus:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
+function tutorScoreLessons(index, queryTokens, contextLessonId) {
+  // Weighted deterministic overlap: concept-tag hit 3, title hit 2,
+  // body-term hit 1; the lesson the student is viewing gets +100 so
+  // it is always in context. Sorted score desc, then id asc — the
+  // same inputs always retrieve the same chunks.
+  const q = Array.from(new Set(queryTokens));
+  const scored = [];
+  const lessons = index && Array.isArray(index.lessons) ? index.lessons : [];
+  for (const e of lessons) {
+    if (!e || typeof e.id !== 'string') continue;
+    let s = 0;
+    const tags = Array.isArray(e.tagsW) ? e.tagsW : [];
+    const title = Array.isArray(e.titleW) ? e.titleW : [];
+    const terms = Array.isArray(e.termsW) ? e.termsW : [];
+    for (const t of q) {
+      if (tags.indexOf(t) !== -1) s += 3;
+      if (title.indexOf(t) !== -1) s += 2;
+      if (terms.indexOf(t) !== -1) s += 1;
+    }
+    if (contextLessonId && e.id === contextLessonId) s += 100;
+    scored.push({ id: e.id, module: e.module, title: e.title, score: s });
+  }
+  scored.sort(function (a, b) { return b.score - a.score || (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)); });
+  return scored;
+}
+async function tutorRetrieve(env, lang, message, contextLessonId) {
+  const index = await tutorCorpusIndex(env, lang);
+  if (!index || !Array.isArray(index.lessons) || !index.lessons.length) return { seeded: false, strong: [], nearest: null };
+  const scored = tutorScoreLessons(index, tutorTokenize(message), contextLessonId);
+  const strong = scored.filter(function (s) { return s.score >= 3; }).slice(0, TUTOR_TOP_K);
+  const excerpts = [];
+  const byModule = {};
+  for (const s of strong) {
+    if (!byModule[s.module]) byModule[s.module] = await tutorCorpusModule(env, lang, s.module);
+    const mod = byModule[s.module];
+    const rec = mod && Array.isArray(mod.lessons) ? mod.lessons.find(function (l) { return l && l.id === s.id; }) : null;
+    if (rec && typeof rec.text === 'string') excerpts.push({ id: s.id, title: s.title, text: rec.text.slice(0, 6000) });
+  }
+  const nearest = scored.length ? scored[0] : null;
+  return { seeded: true, strong: excerpts, nearest: nearest && nearest.score > 0 ? nearest : (contextLessonId ? (scored.find(function (s) { return s.id === contextLessonId; }) || null) : null) };
+}
+function tutorLessonLabel(id) { return String(id || '').toUpperCase(); }
+function tutorSystemPrompt(lang, excerpts, nearest) {
+  const langName = lang === 'fa' ? 'Persian (Farsi)' : 'English';
+  const blocks = excerpts.map(function (e) { return '[' + tutorLessonLabel(e.id) + '] ' + e.title + '\n' + e.text; }).join('\n\n');
+  return 'You are the Learning Assistant (دستیار یادگیری) of EH REALTY ACADEMY, a tutor for the BC Real Estate Trading Services licensing exam course.\n' +
+    'GROUNDING RULES — absolute:\n' +
+    '1. Answer ONLY from the COURSE EXCERPTS below. Never use outside knowledge, never guess, never invent a rule, number, date or case.\n' +
+    '2. Cite the lesson id(s) you used in the answer, in square brackets like [' + (excerpts.length ? tutorLessonLabel(excerpts[0].id) : 'M0-L1') + '].\n' +
+    '3. If the excerpts do not answer the question, say honestly that this point is not covered in the course material provided' + (nearest ? ' and point the student to the nearest lesson, ' + tutorLessonLabel(nearest.id) + ' — ' + nearest.title : '') + '. Do not improvise an answer.\n' +
+    'TEACHING STYLE — the EH Method:\n' +
+    '4. First identify the student\'s specific misunderstanding (if any) and name it kindly in one sentence.\n' +
+    '5. Explain the correct point briefly and concretely, grounded in the excerpts (a small example is welcome when the excerpts support one).\n' +
+    '6. End with exactly ONE short practice check question for the student. Do not answer it yourself.\n' +
+    '7. Answer in ' + langName + '. Exam terms stay in English in every language.\n' +
+    '8. If (and only if) you detected a specific misconception in the student\'s message, append as the VERY LAST line a JSON object of exactly this shape: {"concept":"<short-kebab-case-tag>"} — and nothing after it. Omit it otherwise.\n\n' +
+    'COURSE EXCERPTS:\n' + blocks;
+}
+function tutorNotCoveredReply(lang, nearest) {
+  const ptr = nearest ? tutorLessonLabel(nearest.id) + ' — ' + nearest.title : null;
+  if (lang === 'fa') {
+    return 'این نکته در محتوای درسی که به آن دسترسی دارم پوشش داده نشده است، و نمی‌خواهم حدس بزنم.' + (ptr ? ' نزدیک‌ترین درس به سؤال تو: ' + ptr + ' است.' : '') + ' سؤالت را با نام دقیق مفهومِ همان درس دوباره بپرس تا دقیق و فقط از متن درس جواب بدهم.';
+  }
+  return 'That point is not covered in the course material I can search, and I won\'t guess at it.' + (ptr ? ' The nearest lesson to your question is ' + ptr + '.' : '') + ' Try asking again with the exact concept name from that lesson, and I\'ll answer strictly from the lesson text.';
+}
+async function tutorThreadGet(env, ne) {
+  try { const t = await env.LEADS.get('tutor:thread:' + ne, { type: 'json' }); if (t && Array.isArray(t.messages)) return t; } catch (e) {}
+  return { messages: [] };
+}
+function tutorThreadTtlSeconds(enrolment) {
+  // Aligned with enrolment: until expiry + the 7-day grace, clamped
+  // to [1 day, 400 days] so a thread never outlives its course access
+  // by more than the grace window.
+  const exp = enrolment ? Date.parse(enrolment.expiresAt) : NaN;
+  if (!isFinite(exp)) return 180 * 86400;
+  const s = Math.floor((exp + ACADEMY_GRACE_DAYS * 86400000 - Date.now()) / 1000);
+  return Math.min(400 * 86400, Math.max(86400, s));
+}
+async function tutorThreadPut(env, ne, thread, enrolment) {
+  const msgs = thread.messages.slice(-TUTOR_THREAD_CAP);
+  try { await env.LEADS.put('tutor:thread:' + ne, JSON.stringify({ messages: msgs, updatedAt: new Date().toISOString() }), { expirationTtl: tutorThreadTtlSeconds(enrolment) }); } catch (e) {}
+  return msgs;
+}
+async function tutorUsageCount(env, key) {
+  try { const v = await env.LEADS.get(key, { type: 'json' }); return v && Number.isInteger(v.count) && v.count > 0 ? v.count : 0; } catch (e) { return 0; }
+}
+async function tutorUsageBump(env, key) {
+  const n = (await tutorUsageCount(env, key)) + 1;
+  try { await env.LEADS.put(key, JSON.stringify({ count: n }), { expirationTtl: 3 * 86400 }); } catch (e) {}
+  return n;
+}
+function tutorStripMisconception(text) {
+  // The model's hidden final line {"concept":"…"} is parsed + removed;
+  // only the LAST non-empty line may carry it, so a quoted example in
+  // the body is never eaten.
+  const lines = String(text || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (!t) continue;
+    const m = t.match(/^\{\s*"concept"\s*:\s*"([^"{}]{1,80})"\s*\}$/);
+    if (m) { lines.splice(i, 1); return { text: lines.join('\n').trim(), concept: m[1].trim().toLowerCase().replace(/\s+/g, '-').slice(0, 80) }; }
+    break;
+  }
+  return { text: String(text || '').trim(), concept: null };
+}
+async function tutorRecordMisconception(env, ne, concept, lessonId) {
+  try {
+    const key = 'tutor:miscon:' + ne;
+    const cur = (await env.LEADS.get(key, { type: 'json' })) || { items: [] };
+    if (!Array.isArray(cur.items)) cur.items = [];
+    cur.items.push({ concept: concept, lessonId: lessonId || null, at: new Date().toISOString(), source: 'tutor' });
+    if (cur.items.length > TUTOR_MISCON_CAP) cur.items = cur.items.slice(-TUTOR_MISCON_CAP);
+    await env.LEADS.put(key, JSON.stringify(cur));
+  } catch (e) {}
+}
+async function tutorCallGroq(prov, turns) {
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + String(prov.apiKey || '') },
+    body: JSON.stringify({ model: String(prov.model || TUTOR_GROQ_DEFAULT_MODEL), messages: turns.map(function (t) { return { role: t.role, content: t.text }; }), temperature: 0.2, max_tokens: 1100 }),
+    signal: AbortSignal.timeout(25000)
+  });
+  if (!r.ok) throw new Error('groq_' + r.status);
+  const j = await r.json().catch(() => null);
+  const text = j && j.choices && j.choices[0] && j.choices[0].message ? String(j.choices[0].message.content || '') : '';
+  if (!text.trim()) throw new Error('groq_empty');
+  return text;
+}
+async function tutorCallGemini(prov, turns, attachment) {
+  const model = String(prov.model || TUTOR_GEMINI_DEFAULT_MODEL);
+  const system = turns.filter(function (t) { return t.role === 'system'; }).map(function (t) { return t.text; }).join('\n\n');
+  const contents = [];
+  for (const t of turns) {
+    if (t.role === 'system') continue;
+    const role = t.role === 'assistant' ? 'model' : 'user';
+    const last = contents[contents.length - 1];
+    if (last && last.role === role) last.parts.push({ text: t.text });
+    else contents.push({ role: role, parts: [{ text: t.text }] });
+  }
+  if (!contents.length || contents[0].role !== 'user') contents.unshift({ role: 'user', parts: [{ text: '(conversation start)' }] });
+  if (attachment) contents[contents.length - 1].parts.push({ inline_data: { mime_type: attachment.mime, data: attachment.dataBase64 } });
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': String(prov.apiKey || '') },
+    body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents: contents, generationConfig: { temperature: 0.2, maxOutputTokens: 1100 } }),
+    signal: AbortSignal.timeout(25000)
+  });
+  if (!r.ok) throw new Error('gemini_' + r.status);
+  const j = await r.json().catch(() => null);
+  const parts = j && j.candidates && j.candidates[0] && j.candidates[0].content && Array.isArray(j.candidates[0].content.parts) ? j.candidates[0].content.parts : [];
+  const text = parts.map(function (p) { return p && typeof p.text === 'string' ? p.text : ''; }).join('');
+  if (!text.trim()) throw new Error('gemini_empty');
+  return text;
+}
+async function tutorCallWorkersAi(env, prov, turns) {
+  if (!env.AI || typeof env.AI.run !== 'function') throw new Error('workers_ai_unbound');
+  const out = await env.AI.run(String(prov.model || TUTOR_WAI_DEFAULT_MODEL), { messages: turns.map(function (t) { return { role: t.role, content: t.text }; }) });
+  const text = out && typeof out.response === 'string' ? out.response : '';
+  if (!text.trim()) throw new Error('workers_ai_empty');
+  return text;
+}
+async function tutorCallChain(env, cfg, turns, attachment) {
+  // Chain order = cfg order; an attachment restricts the chain to
+  // gemini entries (the only vision/document-capable free provider
+  // wired here). Returns {text, kind} or throws the last error.
+  let provs = tutorProviders(cfg).filter(tutorProviderUsable);
+  if (attachment) provs = provs.filter(function (p) { return p.kind === 'gemini'; });
+  let lastErr = null;
+  for (const p of provs) {
+    try {
+      const text = p.kind === 'groq' ? await tutorCallGroq(p, turns) : (p.kind === 'gemini' ? await tutorCallGemini(p, turns, attachment) : await tutorCallWorkersAi(env, p, turns));
+      return { text: text, kind: p.kind };
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error('no_provider');
 }
 
 /* ================= Academy × Stripe (Pack AcademyStripe, 2026-11-10) =====
@@ -8511,7 +8847,7 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { return p === '/api/admin/academy/b2-object' ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -9956,6 +10292,167 @@ async function handleRequest(request, env, ctx) {
       if ((path === '/api/academy/video' || path.indexOf('/api/academy/video/') === 0) && path !== '/api/academy/video-token') {
         // No other /api/academy/video/* shape exists (spec §3).
         return json({ ok: false, error: 'not_found' }, 404, origin);
+      }
+
+      // ---- Academy: Learning Assistant student routes (Pack Tutor,
+      // 2026-11-11). Own auth, deliberately BEFORE the admin gate, the
+      // video-token posture verbatim: the session is the credential
+      // (authed), the student's email rides the request, entitlement
+      // is re-checked FRESH per call. Chat is interactive/write →
+      // readOnly:false (grace never chats, exactly as grace never
+      // mints a video token); history/reset are reads of the student's
+      // own thread → readOnly:true (the lessons' grace posture).
+      if (path === '/api/academy/tutor/chat' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const message = String(d.message || '').trim();
+        if (!message || message.length > 4000) return json({ ok: false, error: 'invalid_message' }, 400, origin);
+        const lang = String(d.lang || 'en').trim().toLowerCase();
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        const lessonId = d.lessonId ? String(d.lessonId).trim().toLowerCase() : '';
+        if (lessonId && (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40)) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
+        let attachment = null;
+        if (d.attachment !== undefined && d.attachment !== null) {
+          const a = d.attachment || {};
+          const kind = String(a.kind || '');
+          const mime = String(a.mime || '').toLowerCase();
+          const b64 = String(a.dataBase64 || '');
+          const kindOk = (kind === 'image' && TUTOR_IMAGE_MIMES.indexOf(mime) !== -1) || (kind === 'pdf' && mime === 'application/pdf');
+          if (!kindOk) return json({ ok: false, error: 'invalid_attachment' }, 400, origin);
+          if (!b64 || b64.length > Math.ceil(TUTOR_ATTACH_MAX_BYTES / 3) * 4 + 8 || !/^[A-Za-z0-9+/=\s]+$/.test(b64)) return json({ ok: false, error: 'invalid_attachment' }, 400, origin);
+          const decodedBytes = Math.floor(b64.replace(/\s/g, '').length * 3 / 4);
+          if (decodedBytes > TUTOR_ATTACH_MAX_BYTES) return json({ ok: false, error: 'attachment_too_large' }, 400, origin);
+          if (decodedBytes < 32) return json({ ok: false, error: 'invalid_attachment' }, 400, origin);
+          attachment = { kind: kind, mime: mime, dataBase64: b64.replace(/\s/g, '') };
+        }
+        const cfg = await tutorCfg(env);
+        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const ent = await academyEntitlement(env, email, { readOnly: false });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        if (attachment && !tutorProviders(cfg).some(function (p) { return p.kind === 'gemini' && tutorProviderUsable(p); })) {
+          return json({ ok: false, error: 'attachments_unsupported' }, 400, origin);
+        }
+        const ne = normEmail(email);
+        const day = todayVancouver();
+        const caps = tutorCaps(cfg);
+        const usedStudent = await tutorUsageCount(env, 'tutor:usage:' + day + ':' + ne);
+        const usedGlobal = await tutorUsageCount(env, 'tutor:usage:' + day + ':_global');
+        if (usedStudent >= caps.perStudent) return json({ ok: false, error: 'daily_cap', remainingToday: 0 }, 429, origin);
+        if (usedGlobal >= caps.global) return json({ ok: false, error: 'global_cap', remainingToday: Math.max(0, caps.perStudent - usedStudent) }, 429, origin);
+        const ret = await tutorRetrieve(env, lang, message, lessonId || null);
+        if (!ret.seeded) return json({ ok: false, error: 'corpus_not_seeded' }, 503, origin);
+        const thread = await tutorThreadGet(env, ne);
+        if (!ret.strong.length) {
+          // Retrieval empty/weak: the honest not-covered reply, no
+          // provider call, no budget burned — the turn still lands in
+          // the student's thread so the conversation stays coherent.
+          const reply = tutorNotCoveredReply(lang, ret.nearest);
+          thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
+          thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: ret.nearest ? [ret.nearest.id] : [] });
+          await tutorThreadPut(env, ne, thread, ent.enrolment);
+          return json({ ok: true, reply: reply, citations: ret.nearest ? [ret.nearest.id] : [], notCovered: true, remainingToday: Math.max(0, caps.perStudent - usedStudent) }, 200, origin);
+        }
+        const turns = [{ role: 'system', text: tutorSystemPrompt(lang, ret.strong, ret.nearest) }];
+        for (const m of thread.messages.slice(-TUTOR_HISTORY_PROMPT_TURNS)) turns.push({ role: m.role === 'assistant' ? 'assistant' : 'user', text: String(m.text || '').slice(0, 2000) });
+        turns.push({ role: 'user', text: message });
+        let out = null;
+        try { out = await tutorCallChain(env, cfg, turns, attachment); } catch (e) { out = null; }
+        if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
+        const stripped = tutorStripMisconception(out.text);
+        const reply = stripped.text || out.text.trim();
+        const citations = ret.strong.map(function (e) { return e.id; });
+        const newUsed = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne);
+        await tutorUsageBump(env, 'tutor:usage:' + day + ':_global');
+        thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
+        thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: citations });
+        await tutorThreadPut(env, ne, thread, ent.enrolment);
+        if (stripped.concept) await tutorRecordMisconception(env, ne, stripped.concept, lessonId || citations[0] || null);
+        return json({ ok: true, reply: reply, citations: citations, remainingToday: Math.max(0, caps.perStudent - newUsed) }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/history' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const ent = await academyEntitlement(env, email, { readOnly: true });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        const thread = await tutorThreadGet(env, normEmail(email));
+        const cfg = await tutorCfg(env);
+        const caps = tutorCaps(cfg);
+        const usedStudent = await tutorUsageCount(env, 'tutor:usage:' + todayVancouver() + ':' + normEmail(email));
+        return json({ ok: true, messages: thread.messages, remainingToday: Math.max(0, caps.perStudent - usedStudent), configured: tutorReady(cfg) }, 200, origin);
+      }
+      if (path === '/api/academy/tutor/reset' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { d = {}; }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const ent = await academyEntitlement(env, email, { readOnly: true });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        try { await env.LEADS.delete('tutor:thread:' + normEmail(email)); } catch (e) {}
+        return json({ ok: true }, 200, origin);
+      }
+
+      // ---- Academy: lesson/module booklets (Pack BookletView,
+      // 2026-11-11). Own auth, BEFORE the admin gate, the tutor
+      // posture: the portal session is the credential (authed) — the
+      // SERVICE bearer is also admitted as the operator verification
+      // path — the student's email rides the query, and entitlement
+      // is re-checked FRESH per call. Booklets are reads →
+      // readOnly:true (grace reads its notes; video tokens remain
+      // grace-exempt). Bytes come only from ACADEMY KV (seeded via
+      // /api/admin/academy/booklet-seed); an unseeded language falls
+      // back to the EN file with X-Booklet-Fallback: en.
+      if (path.indexOf('/api/academy/booklet/') === 0 && request.method === 'GET') {
+        const bp = path.split('/').filter(Boolean); // api, academy, booklet, kind, id, lang
+        const bkind = bp[3] || '';
+        const bid = String(bp[4] || '').toLowerCase();
+        const blang = String(bp[5] || '').toLowerCase();
+        const idOk = (bkind === 'module' && /^m[0-8]$/.test(bid)) || (bkind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bid) && bid.length <= 40);
+        if (!idOk || BOOKLET_LANGS.indexOf(blang) === -1) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const sessionOk = await authed(request, env);
+        const serviceOk = sessionOk ? false : await bookletServiceOk(request, env);
+        if (!sessionOk && !serviceOk) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const ent = await academyEntitlement(env, email, { readOnly: true });
+        if (!ent.entitled) {
+          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
+          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
+          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+        }
+        let servedLang = blang;
+        let b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':' + blang);
+        if (!b64 && blang !== 'en') { b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':en'); servedLang = 'en'; }
+        if (!b64) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const bytes = bookletB64Decode(b64);
+        if (!bytes) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const fname = bid + '-booklet' + (servedLang === 'en' ? '' : '-' + servedLang) + '.pdf';
+        const bh = Object.assign({}, cors(origin), {
+          'Content-Type': 'application/pdf',
+          'Content-Disposition': 'inline; filename="' + fname + '"',
+          'Cache-Control': 'private, no-store',
+          'X-Booklet-Lang': servedLang
+        });
+        if (servedLang !== blang) bh['X-Booklet-Fallback'] = 'en';
+        return new Response(bytes, { status: 200, headers: bh });
       }
 
       // Pack PMV1 (PM P11): server-side sign-out — deletes the caller's
@@ -12074,6 +12571,109 @@ async function handleRequest(request, env, ctx) {
         const cfg = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
         const b2cfg = await academyB2Cfg(env);
         return json({ ok: true, configured: !!cfg.tokenSecret, provisionedAt: cfg.provisionedAt || null, bucketBound: academyB2Ready(b2cfg) }, 200, origin);
+      }
+      // ---- admin: Academy Learning Assistant (Pack Tutor, 2026-11-11) ----
+      if (path === '/api/admin/academy/tutor-provision' && request.method === 'POST') {
+        // Session-gated ONE-SHOT provision of the tutor's OWN provider
+        // chain into cfg:tutor — the cfg:mail pattern (session-only;
+        // the SERVICE set deliberately does NOT include this route).
+        // 409 once a usable chain is set, unless the session caller
+        // passes replace:true (key rotation is a deliberate act, never
+        // a silent overwrite). Keys are never echoed, logged or
+        // returned; the audit records provider KINDS only.
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const cur = (await env.LEADS.get('cfg:tutor', { type: 'json' })) || {};
+        if (tutorProviders(cur).length && d.replace !== true) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
+        const provs = Array.isArray(d.providers) ? d.providers : null;
+        if (!provs || !provs.length || provs.length > 6) return json({ ok: false, error: 'validation' }, 400, origin);
+        const clean = [];
+        for (const p of provs) {
+          if (!p || (p.kind !== 'groq' && p.kind !== 'gemini' && p.kind !== 'workers-ai')) return json({ ok: false, error: 'validation' }, 400, origin);
+          const e = { kind: p.kind, model: String(p.model || '').slice(0, 80) };
+          if (p.kind !== 'workers-ai') {
+            const k = String(p.apiKey || '');
+            if (k.length < 8 || k.length > 512) return json({ ok: false, error: 'validation' }, 400, origin);
+            e.apiKey = k;
+          }
+          clean.push(e);
+        }
+        const next = { providers: clean, provisionedAt: new Date().toISOString() };
+        const psd = Number.isInteger(d.perStudentDaily) ? d.perStudentDaily : (Number.isInteger(cur.perStudentDaily) ? cur.perStudentDaily : null);
+        const gd = Number.isInteger(d.globalDaily) ? d.globalDaily : (Number.isInteger(cur.globalDaily) ? cur.globalDaily : null);
+        if (psd !== null && psd > 0 && psd <= 10000) next.perStudentDaily = psd;
+        if (gd !== null && gd > 0 && gd <= 100000) next.globalDaily = gd;
+        await env.LEADS.put('cfg:tutor', JSON.stringify(next));
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_provision', target: 'cfg:tutor', ip: ip, at: new Date().toISOString(), detail: { providers: clean.map(function (p) { return p.kind; }), replace: d.replace === true } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/admin/academy/tutor-status' && request.method === 'GET') {
+        // Booleans only — no key material ever leaves this route.
+        const cfg = (await env.LEADS.get('cfg:tutor', { type: 'json' })) || {};
+        const caps = tutorCaps(cfg);
+        const corpus = {};
+        for (const lg of TUTOR_LANGS) { const ix = await tutorCorpusIndex(env, lg); corpus[lg] = !!(ix && Array.isArray(ix.lessons) && ix.lessons.length); }
+        return json({ ok: true, configured: tutorReady(cfg), providers: tutorProviders(cfg).map(function (p) { return { kind: p.kind, model: p.model || null, hasKey: p.kind === 'workers-ai' ? true : !!p.apiKey }; }), perStudentDaily: caps.perStudent, globalDaily: caps.global, corpusSeeded: corpus, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+      }
+      if (path === '/api/admin/academy/tutor-seed' && request.method === 'POST') {
+        // Corpus seeding (Pack Tutor): the operator's build script
+        // posts the compiled lesson corpus in two part shapes —
+        // {lang, part:'index', lessons:[…]} → tutor:corpus:<lang>:index
+        // and {lang, part:'module', module:'m5', lessons:[…]} →
+        // tutor:corpus:<lang>:<module>. Admission is the admin gate
+        // (owner session, or the SERVICE token via scopedAuthed —
+        // this route is in the SERVICE set so the parent's seed script
+        // can run unattended). Content derives ONLY from the canonical
+        // lesson banks; the script is
+        // hidden_files/academy-production/tools/seed-tutor-corpus.mjs.
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const lang = String(d.lang || '');
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
+        if (d.part === 'index') {
+          await env.LEADS.put('tutor:corpus:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'index', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
+        }
+        if (d.part === 'module') {
+          const mod = String(d.module || '');
+          if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'module', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
+        }
+        return json({ ok: false, error: 'validation' }, 400, origin);
+      }
+      if (path === '/api/admin/academy/booklet-seed' && request.method === 'POST') {
+        // Booklet seeding (Pack BookletView): the operator's driver
+        // (hidden_files/booklet-seed-driver.py) posts ONE booklet per
+        // call — {kind:'module'|'lesson', id, lang, b64, bytes,
+        // sha256}. The worker decodes, verifies the %PDF magic, the
+        // byte count and the SHA-256 of the decoded bytes BEFORE
+        // storing the base64 string under booklet:<kind>:<id>:<lang>.
+        // Admission is the admin gate (owner session, or the SERVICE
+        // token — this route is in the SERVICE set). Idempotent:
+        // re-seeding overwrites with the same verified bytes.
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const kind = String(d.kind || '');
+        const bid = String(d.id || '').toLowerCase();
+        const lang = String(d.lang || '').toLowerCase();
+        const idOk = (kind === 'module' && /^m[0-8]$/.test(bid)) || (kind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bid) && bid.length <= 40);
+        if (!idOk || BOOKLET_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        const b64 = String(d.b64 || '').replace(/\s/g, '');
+        if (!b64 || b64.length > 14000000 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const bytes = bookletB64Decode(b64);
+        if (!bytes) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (bytes.length < 5 || bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) return json({ ok: false, error: 'not_pdf' }, 400, origin);
+        if (typeof d.bytes === 'number' && d.bytes !== bytes.length) return json({ ok: false, error: 'size_mismatch' }, 400, origin);
+        if (d.sha256) { const hh = await bookletBytesSha256(bytes); if (hh !== String(d.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch' }, 400, origin); }
+        await env.LEADS.put('booklet:' + kind + ':' + bid + ':' + lang, b64);
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length }, 200, origin);
       }
       // ---- admin: Academy × Backblaze B2 (Pack AcademyB2Video) ----
       // The B2 credentials arrive in TWO one-shot calls, one per part
