@@ -216,7 +216,9 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/admin/academy/tutor-seed'],
   // Pack BookletView (2026-11-11): the booklet seed writes only
   // booklet: keys; the student booklet GETs are reads (no bump).
-  ['POST', '/api/admin/academy/booklet-seed']
+  ['POST', '/api/admin/academy/booklet-seed'],
+  ['POST', '/api/internal/academy/booklet-seed'],
+  ['POST', '/api/admin/academy/booklet-seed-proxy']
 ];
 function genBumpExempt(method, path) {
   for (let i = 0; i < GEN_BUMP_EXEMPT.length; i++) {
@@ -1090,6 +1092,13 @@ async function scopedAuthed(request, env, path, method) {
     // Academy-mutation joins: every other Academy mutation stays
     // session-only.
     (method === 'POST' && path === '/api/admin/academy/purge-student') ||
+    // Pack BookletView (2026-11-11): the booklet seed PROXY joins the
+    // SERVICE set — the route itself enforces scopedAuthed ONLY and
+    // forwards the seed body to the ACADEMY deployment's internal
+    // route under cfg:internal (the purge-student pattern, stood up
+    // because cfg:service exists only in the SITE namespace while the
+    // booklet bytes must land in ACADEMY KV).
+    (method === 'POST' && path === '/api/admin/academy/booklet-seed-proxy') ||
     // Pack Tutor (2026-11-11): the Academy tutor CORPUS SEED joins the
     // SERVICE set (the provision/status pair does NOT — exactly the
     // cfg:mail posture, session-only). The seed writes only
@@ -3455,7 +3464,7 @@ function academyAddMonths(iso, months) {
    Record: hidden_files/free-split-plan-2026-11-10.md §2.2/§4. */
 function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; return s === 'academy' || s === 'site' ? s : null; }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -8836,6 +8845,49 @@ async function handleRequest(request, env, ctx) {
       try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
       return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined }, 200, origin);
     }
+    /* Pack BookletView (2026-11-11): booklet seed, INTERNAL family —
+       the mirror of student-delete above. The direct seed route
+       (/api/admin/academy/booklet-seed) is admitted by the admin gate
+       (owner session or SERVICE), but cfg:service lives only in the
+       SITE namespace, so the operator's unattended driver reaches
+       ACADEMY KV through the SITE deployment's
+       /api/admin/academy/booklet-seed-proxy (SERVICE-scoped), which
+       calls this route server-to-server under the SAME cfg:internal
+       secret (X-Internal-Secret, timing-safe compare). Admission is
+       that secret ONLY and fails closed: cfg:internal absent → 503
+       not_configured; a wrong or missing secret → 401 and nothing is
+       stored. Validation + storage are the booklet-seed handler's,
+       verbatim: kind/id/lang shape, base64 shape, %PDF magic, byte
+       count and SHA-256 of the decoded bytes — all verified BEFORE
+       the base64 lands under booklet:<kind>:<id>:<lang>, and the
+       stored value is re-read and re-hashed so the caller can prove
+       what ACADEMY KV now holds (storedSha256). */
+    if (path === '/api/internal/academy/booklet-seed' && request.method === 'POST') {
+      const icfgB = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+      if (!icfgB || !icfgB.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+      const bsec = request.headers.get('X-Internal-Secret') || '';
+      if (!bsec || !timingSafeEqual(bsec, String(icfgB.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+      let bd = null;
+      try { bd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+      const kind = String(bd.kind || '');
+      const bid = String(bd.id || '').toLowerCase();
+      const lang = String(bd.lang || '').toLowerCase();
+      const idOk = (kind === 'module' && /^m[0-8]$/.test(bid)) || (kind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bid) && bid.length <= 40);
+      if (!idOk || BOOKLET_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+      const b64 = String(bd.b64 || '').replace(/\s/g, '');
+      if (!b64 || b64.length > 14000000 || !/^[A-Za-z0-9+/=]+$/.test(b64)) return json({ ok: false, error: 'validation' }, 400, origin);
+      const bytes = bookletB64Decode(b64);
+      if (!bytes) return json({ ok: false, error: 'validation' }, 400, origin);
+      if (bytes.length < 5 || bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) return json({ ok: false, error: 'not_pdf' }, 400, origin);
+      if (typeof bd.bytes === 'number' && bd.bytes !== bytes.length) return json({ ok: false, error: 'size_mismatch' }, 400, origin);
+      if (bd.sha256) { const hh = await bookletBytesSha256(bytes); if (hh !== String(bd.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch' }, 400, origin); }
+      const bkey = 'booklet:' + kind + ':' + bid + ':' + lang;
+      await env.LEADS.put(bkey, b64);
+      const backBytes = bookletB64Decode((await env.LEADS.get(bkey)) || '');
+      const storedSha256 = backBytes ? await bookletBytesSha256(backBytes) : null;
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
+    }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
@@ -8847,7 +8899,7 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : 32768)))))); };
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -12080,6 +12132,29 @@ async function handleRequest(request, env, ctx) {
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_purge', target: pne, ip: ip, at: new Date().toISOString(), detail: { via: 'service', deleted: pdel } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json(upBody, up.status, origin);
       }
+      if (path === '/api/admin/academy/booklet-seed-proxy' && request.method === 'POST') {
+        // Pack BookletView (2026-11-11): SERVICE-scoped proxy to the
+        // ACADEMY deployment's internal booklet-seed route (the
+        // purge-student pattern verbatim). The operator's seed driver
+        // authenticates HERE with the SERVICE token (cfg:service
+        // lives in this namespace); the hop to the academy deployment
+        // rides cfg:internal. An owner session never suffices — the
+        // route enforces scopedAuthed ONLY.
+        if (!(await scopedAuthed(request, env, path, request.method))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let qbd = null;
+        try { qbd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const icfgQ = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+        if (!icfgQ || !icfgQ.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let up = null;
+        let upBody = null;
+        try {
+          up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/booklet-seed', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgQ.secret) }, body: JSON.stringify(qbd), signal: AbortSignal.timeout(60000) });
+          upBody = await up.json().catch(() => null);
+        } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
+        if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', bytes: upBody.bytes || null } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json(upBody, up.status, origin);
+      }
       // ---- admin: Academy × Stripe config (Pack AcademyStripe) ----
       // The provision route is the brain-provision pattern verbatim:
       // ONE-SHOT, merges into cfg:stripe, refuses once a secret exists
@@ -12672,8 +12747,10 @@ async function handleRequest(request, env, ctx) {
         if (typeof d.bytes === 'number' && d.bytes !== bytes.length) return json({ ok: false, error: 'size_mismatch' }, 400, origin);
         if (d.sha256) { const hh = await bookletBytesSha256(bytes); if (hh !== String(d.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch' }, 400, origin); }
         await env.LEADS.put('booklet:' + kind + ':' + bid + ':' + lang, b64);
+        const backBytes2 = bookletB64Decode((await env.LEADS.get('booklet:' + kind + ':' + bid + ':' + lang)) || '');
+        const storedSha256 = backBytes2 ? await bookletBytesSha256(backBytes2) : null;
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
-        return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length }, 200, origin);
+        return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
       }
       // ---- admin: Academy × Backblaze B2 (Pack AcademyB2Video) ----
       // The B2 credentials arrive in TWO one-shot calls, one per part
