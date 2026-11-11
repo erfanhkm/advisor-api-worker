@@ -4829,6 +4829,30 @@ async function puAttentionAdd(env, kind, text, ref) {
     await env.LEADS.put('attention', JSON.stringify(cur.slice(0, 50)));
   } catch (e) {}
 }
+/* Pack AttnFix (2026-11-10): the Today card is a genuine-alerts
+   surface ('Needs attention'), NOT the whole activity feed. Every
+   producer of the stored 'attention' list was audited — the kinds:
+   'rule' (owner-configured rule notes + flag_hot escalation — the
+   rules exist to be noticed), 'brain-action' (a held draft or a
+   created follow-up — both wait on the owner's review), 'brain-agent'
+   (agent step traces AND held gate-blocked emails — the mail queue is
+   HELD by design, so its traces are owner-action items). Admission of
+   those kinds to the alert surface is UNCHANGED: dropping or demoting
+   any of them would silently swallow real alerts. Exactly two kinds
+   are purely informational 'a thing is ready' notices whose content
+   lives on another surface and that demand NO action, so they no
+   longer appear under 'Needs attention' (Erfan's ruling 2026-11-10,
+   on the market-brief item): 'market-brief' (the brief itself lives
+   in the Assistant tab) and 'brain-calibration' (a monthly statistics
+   + proposals digest — returned by its own route, re-derivable at any
+   time). NO producer stops writing: the stored list stays complete as
+   the Assistant context feed (brainChatContext reads it via
+   puAttentionList) — only the Today today-payload filter below
+   reclassifies. */
+const PU_ATTENTION_INFO_KINDS = ['market-brief', 'brain-calibration'];
+function puAttentionAlerts(items) {
+  return (Array.isArray(items) ? items : []).filter(function (e) { return e && PU_ATTENTION_INFO_KINDS.indexOf(e.kind) === -1; });
+}
 async function puAttentionList(env) {
   try { return (await env.LEADS.get('attention', { type: 'json' })) || []; } catch (e) { return []; }
 }
@@ -5223,7 +5247,7 @@ async function puToday(env) {
     all.sort(function (a, b) { return String(a.due).localeCompare(String(b.due)); });
     return { due: all.slice(0, 10), count: all.length, overdue: all.filter(function (t) { return t.due < today; }).length };
   });
-  await seg('attention', async function () { return { items: (await puAttentionList(env)).slice(0, 15) }; });
+  await seg('attention', async function () { return { items: puAttentionAlerts(await puAttentionList(env)).slice(0, 15) }; });
   out.generatedAt = new Date().toISOString();
   return out;
 }
