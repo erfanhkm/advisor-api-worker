@@ -1062,7 +1062,9 @@ async function scopedAuthed(request, env, path, method) {
     // service path must mint the secret WORKER-SIDE (no value in any
     // request the agent emits — a client-supplied value would risk
     // storing an egress surrogate literal, the Stripe §13 lesson);
-    // the owner session keeps the body {secret} path. Nothing else
+    // the owner session may supply a body {secret} but the portal
+    // card sends an empty body and the handler mints worker-side for
+    // it too (AcademyVideoCard FIX, 2026-11-10). Nothing else
     // video-related is in scope.
     (method === 'POST' && path === '/api/admin/academy/video-provision') ||
     (method === 'GET' && path === '/api/admin/academy/video-status') ||
@@ -11839,21 +11841,28 @@ async function handleRequest(request, env, ctx) {
         // same worker), so unlike the Stripe keys it never has to
         // cross the agent egress boundary, and a supplied value could
         // only ever risk storing an unswapped surrogate literal
-        // (Stripe pack §13). The owner-session path keeps the
-        // original body {secret} contract. Both modes are one-shot
-        // (409 once set) and write a video_provision audit (mode only,
-        // never the value).
+        // (Stripe pack §13). The owner-session path originally kept a
+        // body {secret} contract. Pack AcademyVideoCard FIX
+        // (2026-11-10, live-found): the portal card sends an EMPTY
+        // body by design ("the signing secret is generated on the
+        // worker" — its copy, PVID-pinned), so the session path now
+        // ALSO mints worker-side when no secret is supplied; a
+        // body-supplied session secret is still accepted and still
+        // validated (16–256). All modes are one-shot (409 once set)
+        // and write a video_provision audit (mode only, never the
+        // value).
         const viaService = await scopedAuthed(request, env, path, request.method);
         let d = null;
         try { d = await request.json(); } catch (e) {}
-        const sec = viaService ? randHex(32) : String((d && d.secret) || '');
+        const supplied = String((d && d.secret) || '');
+        const sec = viaService ? randHex(32) : (supplied ? supplied : randHex(32));
         if (sec.length < 16 || sec.length > 256) return json({ ok: false, error: 'validation' }, 400, origin);
         const cur = (await env.LEADS.get('cfg:video', { type: 'json' })) || {};
         if (cur.tokenSecret) return json({ ok: false, error: 'already_provisioned' }, 409, origin);
         cur.tokenSecret = sec;
         cur.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:video', JSON.stringify(cur));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'video_provision', target: 'cfg:video', ip: ip, at: new Date().toISOString(), detail: { via: viaService ? 'service_generated' : 'session' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'video_provision', target: 'cfg:video', ip: ip, at: new Date().toISOString(), detail: { via: viaService ? 'service_generated' : (supplied ? 'session' : 'session_generated') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/academy/video-status' && request.method === 'GET') {
