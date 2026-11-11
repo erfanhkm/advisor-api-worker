@@ -3948,7 +3948,7 @@ function tutorTokenize(text) {
   // rest. Stopwords are dropped so overlap scores track CONTENT terms.
   const stop = { the: 1, a: 1, an: 1, is: 1, are: 1, was: 1, were: 1, be: 1, been: 1, what: 1, how: 1, does: 1, do: 1, did: 1, in: 1, of: 1, to: 1, and: 1, or: 1, for: 1, on: 1, at: 1, by: 1, if: 1, it: 1, its: 1, this: 1, that: 1, with: 1, from: 1, as: 1, can: 1, could: 1, would: 1, should: 1, when: 1, why: 1, which: 1, who: 1, i: 1, me: 1, my: 1, you: 1, your: 1, we: 1, they: 1, them: 1, he: 1, she: 1, not: 1, no: 1, yes: 1 };
   const faStop = { 'چیست': 1, 'چه': 1, 'چگونه': 1, 'آیا': 1, 'در': 1, 'به': 1, 'از': 1, 'را': 1, 'و': 1, 'است': 1, 'بود': 1, 'برای': 1, 'این': 1, 'آن': 1, 'که': 1, 'می': 1, 'شود': 1, 'یک': 1, 'من': 1, 'تو': 1, 'او': 1, 'ما': 1, 'شما': 1, 'اگر': 1, 'چرا': 1, 'کدام': 1, 'هر': 1, 'هم': 1, 'تا': 1, 'با': 1, 'بی': 1, 'خواهند': 1, 'خواهد': 1, 'دارند': 1, 'دارد': 1 };
-  const raw = String(text || '').toLowerCase().replace(/‌/g, ' ').split(/[^a-z0-9؀-ۿ]+/);
+  const raw = String(text || '').toLowerCase().replace(/\u064A/g, '\u06CC').replace(/\u0643/g, '\u06A9').replace(/\u0640/g, '').replace(/[\u200C\u200D]/g, ' ').split(/[^a-z0-9\u0600-\u06FF]+/); // SCAN fix (2026-11-11): normalize Arabic-keyboard variants (ي→ی, ك→ک), drop tatweel, ZWNJ/ZWJ → space, so FA retrieval matches regardless of the student's keyboard layout
   const out = [];
   for (const t of raw) { if (t.length >= 2 && !stop[t] && !faStop[t]) out.push(t); }
   return out;
@@ -4211,6 +4211,15 @@ const TUTOR_VOICE_DEFAULTS = { enVoice: 'CwhRBWXzGAHq8TQ4Fs17', faVoice: 'Mn0jJ3
 // ---------- shared student gate for the Tutor2 routes ----------
 // Same posture as the v1 chat route: the caller has already passed
 // authed(); this validates the email and re-checks entitlement FRESH.
+// Pack Tutor2 SCAN fix (2026-11-11): admission for the tutor's
+// student routes — the owner session OR a student session (stok:)
+// BOUND to the very email being served (the BookletFix pattern).
+// Before this fix the tutor routes accepted only the owner
+// session, so a real signed-in student was 401'd on every call.
+async function tutorAdmit(request, env, email) {
+  try { if (await authed(request, env)) return true; return await studentAuthed(request, env, email); } catch (e) { return false; }
+}
+
 async function tutorGate(env, rawEmail, readOnly, origin) {
   const email = String(rawEmail || '').trim().toLowerCase();
   if (!EMAIL_RE.test(email)) return { resp: json({ ok: false, error: 'invalid_email' }, 400, origin) };
@@ -10864,12 +10873,12 @@ async function handleRequest(request, env, ctx) {
       // mints a video token); history/reset are reads of the student's
       // own thread → readOnly:true (the lessons' grace posture).
       if (path === '/api/academy/tutor/chat' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
         const email = String(d.email || '').trim().toLowerCase();
         if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const message = String(d.message || '').trim();
         if (!message || message.length > 4000) return json({ ok: false, error: 'invalid_message' }, 400, origin);
         const lang = String(d.lang || 'en').trim().toLowerCase();
@@ -10943,8 +10952,14 @@ async function handleRequest(request, env, ctx) {
         if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
         await spendUnit();
         let stripped = tutorStripMisconception(out.text);
-        let reply = stripped.text || out.text.trim();
         let concept = stripped.concept;
+        // SCAN fix (2026-11-11): a draft that is ONLY the hidden
+        // concept line strips to empty — never fall back to the raw
+        // model text (it would leak the hidden line to the student).
+        // Serve an honest localized fallback instead; it is our own
+        // static text, so the verification pass below is skipped.
+        let emptyDraft = !stripped.text;
+        let reply = stripped.text || (lang === 'fa' ? 'درس مرتبط را پیدا کردم، اما نتوانستم از روی متن آن پاسخ کاملی بنویسم — لطفاً سؤالت را طور دیگری بپرس.' : 'I found the relevant lesson, but I could not compose a complete answer from its text — please try asking in a different way.');
         // ---- Tier 1d: verification pass. The draft is checked
         // claim-by-claim against the SAME excerpts before the student
         // sees it. Accounting (successful replies only): draft 1 +
@@ -10952,7 +10967,8 @@ async function handleRequest(request, env, ctx) {
         // fails). Any step is skipped when the budget is exhausted —
         // verification never eats the student's answer.
         let verifyOutcome = null;
-        if (!budgetLeft()) { verifyOutcome = 'skipped_budget'; await tutorVerifyLog(env, 'skipped_budget'); }
+        if (emptyDraft) { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
+        else if (!budgetLeft()) { verifyOutcome = 'skipped_budget'; await tutorVerifyLog(env, 'skipped_budget'); }
         else {
           const v1res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply, out.kind, attachment);
           if (!v1res.called) { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
@@ -10970,15 +10986,19 @@ async function handleRequest(request, env, ctx) {
                 if (out2) {
                   await spendUnit();
                   const s2 = tutorStripMisconception(out2.text);
-                  const reply2 = s2.text || out2.text.trim();
-                  let accepted = true;
-                  if (budgetLeft()) {
+                  const reply2 = s2.text || ''; // SCAN fix: an empty regeneration (concept line only) is never shipped raw either
+                  let accepted = !!s2.text;
+                  let rechecked = false;
+                  if (accepted && budgetLeft()) {
                     const v2res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply2, out2.kind, attachment);
                     if (v2res.called) {
                       await spendUnit();
+                      rechecked = true;
                       if (v2res.status === 'unsupported') { trimmedFrom = v2res; accepted = false; }
+                      else if (v2res.status === 'inconclusive') accepted = false; // SCAN fix (2026-11-11): an inconclusive re-check must not wave through a rewrite of a draft the FIRST verdict already flagged
                     }
                   }
+                  if (accepted && !rechecked) accepted = false; // SCAN fix: the rewrite was never re-checked (no budget left, or the verify call failed) — the trim below falls back to the first verdict's supported claims instead of shipping the rewrite unchecked
                   if (accepted) { reply = reply2; concept = s2.concept || concept; regenOk = true; }
                   else { reply = reply2; concept = s2.concept || concept; }
                 }
@@ -11004,9 +11024,9 @@ async function handleRequest(request, env, ctx) {
         return json(chatResp, 200, origin);
       }
       if (path === '/api/academy/tutor/history' && request.method === 'GET') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
         if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const ent = await academyEntitlement(env, email, { readOnly: true });
         if (!ent.entitled) {
           if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
@@ -11020,11 +11040,11 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, messages: thread.messages, remainingToday: Math.max(0, caps.perStudent - usedStudent), configured: tutorReady(cfg), voiceEnabled: tutorVoiceCfg(cfg).enabled }, 200, origin);
       }
       if (path === '/api/academy/tutor/reset' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { d = {}; }
         const email = String(d.email || '').trim().toLowerCase();
         if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const ent = await academyEntitlement(env, email, { readOnly: true });
         if (!ent.entitled) {
           if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
@@ -11075,10 +11095,12 @@ async function handleRequest(request, env, ctx) {
       // (except voice, which is cfg-gated OFF by default), so none of
       // them consumes the tutor's chat budget.
       if (path === '/api/academy/tutor/practice' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const cfg = await tutorCfg(env);
@@ -11112,10 +11134,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, question: tutorQuestionPayload(q), concept: q.concept }, 200, origin);
       }
       if (path === '/api/academy/tutor/practice-answer' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const qid = String(d.qid || '').trim().toLowerCase();
@@ -11134,10 +11158,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, resolvedNow: grade.resolvedNow }, 200, origin);
       }
       if (path === '/api/academy/tutor/quiz/start' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const cfg = await tutorCfg(env);
@@ -11164,10 +11190,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, question: tutorQuestionPayload(q), progress: { asked: 0, score: 0, target: target } }, 200, origin);
       }
       if (path === '/api/academy/tutor/quiz/answer' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const qid = String(d.qid || '').trim().toLowerCase();
@@ -11212,9 +11240,11 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, correct: grade.correct, correctKey: grade.correctKey, explain: grade.explain, options: grade.options, done: false, next: tutorQuestionPayload(nq), progress: { asked: quiz.asked, score: quiz.score, target: quiz.target } }, 200, origin);
       }
       if (path === '/api/academy/tutor/quiz/stop' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const thread = await tutorThreadGet(env, g.ne);
@@ -11227,10 +11257,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, summary: summary }, 200, origin);
       }
       if (path === '/api/academy/tutor/debrief/start' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const cfg = await tutorCfg(env);
@@ -11264,10 +11296,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, done: false, item: item }, 200, origin);
       }
       if (path === '/api/academy/tutor/debrief/next' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const thread = await tutorThreadGet(env, g.ne);
@@ -11290,7 +11324,9 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, done: false, item: item }, 200, origin);
       }
       if (path === '/api/academy/tutor/coach' && request.method === 'GET') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const emailPre = normEmail(String(url.searchParams.get('email') || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, url.searchParams.get('email'), true, origin);
         if (g.resp) return g.resp;
         const snapC = await tutorStudentSnapshot(env, g.ne);
@@ -11310,10 +11346,12 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, dueReview: snapC.dueReview, totalOpen: snapC.openMistakes, weakestModule: snapC.weakestModule ? { module: snapC.weakestModule.module, mastery: snapC.weakestModule.mastery } : null, readiness: snapC.readiness ? snapC.readiness.score : null, suggestion: suggestion }, 200, origin);
       }
       if (path === '/api/academy/tutor/feedback' && request.method === 'POST') {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, true, origin);
         if (g.resp) return g.resp;
         const vote = String(d.vote || '');
@@ -11341,10 +11379,12 @@ async function handleRequest(request, env, ctx) {
         // chat budget. Enabling burns the shared ElevenLabs credit
         // pool and requires Erfan's explicit go (see the Tutor2
         // header comment).
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('actutor:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const emailPre = normEmail(String(d.email || ''));
+        if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
         const cfg = await tutorCfg(env);
