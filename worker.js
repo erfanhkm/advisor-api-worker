@@ -3745,6 +3745,29 @@ async function academyB2Get(env, key, range) {
     text: async function () { return await resp.clone().text(); }
   };
 }
+async function academyB2Probe(env) {
+  // Pack B2Probe (2026-11-12): the diagnostic behind the portal
+  // B2 card's "Test read" button. academyB2Get swallows every
+  // upstream failure into null (the playback route then answers
+  // a bare 404), which hid WHY stored key pairs cannot read the
+  // bucket. This performs ONE raw academyB2Request for the first
+  // video object with a 1-byte Range (so an error body stays
+  // readable) and reports ONLY {ok, status, code, message} —
+  // never headers, credentials or the signed URL.
+  let resp;
+  try {
+    resp = await academyB2Request(env, 'GET', 'media/m5-l1/en/master.m3u8', { rangeHeader: 'bytes=0-0' });
+  } catch (e) { return { ok: false, status: 0, code: 'fetch_failed' }; }
+  if (!resp) return { ok: false, status: 0, code: 'fetch_failed' };
+  if (resp.status === 200 || resp.status === 206) return { ok: true, status: resp.status };
+  let body = '';
+  try { body = await resp.text(); } catch (e) {}
+  const cm = /<Code>([^<]*)<\/Code>/.exec(body);
+  if (!cm) return { ok: false, status: resp.status, code: 'unparsed' };
+  const mm = /<Message>([^<]*)<\/Message>/.exec(body);
+  const msg = mm ? mm[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+  return { ok: false, status: resp.status, code: cm[1], message: msg };
+}
 async function academyB2Head(env, key) {
   let resp;
   try { resp = await academyB2Request(env, 'HEAD', key, {}); } catch (e) { return null; }
@@ -15651,8 +15674,17 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/admin/academy/b2-status' && request.method === 'GET') {
         // Booleans only — no secret material ever leaves this route.
+        // Pack B2Probe (2026-11-12): ?probe=1 additionally runs ONE
+        // raw signed read (academyB2Probe) and attaches its verdict
+        // as `probe` — upstream status + S3 error code/message only,
+        // so a stored-but-unreadable key shows its real failure here
+        // instead of surfacing as a silent playback 404. Admission
+        // is unchanged (the admin gate above), and without probe=1
+        // the response is exactly the shape it has always been.
         const cfg = (await env.LEADS.get('cfg:b2', { type: 'json' })) || {};
-        return json({ ok: true, configured: !!(cfg.keyId && cfg.appKey), keyIdConfigured: !!cfg.keyId, appKeyConfigured: !!cfg.appKey, bucket: cfg.bucket || null, endpoint: cfg.endpoint || null, provisionedAt: cfg.provisionedAt || null }, 200, origin);
+        const out = { ok: true, configured: !!(cfg.keyId && cfg.appKey), keyIdConfigured: !!cfg.keyId, appKeyConfigured: !!cfg.appKey, bucket: cfg.bucket || null, endpoint: cfg.endpoint || null, provisionedAt: cfg.provisionedAt || null };
+        if (url.searchParams.get('probe') === '1') out.probe = await academyB2Probe(env);
+        return json(out, 200, origin);
       }
       // Object transfer through the worker (the worker is the only
       // holder of the B2 credentials): PUT stores one media object
