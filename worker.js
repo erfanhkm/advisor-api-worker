@@ -198,6 +198,10 @@ function genBumpDue() {
 // Academy admin student mutations keep bumping (they change lists).
 const GEN_BUMP_EXEMPT = [
   ['PUT', '/api/admin/academy/b2-object'],
+  // Pack R2VideoServe (2026-11-12): the R2 migration PUT is the
+  // same machine/transfer traffic (9,316 objects) — exempt for
+  // the same reason (the 2026-11-10 KV write-pool lesson).
+  ['PUT', '/api/admin/academy/r2-object'],
   ['DELETE', '/api/admin/academy/b2-object'],
   ['POST', '/api/admin/academy/b2-provision'],
   ['POST', '/api/admin/academy/stripe-provision'],
@@ -1168,6 +1172,15 @@ async function scopedAuthed(request, env, path, method) {
     (method === 'PUT' && path === '/api/admin/academy/b2-object') ||
     (method === 'GET' && path === '/api/admin/academy/b2-object') ||
     (method === 'GET' && path === '/api/admin/academy/b2-list') ||
+    // Pack R2VideoServe (2026-11-12): the R2 transfer pair + list
+    // join the SERVICE set with the B2 posture — the migration
+    // driver moves the packaged HLS set from local disk into the
+    // R2 bucket through the worker (no Cloudflare API token
+    // exists for the business account) and verifies via the
+    // probe/list. Nothing else R2-related is in scope.
+    (method === 'PUT' && path === '/api/admin/academy/r2-object') ||
+    (method === 'GET' && path === '/api/admin/academy/r2-object') ||
+    (method === 'GET' && path === '/api/admin/academy/r2-list') ||
     // Pack L (2026-11-02): the monthly newsletter job publishes the
     // Market Pulse dataset with the service token — /api/login is
     // Turnstile-gated server-side, so a job can never hold an admin
@@ -3866,6 +3879,63 @@ async function academyB2List(env, prefix, maxKeys) {
     if (km) { const sz = sm ? parseInt(sm[1], 10) : 0; keys.push({ key: km[1], size: sz }); bytes += sz; }
   }
   return { keys: keys, count: keys.length, bytes: bytes, truncated: /<IsTruncated>true<\/IsTruncated>/.test(xml) };
+}
+
+/* ---- Academy media read layer (Pack R2VideoServe, 2026-11-12) ----
+   The owner chose Cloudflare R2 for the Academy media store (the
+   2026-11-10 B2 move was forced by R2's payment-method activation
+   gate, since lifted). The video serve route reads through
+   academyVideoGet / academyVideoHead: when the ACADEMY_VIDEO R2
+   binding exists (the academy deployment's wrangler.academy.toml
+   carries the [[r2_buckets]] block; the site deployment's config
+   does not, so env.ACADEMY_VIDEO is simply absent there) the
+   object is read from the binding; on a missing binding, a missing
+   object or ANY R2-side error the read falls back to academyB2Get
+   / academyB2Head unchanged — B2 stays the archive/fallback store
+   and an R2 hiccup can never 500 the serve path. The return shapes
+   are the B2 store's exactly: Get → {body, size, text()} | null
+   with size = the bytes in THIS body (the slice length on a ranged
+   read, mirroring B2's Content-Length); Head → {size} | null with
+   size = the FULL object size. R2 range semantics differ from
+   B2's in one place: an unsatisfiable range is IGNORED (the whole
+   object comes back with no .range) where B2 answers 416 → null —
+   a ranged read whose .range is absent is treated as a miss and
+   handed to B2, preserving the route's 404/416 behaviour. Keys
+   are the same media/<lesson>/<lang>/<file> keys on both stores. */
+async function academyVideoReady(env) {
+  if (env && env.ACADEMY_VIDEO) return true;
+  return academyB2Ready(await academyB2Cfg(env));
+}
+async function academyVideoGet(env, key, range) {
+  const bucket = env && env.ACADEMY_VIDEO;
+  if (bucket && typeof bucket.get === 'function') {
+    try {
+      const obj = await bucket.get(key, range ? { range: { offset: range.offset, length: range.length } } : undefined);
+      if (obj) {
+        if (range && !obj.range) {
+          // Unsatisfiable range (see header): let B2 decide (it
+          // answers 416 → null, exactly as before this pack).
+          return await academyB2Get(env, key, range);
+        }
+        return {
+          body: obj.body,
+          size: range ? obj.range.length : obj.size,
+          text: async function () { return await obj.text(); }
+        };
+      }
+    } catch (e) { /* R2 read failed — fall back to B2 below. */ }
+  }
+  return await academyB2Get(env, key, range);
+}
+async function academyVideoHead(env, key) {
+  const bucket = env && env.ACADEMY_VIDEO;
+  if (bucket && typeof bucket.head === 'function') {
+    try {
+      const obj = await bucket.head(key);
+      if (obj) return { size: obj.size };
+    } catch (e) { /* R2 head failed — fall back to B2 below. */ }
+  }
+  return await academyB2Head(env, key);
 }
 
 function effectiveStatus(rec, nowMs) {
@@ -10540,7 +10610,7 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed' || p === '/api/admin/academy/tutor-seed-proxy') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/admin/academy/r2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed' || p === '/api/admin/academy/tutor-seed-proxy') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
     // Pack AcademyBuildA2 (Finding 7, QC Round 3 addendum): tutor-seed rides the
     // 6 MiB cap above — the compiled EN index part is ~151 KB, far past the
     // 32 KB default that used to 413 it before the handler ran; the handler's
@@ -11982,14 +12052,18 @@ async function handleRequest(request, env, ctx) {
         // cfg:b2 (the R2 binding was never provisionable — R2
         // activation needs a payment method). Unprovisioned B2 keeps
         // the same fail-closed 503 shape the binding check produced.
-        if (!academyB2Ready(await academyB2Cfg(env))) return json({ ok: false, error: 'media_unavailable' }, 503, origin);
+        // Pack R2VideoServe (2026-11-12): the store is now the R2
+        // binding when present (academy deployment), B2 otherwise —
+        // the readiness gate accepts either store, same fail-closed
+        // 503 shape when neither is available.
+        if (!(await academyVideoReady(env))) return json({ ok: false, error: 'media_unavailable' }, 503, origin);
         const file = vm[3];
         const fileOk = /^[A-Za-z0-9._-]+$/.test(file) && file.indexOf('..') === -1 &&
           (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file) || /^seg-\d{4}\.ts$/.test(file) || file === 'captions.vtt');
         if (!fileOk) return json({ ok: false, error: 'not_found' }, 404, origin);
         const objKey = 'media/' + vm[1] + '/' + vm[2] + '/' + file;
         if (file === 'master.m3u8' || /^v\d+\.m3u8$/.test(file)) {
-          const obj = await academyB2Get(env, objKey);
+          const obj = await academyVideoGet(env, objKey);
           if (!obj) return json({ ok: false, error: 'not_found' }, 404, origin);
           let text = await obj.text();
           const tok = url.searchParams.get('t');
@@ -12010,7 +12084,7 @@ async function handleRequest(request, env, ctx) {
           return new Response(text, { status: 200, headers: academyVideoMediaHeaders('application/vnd.apple.mpegurl') });
         }
         if (file === 'captions.vtt') {
-          const cap = await academyB2Get(env, objKey);
+          const cap = await academyVideoGet(env, objKey);
           if (!cap) return json({ ok: false, error: 'not_found' }, 404, origin);
           return new Response(cap.body, { status: 200, headers: academyVideoMediaHeaders('text/vtt; charset=utf-8') });
         }
@@ -12020,12 +12094,12 @@ async function handleRequest(request, env, ctx) {
         const rangeH = request.headers.get('Range') || '';
         const rm = rangeH.match(/^bytes=(\d+)-(\d*)$/);
         if (rm) {
-          const head = await academyB2Head(env, objKey);
+          const head = await academyVideoHead(env, objKey);
           if (!head) return json({ ok: false, error: 'not_found' }, 404, origin);
           const start = parseInt(rm[1], 10);
           if (start >= head.size) return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */' + head.size, 'Cache-Control': 'private, no-store' } });
           const end = rm[2] ? Math.min(parseInt(rm[2], 10), head.size - 1) : head.size - 1;
-          const part = await academyB2Get(env, objKey, { offset: start, length: end - start + 1 });
+          const part = await academyVideoGet(env, objKey, { offset: start, length: end - start + 1 });
           if (!part) return json({ ok: false, error: 'not_found' }, 404, origin);
           const h = academyVideoMediaHeaders('video/mp2t');
           h['Content-Range'] = 'bytes ' + start + '-' + end + '/' + head.size;
@@ -12033,7 +12107,7 @@ async function handleRequest(request, env, ctx) {
           h['Content-Length'] = String(end - start + 1);
           return new Response(part.body, { status: 206, headers: h });
         }
-        const seg = await academyB2Get(env, objKey);
+        const seg = await academyVideoGet(env, objKey);
         if (!seg) return json({ ok: false, error: 'not_found' }, 404, origin);
         const sh = academyVideoMediaHeaders('video/mp2t');
         sh['Accept-Ranges'] = 'bytes';
@@ -15796,6 +15870,69 @@ async function handleRequest(request, env, ctx) {
         const listed = await academyB2List(env, prefix, 1000);
         if (!listed) return json({ ok: false, error: 'b2_list_failed' }, 502, origin);
         return json({ ok: true, count: listed.count, bytes: listed.bytes, truncated: listed.truncated, keys: listed.keys }, 200, origin);
+      }
+      // Pack R2VideoServe (2026-11-12): object transfer INTO the
+      // R2 bucket through the worker — the migration path. No
+      // Cloudflare API token exists for the business account, so
+      // the operator's driver moves the packaged HLS set from
+      // local disk through these routes exactly as the B2 upload
+      // rode the b2-* routes (the b2-upload-driver pattern): PUT
+      // stores one media object (the route's body cap is 6 MiB
+      // via bodyCapFor; the largest packaged segment is ~2.7 MB),
+      // GET is a head-probe ({exists, size}), and r2-list returns
+      // the bucket inventory under a prefix for verification.
+      // All three sit behind the admin gate; PUT/GET/list are
+      // also in the SERVICE allowlist and the PUT is
+      // GEN_BUMP-exempt, both mirroring the B2 pair. A missing
+      // binding is a clean 503 r2_not_configured (the site
+      // deployment has no binding by design and never serves
+      // these).
+      if (path === '/api/admin/academy/r2-object' && request.method === 'PUT') {
+        if (limited('acadr2up:' + ip, 5000, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        const key = String(url.searchParams.get('key') || '');
+        if (!ACADEMY_B2_KEY_RE.test(key)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        const bucket = env.ACADEMY_VIDEO;
+        if (!bucket || typeof bucket.put !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+        const buf = new Uint8Array(await request.arrayBuffer());
+        if (!buf.length) return json({ ok: false, error: 'empty_body' }, 400, origin);
+        const ct = key.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (key.endsWith('.ts') ? 'video/MP2T' : (key.endsWith('.vtt') ? 'text/vtt' : 'application/octet-stream'));
+        try { await bucket.put(key, buf, { httpMetadata: { contentType: ct } }); } catch (e) { return json({ ok: false, error: 'r2_put_failed' }, 502, origin); }
+        return json({ ok: true, key: key, size: buf.length }, 200, origin);
+      }
+      if (path === '/api/admin/academy/r2-object' && request.method === 'GET') {
+        const key = String(url.searchParams.get('key') || '');
+        if (!ACADEMY_B2_KEY_RE.test(key)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        const bucket = env.ACADEMY_VIDEO;
+        if (!bucket || typeof bucket.head !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+        let head = null;
+        try { head = await bucket.head(key); } catch (e) { return json({ ok: false, error: 'r2_head_failed' }, 502, origin); }
+        if (!head) return json({ ok: true, exists: false, size: null }, 200, origin);
+        return json({ ok: true, exists: true, size: head.size }, 200, origin);
+      }
+      if (path === '/api/admin/academy/r2-list' && request.method === 'GET') {
+        const prefix = String(url.searchParams.get('prefix') || 'media/');
+        if (prefix.indexOf('media/') !== 0 || prefix.indexOf('..') !== -1) return json({ ok: false, error: 'invalid_prefix' }, 400, origin);
+        const bucket = env.ACADEMY_VIDEO;
+        if (!bucket || typeof bucket.list !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+        const keys = [];
+        let bytes = 0;
+        let cursor = undefined;
+        let truncated = false;
+        try {
+          // Page cap 50 × 1000 = a 50,000-key ceiling (the packaged
+          // set is 9,316); a still-truncated answer after the cap
+          // reports truncated:true so the caller knows it is partial.
+          for (let page = 0; page < 50; page++) {
+            const res = await bucket.list({ prefix: prefix, limit: 1000, cursor: cursor });
+            const objs = (res && res.objects) || [];
+            for (const o of objs) { keys.push({ key: o.key, size: o.size }); bytes += o.size || 0; }
+            truncated = !!(res && res.truncated);
+            if (!truncated) break;
+            cursor = res.cursor;
+            if (!cursor) break;
+          }
+        } catch (e) { return json({ ok: false, error: 'r2_list_failed' }, 502, origin); }
+        return json({ ok: true, count: keys.length, bytes: bytes, truncated: truncated, keys: keys }, 200, origin);
       }
       if (path === '/api/admin/brain/provision' && request.method === 'POST') {
         // One-shot: stores the shared secret into cfg:brain (merging
