@@ -202,6 +202,7 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/admin/academy/b2-provision'],
   ['POST', '/api/admin/academy/stripe-provision'],
   ['POST', '/api/admin/academy/stripe-clear'],
+  ['POST', '/api/admin/academy/b2-clear'],
   ['POST', '/api/admin/academy/purge-student'],
   ['POST', '/api/internal/academy/student-delete'],
   ['POST', '/api/admin/academy/video-provision'],
@@ -4811,8 +4812,8 @@ const TUTOR_TOP_K = 3;
 const TUTOR_ATTACH_MAX_BYTES = 4 * 1024 * 1024;
 const TUTOR_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
 const TUTOR_MISCON_CAP = 200;
-const TUTOR_GROQ_DEFAULT_MODEL = 'llama-3.3-70b-versatile';
-const TUTOR_GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash';
+const TUTOR_GROQ_DEFAULT_MODEL = 'openai/gpt-oss-120b';
+const TUTOR_GEMINI_DEFAULT_MODEL = 'gemini-3.5-flash';
 const TUTOR_WAI_DEFAULT_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 async function tutorCfg(env) { try { return await env.LEADS.get('cfg:tutor', { type: 'json' }); } catch (e) { return null; } }
 function tutorProviders(cfg) {
@@ -13084,7 +13085,13 @@ async function handleRequest(request, env, ctx) {
          exemption itself stays because the handler's admission
          re-run is the route's documented control. The response is
          booleans only. */
-      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-clear' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
+      /* Pack ModelSwap+B2Clear (2026-11-12): POST
+         /api/admin/academy/b2-clear joins the exemption — the
+         route re-runs admission in-handler (owner session or the
+         SERVICE credential, gated by the exact
+         {"confirm":"clear-b2"} body — see the handler). The
+         response is booleans only. */
+      if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-clear' && request.method === 'POST') && !(path === '/api/admin/academy/b2-clear' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         const admIp = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
         if (limited('adm:' + admIp, 60, 3600000)) return json({ ok: false, error: 'rate_limited' }, 429, origin);
         return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -14885,6 +14892,43 @@ async function handleRequest(request, env, ctx) {
         if (curC === null) return json({ ok: true, cleared: false }, 200, origin);
         await env.LEADS.delete('cfg:stripe');
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_clear', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: viaClear } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, cleared: true }, 200, origin);
+      }
+      if (path === '/api/admin/academy/b2-clear' && request.method === 'POST') {
+        // Pack ModelSwap+B2Clear (2026-11-12): the CLEAR half of
+        // the B2 repair loop — the missing counterpart to
+        // stripe-clear above. The stored cfg:b2 pair on the
+        // ACADEMY deployment (Backblaze key academy-video-upload-3)
+        // cannot read the bucket, and the one-shot b2-provision
+        // refuses a part once set, so without this route no
+        // admitted path could remove a bad record: the portal card
+        // hides its fields once configured and the fresh key
+        // (academy-video-upload-4) could never be entered. This
+        // route deletes cfg:b2 and nothing else. PRE-GATE
+        // OWNERSHIP: exempt from the generic admin gate above (see
+        // the gate comment); admission is re-run here and admits
+        // EITHER an owner session (authed — incl. the bridged
+        // session on the academy deployment; the portal path) OR
+        // the SERVICE credential (scopedAuthed). One control still
+        // narrows every admitted call: the body must be exactly
+        // {"confirm":"clear-b2"}, a deliberate-action token a stray
+        // or crawled POST will not carry — anything else is 400
+        // and the record is untouched. Idempotent, mirroring
+        // stripe-clear exactly: an absent record answers
+        // cleared:false and writes no audit; a real delete writes
+        // a b2_clear audit (via only, never any stored material)
+        // with the standard 730-day TTL.
+        let viaClearB2 = null;
+        if (await authed(request, env)) viaClearB2 = 'session';
+        else if (await scopedAuthed(request, env, path, request.method)) viaClearB2 = 'service';
+        else return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let db2 = null;
+        try { db2 = await request.json(); } catch (e) {}
+        if (!db2 || db2.confirm !== 'clear-b2' || Object.keys(db2).length !== 1) return json({ ok: false, error: 'validation' }, 400, origin);
+        const curB2 = await env.LEADS.get('cfg:b2');
+        if (curB2 === null) return json({ ok: true, cleared: false }, 200, origin);
+        await env.LEADS.delete('cfg:b2');
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'b2_clear', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { via: viaClearB2 } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true, cleared: true }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'POST') {
