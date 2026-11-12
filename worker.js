@@ -4324,8 +4324,15 @@ async function tutorStudentSnapshot(env, ne) {
       out.totalEver = mk.totalEver | 0; out.resolvedEver = mk.resolvedEver | 0;
       const open = mk.items.filter(function (i) { return i && !i.resolved; });
       out.openMistakes = open.length;
-      out.dueItems = open.filter(function (i) { return (i.dueAt || 0) <= nowMs; }).sort(function (a, b) { return (a.dueAt || 0) - (b.dueAt || 0); }).slice(0, 10).map(function (i) { return { qid: i.qid, concept: i.concept, lessonId: i.lessonId, moduleId: i.moduleId, dueAt: i.dueAt }; });
-      out.dueReview = out.dueItems.length;
+      const dueOpen = open.filter(function (i) { return (i.dueAt || 0) <= nowMs; }).sort(function (a, b) { return (a.dueAt || 0) - (b.dueAt || 0); });
+      // dueReview is the TRUE due count (the quiz engine's
+      // reviewQueue semantics — uncapped); dueItems stays a capped
+      // sample for the prompt / first-item consumers. Tutor2
+      // follow-up fix (2026-11-11): the count previously inherited
+      // the sample's slice(0,10), so the coach payload under-
+      // reported due reviews whenever more than 10 were due.
+      out.dueReview = dueOpen.length;
+      out.dueItems = dueOpen.slice(0, 10).map(function (i) { return { qid: i.qid, concept: i.concept, lessonId: i.lessonId, moduleId: i.moduleId, dueAt: i.dueAt }; });
       out.openItems = open.slice().sort(function (a, b) { return (a.dueAt || 0) - (b.dueAt || 0); }).slice(0, 20).map(function (i) { return { qid: i.qid, concept: i.concept, lessonId: i.lessonId, moduleId: i.moduleId, dueAt: i.dueAt }; });
       const byConcept = {};
       for (const i of open) byConcept[i.concept] = (byConcept[i.concept] || 0) + 1;
