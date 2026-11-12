@@ -4559,6 +4559,9 @@ async function tutorVerifyDraft(env, cfg, lang, excerpts, nearest, draftText, pr
   // by the vision provider, with the attachment attached). Returns
   // {called:false} when no provider produced a reply — the caller
   // then spends NO budget, matching v1's "counted on success only".
+  // Pack TutorCredits (2026-11-11): the result also carries `kind` —
+  // WHICH provider served the call — so the caller can attribute the
+  // spent unit to that provider's daily counter (observability only).
   const turns = [{ role: 'system', text: tutorSystemPrompt(lang, excerpts, nearest) + TUTOR_VERIFY_NOTE }, { role: 'user', text: 'DRAFT ANSWER TO CHECK:\n' + draftText }];
   let provs = tutorProviders(cfg).filter(tutorProviderUsable);
   if (attachment) provs = provs.filter(function (p) { return p.kind === 'gemini'; });
@@ -4567,11 +4570,11 @@ async function tutorVerifyDraft(env, cfg, lang, excerpts, nearest, draftText, pr
     try {
       const text = p.kind === 'groq' ? await tutorCallGroq(p, turns) : (p.kind === 'gemini' ? await tutorCallGemini(p, turns, attachment) : await tutorCallWorkersAi(env, p, turns));
       const v = tutorParseVerdict(text);
-      if (v) return { called: true, status: v.status, supported: v.supported, unsupported: v.unsupported };
-      return { called: true, status: 'inconclusive', supported: [], unsupported: [] };
+      if (v) return { called: true, kind: p.kind, status: v.status, supported: v.supported, unsupported: v.unsupported };
+      return { called: true, kind: p.kind, status: 'inconclusive', supported: [], unsupported: [] };
     } catch (e) {}
   }
-  return { called: false, status: 'inconclusive', supported: [], unsupported: [] };
+  return { called: false, kind: null, status: 'inconclusive', supported: [], unsupported: [] };
 }
 async function tutorVerifyLog(env, outcome) {
   const key = 'tutor:verify:' + todayVancouver();
@@ -10992,11 +10995,16 @@ async function handleRequest(request, env, ctx) {
         turns.push({ role: 'user', text: message });
         let usedS = usedStudent, usedG = usedGlobal;
         const budgetLeft = function () { return usedS < caps.perStudent && usedG < caps.global; };
-        const spendUnit = async function () { usedS = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne); usedG = await tutorUsageBump(env, 'tutor:usage:' + day + ':_global'); };
+        // Pack TutorCredits (2026-11-11): spendUnit ALSO records
+        // which provider served the successful call under
+        // tutor:usage:<day>:prov:<kind> — observability only; the
+        // budget semantics (success-only, same student/global
+        // counters, same caps) are unchanged.
+        const spendUnit = async function (kind) { usedS = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne); usedG = await tutorUsageBump(env, 'tutor:usage:' + day + ':_global'); if (kind) { try { await tutorUsageBump(env, 'tutor:usage:' + day + ':prov:' + kind); } catch (e) {} } };
         let out = null;
         try { out = await tutorCallChain(env, cfg, turns, attachment); } catch (e) { out = null; }
         if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
-        await spendUnit();
+        await spendUnit(out.kind);
         let stripped = tutorStripMisconception(out.text);
         let concept = stripped.concept;
         // SCAN fix (2026-11-11): a draft that is ONLY the hidden
@@ -11019,7 +11027,7 @@ async function handleRequest(request, env, ctx) {
           const v1res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply, out.kind, attachment);
           if (!v1res.called) { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
           else {
-            await spendUnit();
+            await spendUnit(v1res.kind);
             if (v1res.status === 'clean') { verifyOutcome = 'clean'; await tutorVerifyLog(env, 'clean'); }
             else if (v1res.status === 'inconclusive') { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
             else {
@@ -11030,7 +11038,7 @@ async function handleRequest(request, env, ctx) {
                 let out2 = null;
                 try { out2 = await tutorCallChain(env, cfg, strictTurns, attachment); } catch (e) { out2 = null; }
                 if (out2) {
-                  await spendUnit();
+                  await spendUnit(out2.kind);
                   const s2 = tutorStripMisconception(out2.text);
                   const reply2 = s2.text || ''; // SCAN fix: an empty regeneration (concept line only) is never shipped raw either
                   let accepted = !!s2.text;
@@ -11038,7 +11046,7 @@ async function handleRequest(request, env, ctx) {
                   if (accepted && budgetLeft()) {
                     const v2res = await tutorVerifyDraft(env, cfg, lang, ret.strong, ret.nearest, reply2, out2.kind, attachment);
                     if (v2res.called) {
-                      await spendUnit();
+                      await spendUnit(v2res.kind);
                       rechecked = true;
                       if (v2res.status === 'unsupported') { trimmedFrom = v2res; accepted = false; }
                       else if (v2res.status === 'inconclusive') accepted = false; // SCAN fix (2026-11-11): an inconclusive re-check must not wave through a rewrite of a draft the FIRST verdict already flagged
@@ -13769,7 +13777,51 @@ async function handleRequest(request, env, ctx) {
         downExcerptsI.sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); });
         const vcI = tutorVoiceCfg(await tutorCfg(env));
         const voiceUsedTodayI = await tutorUsageCount(env, 'tutor:voiceusage:' + todayVancouver() + ':_global');
-        return json({ ok: true, days: daysI, gaps: { total7d: gapsTotalI, byReason: gapsByReasonI, recent: recentGapsI.slice(0, 20) }, feedback: { up: fbUpI, down: fbDownI, downExcerpts: downExcerptsI.slice(0, 10) }, verify: verifyI, voice: { enabled: vcI.enabled, hasKey: vcI.hasKey, dailyCapPerStudent: vcI.dailyCap, usageTodayGlobal: voiceUsedTodayI } }, 200, origin);
+        // Pack TutorCredits (2026-11-11): the chat-credit read Erfan
+        // asked for («میزان کردیت چت اکادمی») — today's counted units
+        // against the caps, split by serving provider, how many
+        // distinct students spent them, verification calls, voice
+        // usage, a 7-day strip and today's top students. Every number
+        // comes from the worker's OWN counters (tutor:usage:* /
+        // tutor:verify:* / tutor:voiceusage:*): provider-side quota
+        // balances (Groq/Gemini dashboards) are not API-readable, so
+        // the counted units are the source of truth. All usage keys
+        // are Vancouver days (todayVancouver()). Pre-provisioning the
+        // block is honest zeros + configured:false — never an error.
+        const cfgI = await tutorCfg(env);
+        const capsI = tutorCaps(cfgI);
+        const todayI = daysI[0];
+        const perProviderI = {};
+        for (const kindI of ['groq', 'gemini', 'workers-ai']) { const nI = await tutorUsageCount(env, 'tutor:usage:' + todayI + ':prov:' + kindI); if (nI > 0) perProviderI[kindI] = nI; }
+        const usageByStudentI = {};
+        try {
+          let cursorI = undefined;
+          do {
+            const pageI = await env.LEADS.list({ prefix: 'tutor:usage:' + todayI + ':', limit: 1000, cursor: cursorI });
+            for (const kI of (pageI.keys || [])) {
+              const suffixI = kI.name.slice(('tutor:usage:' + todayI + ':').length);
+              if (!suffixI || suffixI === '_global' || suffixI.indexOf('prov:') === 0) continue;
+              usageByStudentI[suffixI] = await tutorUsageCount(env, kI.name);
+            }
+            cursorI = pageI.list_complete ? undefined : pageI.cursor;
+          } while (cursorI);
+        } catch (e) {}
+        const topStudentsI = Object.keys(usageByStudentI).map(function (emI) { return { email: emI, units: usageByStudentI[emI] }; }).filter(function (xI) { return xI.units > 0; }).sort(function (aI, bI) { return bI.units - aI.units || (aI.email < bI.email ? -1 : 1); }).slice(0, 10);
+        const verifyCallsOfI = function (vv) { return vv ? ((vv.clean | 0) + (vv.regenerated | 0) + (vv.trimmed | 0) + (vv.inconclusive | 0)) : 0; };
+        const last7I = [];
+        for (const dy7 of daysI) {
+          let vv7 = null; try { vv7 = await env.LEADS.get('tutor:verify:' + dy7, { type: 'json' }); } catch (e) {}
+          last7I.push({ day: dy7, globalUsed: await tutorUsageCount(env, 'tutor:usage:' + dy7 + ':_global'), verifyCalls: verifyCallsOfI(vv7) });
+        }
+        let verifyTodayRecI = null; try { verifyTodayRecI = await env.LEADS.get('tutor:verify:' + todayI, { type: 'json' }); } catch (e) {}
+        const creditsI = {
+          configured: tutorReady(cfgI),
+          today: { day: todayI, globalUsed: await tutorUsageCount(env, 'tutor:usage:' + todayI + ':_global'), globalCap: capsI.global, studentsActiveToday: Object.keys(usageByStudentI).filter(function (emI) { return usageByStudentI[emI] > 0; }).length, perProvider: perProviderI, verifyCalls: verifyCallsOfI(verifyTodayRecI), voiceUsed: voiceUsedTodayI },
+          last7: last7I,
+          topStudentsToday: topStudentsI,
+          caps: { perStudentDay: capsI.perStudent, globalDay: capsI.global }
+        };
+        return json({ ok: true, days: daysI, gaps: { total7d: gapsTotalI, byReason: gapsByReasonI, recent: recentGapsI.slice(0, 20) }, feedback: { up: fbUpI, down: fbDownI, downExcerpts: downExcerptsI.slice(0, 10) }, verify: verifyI, voice: { enabled: vcI.enabled, hasKey: vcI.hasKey, dailyCapPerStudent: vcI.dailyCap, usageTodayGlobal: voiceUsedTodayI }, credits: creditsI }, 200, origin);
       }
       if (path === '/api/admin/academy/tutor-seed' && request.method === 'POST') {
         // Corpus seeding (Pack Tutor): the operator's build script
