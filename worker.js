@@ -3768,6 +3768,63 @@ async function academyB2Probe(env) {
   const msg = mm ? mm[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '';
   return { ok: false, status: resp.status, code: cm[1], message: msg };
 }
+async function academyB2ProbeVariant(env, variant) {
+  // Pack B2Probe2 (2026-11-12): signing-variant bisect for the
+  // B2Probe diagnostic. Bodyless OBJECT requests (GET/HEAD on
+  // /bucket/<key>) fail with SignatureDoesNotMatch while PUT
+  // (with body) and LIST (bucket path + query) sign fine — with
+  // the same proven-good key. This rebuilds the probe's signed
+  // GET with exactly ONE element changed per variant so the
+  // parent can bisect which request shape B2 accepts:
+  //   1 control — byte-for-byte the academyB2Request probe shape
+  //      (signed host + x-amz-content-sha256 = empty-body hash +
+  //      x-amz-date; Range bytes=0-0 signed AND sent).
+  //   2 — no x-amz-content-sha256 anywhere (not signed, not sent).
+  //   3 — x-amz-content-sha256 = 'UNSIGNED-PAYLOAD' (signed + sent).
+  //   4 — 'host' NOT in SignedHeaders (the URL's host unchanged;
+  //      no manual Host header is sent).
+  //   5 — no Range at all (plain GET; nothing signed or sent).
+  //   6 — Range SENT but NOT signed (fetch-init header only).
+  // Self-contained on purpose: academyB2Sign /
+  // academyB2Sha256HexBytes / academyB2AmzDates are reused, but
+  // academyB2Request and every production path stay untouched.
+  // Result shapes mirror academyB2Probe plus the variant echo;
+  // never headers, credentials or the signed URL.
+  const fail0 = { ok: false, status: 0, code: 'fetch_failed', variant: variant };
+  const cfg = await academyB2Cfg(env);
+  if (!academyB2Ready(cfg)) return fail0;
+  const bucket = String(cfg.bucket || ACADEMY_B2_BUCKET);
+  const host = String(cfg.endpoint || ACADEMY_B2_ENDPOINT);
+  const region = host.split('.')[1] || ACADEMY_B2_REGION;
+  const path = '/' + bucket + '/media/m5-l1/en/master.m3u8';
+  const emptyHash = await academyB2Sha256HexBytes(new Uint8Array(0));
+  const dates = academyB2AmzDates(Date.now());
+  const signedHeaders = { 'host': host, 'x-amz-content-sha256': emptyHash, 'x-amz-date': dates.amz, 'range': 'bytes=0-0' };
+  let payloadHash = emptyHash;
+  let sendRange = true;
+  if (variant === 2) { delete signedHeaders['x-amz-content-sha256']; }
+  if (variant === 3) { signedHeaders['x-amz-content-sha256'] = 'UNSIGNED-PAYLOAD'; payloadHash = 'UNSIGNED-PAYLOAD'; }
+  if (variant === 4) { delete signedHeaders['host']; }
+  if (variant === 5) { delete signedHeaders['range']; sendRange = false; }
+  if (variant === 6) { delete signedHeaders['range']; }
+  let signed;
+  try {
+    signed = await academyB2Sign(cfg, { method: 'GET', host: host, region: region, path: path, query: [], signedHeaders: signedHeaders, payloadHash: payloadHash, nowMs: Date.now() });
+  } catch (e) { return fail0; }
+  const init = { method: 'GET', headers: signed.headers };
+  if (sendRange) init.headers['Range'] = 'bytes=0-0';
+  let resp;
+  try { resp = await fetch(signed.url, init); } catch (e) { return fail0; }
+  if (!resp) return fail0;
+  if (resp.status === 200 || resp.status === 206) return { ok: true, status: resp.status, variant: variant };
+  let body = '';
+  try { body = await resp.text(); } catch (e) {}
+  const cm = /<Code>([^<]*)<\/Code>/.exec(body);
+  if (!cm) return { ok: false, status: resp.status, code: 'unparsed', variant: variant };
+  const mm = /<Message>([^<]*)<\/Message>/.exec(body);
+  const msg = mm ? mm[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+  return { ok: false, status: resp.status, code: cm[1], message: msg, variant: variant };
+}
 async function academyB2Head(env, key) {
   let resp;
   try { resp = await academyB2Request(env, 'HEAD', key, {}); } catch (e) { return null; }
@@ -15681,9 +15738,18 @@ async function handleRequest(request, env, ctx) {
         // instead of surfacing as a silent playback 404. Admission
         // is unchanged (the admin gate above), and without probe=1
         // the response is exactly the shape it has always been.
+        // Pack B2Probe2 (2026-11-12): a strict v='1'..'6' alongside
+        // probe=1 runs academyB2ProbeVariant instead — the same
+        // signed read with one signing element changed per variant
+        // (see the helper) — and the probe result gains a `variant`
+        // echo. Any other v (or none) keeps the B2Probe behaviour
+        // exactly, including the response shape.
         const cfg = (await env.LEADS.get('cfg:b2', { type: 'json' })) || {};
         const out = { ok: true, configured: !!(cfg.keyId && cfg.appKey), keyIdConfigured: !!cfg.keyId, appKeyConfigured: !!cfg.appKey, bucket: cfg.bucket || null, endpoint: cfg.endpoint || null, provisionedAt: cfg.provisionedAt || null };
-        if (url.searchParams.get('probe') === '1') out.probe = await academyB2Probe(env);
+        if (url.searchParams.get('probe') === '1') {
+          const pv = url.searchParams.get('v');
+          out.probe = (pv === '1' || pv === '2' || pv === '3' || pv === '4' || pv === '5' || pv === '6') ? await academyB2ProbeVariant(env, Number(pv)) : await academyB2Probe(env);
+        }
         return json(out, 200, origin);
       }
       // Object transfer through the worker (the worker is the only
