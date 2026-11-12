@@ -81,7 +81,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2', 'tutor']; // Pack Tutor (2026-11-11): 'tutor' added — cfg:tutor holds {providers:[{kind:'groq'|'gemini'|'workers-ai', model, apiKey?}], perStudentDaily?, globalDaily?, provisionedAt} for the Academy Learning Assistant's OWN free-provider chain — completely separate from the site Brain (its keys/budgets live in the ai-chat worker; nothing is shared); written ONLY via the one-shot session-gated /api/admin/academy/tutor-provision route (409 once set unless replace:true; values never returned or logged), the cfg:mail posture. Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (hello@ehrealtybc.com, scoped to that domain only); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2', 'tutor']; // Pack Tutor (2026-11-11): 'tutor' added — cfg:tutor holds {providers:[{kind:'groq'|'gemini'|'workers-ai', model, apiKey?}], perStudentDaily?, globalDaily?, provisionedAt} for the Academy Learning Assistant's OWN free-provider chain — completely separate from the site Brain (its keys/budgets live in the ai-chat worker; nothing is shared); written ONLY via the one-shot session-gated /api/admin/academy/tutor-provision route (409 once set unless replace:true; values never returned or logged), the cfg:mail posture. Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (scoped to the ehrealtybc.com domain only; senders per the 2026-11-11 split: news@ehrealtybc.com default, academy@ehrealtybc.com for Academy mail; the retired hello@ identity must never be used); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -232,7 +232,24 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/admin/academy/booklet-seed-proxy'],
   // BookletFix (2026-11-11): the student-session mint writes only its
   // own stok: record — not portal-listed data.
-  ['POST', '/api/academy/student-session']
+  ['POST', '/api/academy/student-session'],
+  // Pack AcademyBuildA (2026-11-11): the password-auth + H3 sync +
+  // server-grading writes land only on the caller's own academy keys
+  // (stok:/ac*/tutor:/academy:snap:/acquiz:/acsetpw:) or the diag
+  // lead key; none of them is portal-listed data. The invite-link
+  // route writes only the acsetpw: token + its audit entry.
+  ['POST', '/api/academy/student-login'],
+  ['POST', '/api/academy/student-logout'],
+  ['POST', '/api/academy/student-set-password'],
+  ['POST', '/api/academy/student-change-password'],
+  ['POST', '/api/academy/quiz/serve'],
+  ['POST', '/api/academy/quiz/answer'],
+  ['POST', '/api/academy/quiz/finish'],
+  ['POST', '/api/academy/review/answer'],
+  ['POST', '/api/academy/progress-sync'],
+  ['POST', '/api/academy/progress-snapshot'],
+  ['POST', '/api/academy/diag-lead'],
+  ['POST', '/api/admin/academy/student-invite-link']
 ];
 function genBumpExempt(method, path) {
   for (let i = 0; i < GEN_BUMP_EXEMPT.length; i++) {
@@ -2414,7 +2431,7 @@ async function queueMail(env, item, opts) {
 /* ================= Mail SEND path (Pack MailSend, 2026-11-10) =====
    Erfan activated mail for the site 2026-11-10 and resolved the D4
    sender decision: the dedicated domain + Resend — from
-   "EH Realty <hello@ehrealtybc.com>" via EH Realty's OWN Resend key
+   "EH Realty <news@ehrealtybc.com>" (newsletter + general site mail) and "EH Realty Academy <academy@ehrealtybc.com>" (Academy mail) via EH Realty's OWN Resend key — the sender split ruled by Erfan 2026-11-11, superseding D4; the retired hello@ identity must never be used
    (Sending access, scoped to ehrealtybc.com ONLY, held in KV cfg:mail
    via the one-shot provision route below; never in code, never
    logged). The Smart Table Resend identity/key is a different
@@ -2464,7 +2481,17 @@ async function queueMail(env, item, opts) {
    with an error CLASS only (http_4xx / http_5xx / network /
    bad_response) — provider bodies, which can echo recipient data,
    are never stored on the record or logged. */
-const MAIL_FROM = 'EH Realty <hello@ehrealtybc.com>';
+/* Sender split (Erfan's ruling, 2026-11-11 — supersedes the D4
+   hello@ decision): the retired hello@ identity does not exist and
+   must never be used. MAIL_FROM is the default sender for the
+   newsletter and all general site mail; Academy-originated mail
+   sends from MAIL_FROM_ACADEMY. Selection happens ONCE, in
+   mailFromFor(), keyed on the queue record's kind — any future
+   Academy mail kind MUST be added to MAIL_ACADEMY_KINDS. */
+const MAIL_FROM = 'EH Realty <news@ehrealtybc.com>';
+const MAIL_FROM_ACADEMY = 'EH Realty Academy <academy@ehrealtybc.com>';
+const MAIL_ACADEMY_KINDS = new Set(['academy_invite']);
+function mailFromFor(rec) { return MAIL_ACADEMY_KINDS.has(String((rec && rec.kind) || '')) ? MAIL_FROM_ACADEMY : MAIL_FROM; }
 const MAIL_RESEND_URL = 'https://api.resend.com/emails';
 async function mailCfg(env) { try { return await env.LEADS.get('cfg:mail', { type: 'json' }); } catch (e) { return null; } }
 async function mailSend(env, msg) {
@@ -2475,7 +2502,7 @@ async function mailSend(env, msg) {
     res = await fetch(MAIL_RESEND_URL, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + cfg.apiKey, 'Content-Type': 'application/json', 'User-Agent': 'EHRealty-AdvisorWorker/1.0 (+https://ehrealtybc.com)' },
-      body: JSON.stringify({ from: MAIL_FROM, to: [msg.to], subject: msg.subject, text: msg.text, html: msg.html }),
+      body: JSON.stringify({ from: (msg && msg.from) || MAIL_FROM, to: [msg.to], subject: msg.subject, text: msg.text, html: msg.html }),
       signal: AbortSignal.timeout(15000)
     });
   } catch (e) { return { ok: false, errorClass: 'network' }; }
@@ -2621,7 +2648,7 @@ async function mailReleaseSend(env, mid, ip) {
   await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
   rec.sendState = { state: 'sending', at: new Date().toISOString(), by: 'owner', attempts: attempts };
   await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
-  const out = await mailSend(env, { to: to, subject: subject, text: text, html: mailHtmlFor(rec, text, pnaPostLic) });
+  const out = await mailSend(env, { from: mailFromFor(rec), to: to, subject: subject, text: text, html: mailHtmlFor(rec, text, pnaPostLic) });
   if (!out.ok && out.error === 'not_configured') { // cfg vanished between the check and the call — unwind to plain held-queue state
     rec.sendState = { state: 'held', at: new Date().toISOString(), reason: 'not_configured' };
     await env.LEADS.put('mailq:' + mid, JSON.stringify(rec));
@@ -3482,6 +3509,31 @@ function academyAddMonths(iso, months) {
    presented admin token through the bridge (bridgeAuthed below).
    Record: hidden_files/free-split-plan-2026-11-10.md §2.2/§4. */
 function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; return s === 'academy' || s === 'site' ? s : null; }
+// Pack AcademyBuildE (2026-11-11): course-content freshness stamp.
+// The KV key 'academy:contentUpdatedAt' (ISO string, this deployment's
+// LEADS namespace) records when an admin-side route last changed
+// COURSE CONTENT. It is written ONLY by bumpAcademyContent() calls in
+// the content seed routes (tutor-seed, booklet-seed, internal
+// booklet-seed, booklet-seed-proxy) and read by the public
+// GET /api/academy/content-meta, which powers the "Course content
+// last updated" line on the Academy site and in the student portal.
+// The key is ABSENT until the first content seed lands — the UIs hide
+// the line on null, so no date is ever fabricated. Deliberately NOT
+// bumped by: student-activity writes (progress / quiz / review /
+// tutor chat — students using the course is not a content change),
+// student admin (purge / delete / invite-link), payments and config
+// (stripe-*, *-provision), or B2 media byte moves (b2-object
+// PUT/DELETE run thousands of times per video upload; one stamp
+// write per object would burn the KV write pool — the
+// GEN_BUMP_EXEMPT lesson of 2026-11-10). bumpAcademyContent swallows
+// its own errors: a stamp failure must never fail the content write
+// it rides on.
+async function bumpAcademyContent(env) {
+  try { await env.LEADS.put('academy:contentUpdatedAt', new Date().toISOString()); } catch (e) {}
+}
+async function academyContentUpdatedAt(env) {
+  try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
+}
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
 function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
@@ -3788,13 +3840,230 @@ async function academyAuditScan(env, pred, cap) {
   return out;
 }
 async function academyClearEngineKeys(env, ne) {
-  // §4.6: reset deletes EXACTLY the three engine keys.
-  let removed = 0;
-  for (const p of ['acprogress:', 'acmistakes:', 'acready:']) {
-    if (await env.LEADS.get(p + ne) !== null) removed++;
+  // §4.6 as amended by Scan Line 3 N2 (2026-11-11): reset clears the
+  // three engine keys AND every acattempt: record — attempt history
+  // IS progress, and leaving it behind resurrected "old" quiz/mock
+  // history after a reset the UI describes as a full wipe. (This
+  // supersedes the original §4.6 "attempts are kept" rule and the
+  // PACAD-11a pin that encoded it — see the Build A record.)
+  // Scan L1-L6 second half (QC Round 3, Build A2): the reset ALSO clears
+  // the tutor thread + misconception records — purge (ACADX-39) already
+  // removed them, and the reset contract cannot leave the tutor's memory
+  // of the student behind. academy:snap: stays purge-only (the cohort
+  // snapshot is not progress).
+  const keys = [];
+  for (const p of ['acprogress:', 'acmistakes:', 'acready:', 'tutor:thread:', 'tutor:miscon:']) {
+    if (await env.LEADS.get(p + ne) !== null) keys.push(p + ne);
     await env.LEADS.delete(p + ne);
   }
+  for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 500)) {
+    keys.push(ak.name);
+    await env.LEADS.delete(ak.name);
+  }
+  return { count: keys.length, keys: keys };
+}
+
+/* ================= Pack AcademyBuildA (2026-11-11) =================
+   Student password auth (Addendum 3 — EMAIL + PASSWORD + REMEMBER
+   ME, superseding the email-only session mint), the H3 server-of-
+   truth progress sync + server-graded lesson quizzes, item-3 cohort
+   snapshots, and the Scan Line 1/3 fixes whose route halves live
+   with their handlers (H1/M3/N1/N2/N5/N6). Everything here is
+   ACADEMY family: state lives only in the deployment's own KV
+   (env.LEADS), sessions stay in the stok: keyspace, and entitlement
+   is still re-checked FRESH on every call — the password proves WHO
+   signs in; academyEntitlement still decides WHAT they may do. */
+
+// ---- password store (profile field pw:{…}) ----
+// PBKDF2-SHA256 via WebCrypto only. Iterations: 100,000 — the spec
+// floor and the strongest setting that stays comfortably inside
+// Workers CPU budgets for a once-per-session call (Node WebCrypto
+// benchmark on this VM, 2026-11-11: 100k ≈ 123 ms, 210k ≈ 171 ms,
+// 600k ≈ 684 ms wall). The count is stored PER RECORD and verify
+// uses the record's own count, so the floor can be raised later
+// without invalidating existing hashes. Salt 16 random bytes; hash
+// 32 bytes; both base64. Passwords are never logged, echoed, or
+// stored anywhere else.
+const ACAD_PW_ITER = 100000;
+const ACAD_PW_MIN_LEN = 10;
+const ACAD_SETPW_TTL_MS = 48 * 3600 * 1000;
+const ACAD_SESSION_REMEMBER_MS = 30 * 86400000;
+const ACAD_PORTAL_BASE = 'https://academy.ehrealtybc.com/portal/';
+function acadB64Encode(bytes) { let s = ''; const b = new Uint8Array(bytes); for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); }
+function acadB64Decode(str) { try { const s = atob(String(str || '')); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i); return b; } catch (e) { return new Uint8Array(0); } }
+async function acadPwDerive(password, saltBytes, iter) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(String(password)), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: saltBytes, iterations: iter, hash: 'SHA-256' }, key, 256);
+  return new Uint8Array(bits);
+}
+async function acadPwMake(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await acadPwDerive(password, salt, ACAD_PW_ITER);
+  return { algo: 'PBKDF2-SHA256', iter: ACAD_PW_ITER, salt: acadB64Encode(salt), hash: acadB64Encode(hash), setAt: new Date().toISOString() };
+}
+async function acadPwVerify(password, pw) {
+  if (!pw || pw.algo !== 'PBKDF2-SHA256' || !pw.salt || !pw.hash) return false;
+  const iter = Number.isInteger(pw.iter) && pw.iter >= 1000 ? pw.iter : ACAD_PW_ITER;
+  const want = acadB64Decode(pw.hash);
+  if (want.length !== 32) return false;
+  const got = await acadPwDerive(password, acadB64Decode(pw.salt), iter);
+  return timingSafeEqual(acadB64Encode(got), acadB64Encode(want));
+}
+function acadPwPolicy(password, email) {
+  const p = String(password || '');
+  if (p.length < ACAD_PW_MIN_LEN || p.length > 256) return false;
+  const local = String(email || '').split('@')[0].toLowerCase();
+  if (local && p.toLowerCase() === local) return false;
+  return true;
+}
+
+// ---- student sessions (stok:) ----
+// Issue: token = 64-hex random; stored ONLY as 'stok:' + sha256 →
+// {email, exp, remember, renewedDay}. Default TTL 24h (as before);
+// remember=true → 30 days with SLIDING renewal (the session refresh
+// route extends exp to a full 30 days, at most once per Vancouver
+// day, tracked by renewedDay).
+async function acadIssueSession(env, ne, remember) {
+  const token = randHex(32);
+  const ttl = remember ? ACAD_SESSION_REMEMBER_MS : STUDENT_SESSION_TTL_MS;
+  const exp = Date.now() + ttl;
+  const newKey = 'stok:' + await sha256hex(token);
+  await env.LEADS.put(newKey, JSON.stringify({ email: ne, exp: exp, remember: !!remember, renewedDay: remember ? todayVancouver() : null }), { expirationTtl: Math.floor(ttl / 1000) });
+  // Pack AcademyProtect (2026-11-11): SINGLE active session per
+  // student — issuing a session retires every earlier one for this
+  // student, so a copied or shared login dies the moment the real
+  // student signs in anywhere (and a sign-in anywhere kills the
+  // previous device). Set-password / change-password already revoked
+  // all sessions before issuing; login now gets the same posture from
+  // inside the issuer itself, so no issue path can leave two live
+  // sessions behind. Owner (tok:) sessions are a different keyspace
+  // and are never touched here.
+  try { await acadRevokeSessions(env, ne, newKey); } catch (e) {}
+  return { token: token, expiresAt: new Date(exp).toISOString(), remember: !!remember };
+}
+async function acadSessionRecord(env, request) {
+  const h = request.headers.get('Authorization') || '';
+  const m = h.match(/^Bearer ([0-9a-f]{64})$/);
+  if (!m) return null;
+  const key = 'stok:' + await sha256hex(m[1]);
+  const rec = await env.LEADS.get(key, { type: 'json' });
+  if (!rec || !rec.email || !(Number(rec.exp) > Date.now())) return null;
+  return { key: key, token: m[1], rec: rec };
+}
+// Revoke EVERY session bound to a student (set-password, change-
+// password, purge). Sessions are keyed by token hash, so this is a
+// bounded prefix scan filtered by the record's email.
+async function acadRevokeSessions(env, ne, exceptKey) {
+  let removed = 0;
+  for (const k of await listAllKeys(env, 'stok:', 1000)) {
+    if (exceptKey && k.name === exceptKey) continue;
+    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) { await env.LEADS.delete(k.name); removed++; }
+  }
   return removed;
+}
+
+// ---- one-time set-password tokens ----
+// 'acsetpw:' + sha256(token) → {email, exp}; 48h TTL, single-use.
+// One live token per student: minting a new one retires the old.
+async function acadMintSetPwToken(env, ne) {
+  for (const k of await listAllKeys(env, 'acsetpw:', 1000)) {
+    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) await env.LEADS.delete(k.name);
+  }
+  const token = randHex(32);
+  const exp = Date.now() + ACAD_SETPW_TTL_MS;
+  await env.LEADS.put('acsetpw:' + await sha256hex(token), JSON.stringify({ email: ne, exp: exp }), { expirationTtl: Math.floor(ACAD_SETPW_TTL_MS / 1000) });
+  return { token: token, expiresAt: new Date(exp).toISOString() };
+}
+
+// ---- server readiness (mirrors engine.js readiness math) ----
+// mastery = mean lesson mastery over acprogress; mocks = recency-
+// weighted mean over acattempt mock-* scores; review = resolvedEver
+// / totalEver (mastery when no mistakes yet); score = .5/.3/.2.
+async function acadReadinessCompute(env, ne) {
+  const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' }).catch(() => null);
+  const lessons = prog && prog.lessons ? Object.values(prog.lessons) : [];
+  const mastery = lessons.length ? Math.round(lessons.reduce(function (s, l) { return s + ((l && l.mastery) || 0); }, 0) / lessons.length) : 0;
+  const mockScores = [];
+  for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 200)) {
+    if (ak.name.slice(('acattempt:' + ne + ':').length).indexOf('mock-') !== 0) continue;
+    const rec = await env.LEADS.get(ak.name, { type: 'json' }).catch(() => null);
+    if (rec && Array.isArray(rec.history)) for (const h of rec.history) if (h && typeof h.score === 'number') mockScores.push({ at: h.at || 0, score: h.score });
+  }
+  mockScores.sort(function (a, b) { return a.at - b.at; });
+  let mocks = 0;
+  if (mockScores.length) { let ws = 0, tot = 0; mockScores.forEach(function (m, i) { const w = i + 1; ws += m.score * w; tot += w; }); mocks = Math.round(ws / tot); }
+  const mk = await tutorLoadMistakes(env, ne);
+  const review = mk.totalEver > 0 ? Math.round((mk.resolvedEver / mk.totalEver) * 100) : mastery;
+  const score = Math.round(0.5 * mastery + 0.3 * mocks + 0.2 * review);
+  return { score: score, components: { mastery: mastery, mocks: mocks, review: review, hasMocks: mockScores.length > 0, lessonsAttempted: lessons.length } };
+}
+// Assessment snapshots ONLY (Scan L1-M2): a snapshot is appended by
+// assessment completions (quiz finish, review answer) — never by a
+// dashboard render — so "≥78 sustained over the last 3 snapshots"
+// means three real assessments, never three page views.
+async function acadSnapshotAppend(env, ne) {
+  const cur = await acadReadinessCompute(env, ne);
+  let rec = await env.LEADS.get('acready:' + ne, { type: 'json' }).catch(() => null);
+  if (!rec || typeof rec !== 'object') rec = { history: [] };
+  if (!Array.isArray(rec.history)) rec.history = [];
+  rec.history.push({ score: cur.score, at: Date.now() });
+  if (rec.history.length > 30) rec.history = rec.history.slice(-30);
+  rec.score = cur.score; rec.components = cur.components; rec.updatedAt = new Date().toISOString();
+  const recent = rec.history.slice(-3);
+  rec.gate = { threshold: 78, sustained: recent.length >= 3 && recent.every(function (h) { return h.score >= 78; }) };
+  await env.LEADS.put('acready:' + ne, JSON.stringify(rec));
+  return rec;
+}
+
+// ---- full student-data purge (Scan Line 3 N1) ----
+// Everything a student accumulates, deleted with the profile: the
+// engine keys (incl. EVERY acattempt: record, via academyClear-
+// EngineKeys), the tutor thread + misconception store, the cohort
+// snapshot, live set-password tokens and live sessions. Before this
+// fix the tutor/acattempt records survived a "delete everything"
+// and resurrected on re-enrolment.
+async function acadPurgeStudentData(env, ne) {
+  const keys = [];
+  const cleared = await academyClearEngineKeys(env, ne);
+  keys.push.apply(keys, cleared.keys);
+  for (const p of ['tutor:thread:', 'tutor:miscon:', 'academy:snap:']) {
+    if (await env.LEADS.get(p + ne) !== null) keys.push(p + ne);
+    await env.LEADS.delete(p + ne);
+  }
+  for (const k of await listAllKeys(env, 'acsetpw:', 1000)) {
+    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) { await env.LEADS.delete(k.name); keys.push(k.name); }
+  }
+  const revoked = await acadRevokeSessions(env, ne, null);
+  return { keys: keys, sessionsRevoked: revoked };
+}
+
+// ---- server grading for portal lesson quizzes (Scan L1-M5/H3) ----
+// Mirrors engine.js semantics EXACTLY, split by flow: a QUIZ answer
+// records a miss (recordMistake — the instant path, so the reviews
+// counter is untouched) and never moves the review ladder on a
+// correct answer; a REVIEW answer runs the ladder (submitReview).
+// tutorGradeBankAnswer is the tutor-practice hybrid and is
+// deliberately NOT used here — parity with the client engine is
+// the contract.
+function acadQuizMistakeWrite(mk, q, chosen, nowMs) {
+  const ex = mk.items.find(function (i) { return i && i.qid === q.id && !i.resolved; });
+  if (ex) { ex.stage = 0; ex.streak = 0; ex.chosen = chosen; ex.at = nowMs; ex.dueAt = nowMs + TUTOR_DAY_MS; }
+  else { mk.items.push({ qid: q.id, lessonId: q.lessonId, moduleId: q.moduleId, concept: q.concept, trap: q.trap || null, chosen: chosen, at: nowMs, stage: 0, dueAt: nowMs + TUTOR_SPACING_DAYS[0] * TUTOR_DAY_MS, streak: 0, resolved: false, resolvedAt: null, reviews: 0 }); mk.totalEver = (mk.totalEver || 0) + 1; }
+}
+function acadGradePayload(q, chosen) {
+  return { correct: chosen === q.correct, correctKey: q.correct, explain: q.explain || '', options: (q.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === q.correct }; }) };
+}
+// Deterministic option shuffle (seeded by attempt+qid): a served
+// question's option order is stable within its own attempt only.
+function acadServedOptions(q, seedStr) {
+  const opts = (q.options || []).slice();
+  let h = tutorHashStr(seedStr);
+  const rnd = function () { h ^= h << 13; h ^= h >>> 17; h ^= h << 5; h >>>= 0; return h / 4294967296; };
+  for (let i = opts.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = opts[i]; opts[i] = opts[j]; opts[j] = t; }
+  return opts.map(function (o) { return { key: o.key, text: o.text }; });
 }
 
 /* ================= Academy Learning Assistant (Pack Tutor, 2026-11-11) =====
@@ -3873,6 +4142,367 @@ async function academyClearEngineKeys(env, ne) {
    X-Booklet-Fallback: en. Seeding: POST
    /api/admin/academy/booklet-seed (admin gate; SERVICE set). */
 const BOOKLET_LANGS = ['en', 'fa', 'hi', 'zh', 'es'];
+// Pack AcademyProtect (2026-11-11): ehPdfStamp — the per-student PDF
+// watermark stamper, inlined verbatim from its production source
+// (hidden_files/eh-pdf-stamp.mjs — the worker ships as ONE file).
+// Pure-JS incremental-update stamper for classic-xref PDFs (the
+// Academy booklets are pypdf output: PDF-1.3, xref table, no object
+// streams). It APPENDS an incremental revision: a Helvetica footer
+// content stream per page (email + date), an invisible forensic
+// marker string per page (text rendering mode 3), and document-info
+// markers (/Keywords + /EHWM). Original bytes are never modified.
+// Returns Uint8Array, or null on ANY anomaly (caller falls back to
+// the original bytes — a stamp failure must never break a serve).
+
+function b2s(bytes) { let s = ''; const CH = 32768; for (let i = 0; i < bytes.length; i += CH) s += String.fromCharCode.apply(null, bytes.subarray(i, i + CH)); return s; }
+function s2b(str) { const b = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) b[i] = str.charCodeAt(i) & 0xff; return b; }
+function escPdfStr(t) { return String(t).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'); }
+
+async function deflateBytes(bytes) {
+  const cs = new CompressionStream('deflate');
+  const stream = new Blob([bytes]).stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// ---- minimal classic-xref machinery ----
+function parseXrefAt(s, pos) {
+  // returns {entries: Map<num,{off,gen,used}>, trailer: string, prev: number|null}
+  if (s.slice(pos, pos + 4) !== 'xref') return null;
+  let i = pos + 4;
+  const entries = new Map();
+  while (true) {
+    while (i < s.length && (s[i] === '\n' || s[i] === '\r' || s[i] === ' ')) i++;
+    if (s.slice(i, i + 7) === 'trailer') { i += 7; break; }
+    const hm = /^(\d+) (\d+)/.exec(s.slice(i, i + 24));
+    if (!hm) return null;
+    const first = parseInt(hm[1], 10), count = parseInt(hm[2], 10);
+    i += hm[0].length;
+    // move to end of header line
+    while (i < s.length && s[i] !== '\n') i++;
+    i++;
+    for (let k = 0; k < count; k++) {
+      const line = s.slice(i, i + 20);
+      const em = /^(\d{10}) (\d{5}) ([nf])/.exec(line);
+      if (!em) return null;
+      entries.set(first + k, { off: parseInt(em[1], 10), gen: parseInt(em[2], 10), used: em[3] === 'n' });
+      i += line.indexOf('\n') + 1;
+    }
+  }
+  while (i < s.length && (s[i] === ' ' || s[i] === '\n' || s[i] === '\r')) i++;
+  const dEnd = dictEnd(s, i);
+  if (dEnd < 0) return null;
+  const trailer = s.slice(i, dEnd);
+  const prevM = /\/Prev\s+(\d+)/.exec(trailer);
+  return { entries: entries, trailer: trailer, prev: prevM ? parseInt(prevM[1], 10) : null };
+}
+function dictEnd(s, start) {
+  // start must point at '<<'; returns index just past the matching '>>' or -1
+  if (s.slice(start, start + 2) !== '<<') return -1;
+  let depth = 0, i = start;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '(') { // literal string — skip with escapes/nesting
+      let d = 1; i++;
+      while (i < s.length && d > 0) { if (s[i] === '\\') i += 2; else if (s[i] === '(') { d++; i++; } else if (s[i] === ')') { d--; i++; } else i++; }
+      continue;
+    }
+    if (c === '<' && s[i + 1] !== '<') { // hex string
+      while (i < s.length && s[i] !== '>') i++;
+      i++; continue;
+    }
+    if (c === '<' && s[i + 1] === '<') { depth++; i += 2; continue; }
+    if (c === '>' && s[i + 1] === '>') { depth--; i += 2; if (depth === 0) return i; continue; }
+    i++;
+  }
+  return -1;
+}
+function objBody(s, entry) {
+  const m = /^(\d+) (\d+) obj\r?\n/.exec(s.slice(entry.off, entry.off + 32));
+  if (!m) return null;
+  const start = entry.off + m[0].length;
+  const end = s.indexOf('endobj', start);
+  if (end < 0) return null;
+  return s.slice(start, end).replace(/\r?\n$/, '');
+}
+function objDict(s, entry) {
+  const body = objBody(s, entry);
+  if (body === null) return null;
+  const ds = body.indexOf('<<');
+  if (ds < 0) return null;
+  const de = dictEnd(body, ds);
+  if (de < 0) return null;
+  return { body: body, dict: body.slice(ds, de), dictStart: ds, dictEnd: de };
+}
+function refOf(text, key) {
+  const m = new RegExp('/' + key + '\\s+(\\d+)\\s+(\\d+)\\s+R').exec(text);
+  return m ? { num: parseInt(m[1], 10), gen: parseInt(m[2], 10) } : null;
+}
+function mediaBoxOf(text) {
+  const m = /\/MediaBox\s*\[\s*([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s*\]/.exec(text);
+  return m ? [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])] : null;
+}
+function mergeFontIntoResources(pageDict, fontRefNum, getObjDict) {
+  // returns the new page-dict text with /Fwm available, or null
+  const fontEntry = '/Fwm ' + fontRefNum + ' 0 R';
+  const ri = pageDict.indexOf('/Resources');
+  if (ri === -1) {
+    return pageDict.replace(/>>\s*$/, ' /Resources << /Font << ' + fontEntry + ' >> >> >>');
+  }
+  const after = pageDict.slice(ri + '/Resources'.length);
+  const refM = /^\s*(\d+)\s+(\d+)\s+R/.exec(after);
+  if (refM) {
+    const target = getObjDict(parseInt(refM[1], 10));
+    if (!target) return null;
+    const merged = mergeFontIntoInner(target.dict.slice(2, -2), fontEntry);
+    if (merged === null) return null;
+    return pageDict.slice(0, ri) + '/Resources <<' + merged + '>>' + pageDict.slice(ri + '/Resources'.length + refM[0].length);
+  }
+  const ds = pageDict.indexOf('<<', ri);
+  if (ds === -1) return null;
+  const de = dictEnd(pageDict, ds);
+  if (de < 0) return null;
+  const inner = pageDict.slice(ds + 2, de - 2);
+  const merged = mergeFontIntoInner(inner, fontEntry);
+  if (merged === null) return null;
+  return pageDict.slice(0, ds + 2) + merged + pageDict.slice(de - 2);
+}
+function mergeFontIntoInner(inner, fontEntry) {
+  const fi = inner.indexOf('/Font');
+  if (fi === -1) return inner + ' /Font << ' + fontEntry + ' >>';
+  const ds = inner.indexOf('<<', fi);
+  if (ds === -1) return null;
+  return inner.slice(0, ds + 2) + ' ' + fontEntry + inner.slice(ds + 2);
+}
+function addContentsRef(pageDict, newRefNum) {
+  const cm = /\/Contents\s+(\d+)\s+(\d+)\s+R/.exec(pageDict);
+  if (cm) return pageDict.replace(cm[0], '/Contents [' + cm[1] + ' ' + cm[2] + ' R ' + newRefNum + ' 0 R]');
+  const am = /\/Contents\s*\[([^\]]*)\]/.exec(pageDict);
+  if (am) return pageDict.replace(am[0], '/Contents [' + am[1] + ' ' + newRefNum + ' 0 R]');
+  if (pageDict.indexOf('/Contents') !== -1) return null; // stream-form contents — bail
+  return pageDict.replace(/>>\s*$/, ' /Contents ' + newRefNum + ' 0 R >>');
+}
+
+async function ehPdfStamp(bytes, opts) {
+  try {
+    const footer = String(opts && opts.footer || '');
+    const marker = String(opts && opts.marker || '');
+    if (!footer || !marker) return null;
+    const s = b2s(bytes);
+    if (s.slice(0, 5) !== '%PDF-') return null;
+    const sxIdx = s.lastIndexOf('startxref');
+    if (sxIdx < 0) return null;
+    const sxM = /startxref\s*(\d+)/.exec(s.slice(sxIdx, sxIdx + 48));
+    if (!sxM) return null;
+    const firstXrefPos = parseInt(sxM[1], 10);
+    // Collect xref entries across the /Prev chain (newest wins).
+    const entries = new Map();
+    let trailer = null, pos = firstXrefPos, guard = 0;
+    while (pos !== null && guard++ < 10) {
+      const xr = parseXrefAt(s, pos);
+      if (!xr) return null;
+      if (!trailer) trailer = xr.trailer;
+      for (const [num, e] of xr.entries) if (!entries.has(num)) entries.set(num, e);
+      pos = xr.prev;
+    }
+    const sizeM = /\/Size\s+(\d+)/.exec(trailer);
+    const size = sizeM ? parseInt(sizeM[1], 10) : 0;
+    const rootRef = refOf(trailer, 'Root');
+    if (!rootRef || !size) return null;
+    const infoRef = refOf(trailer, 'Info');
+    const getEntry = (num) => entries.get(num) || null;
+    const getObjDict = (num) => { const e = getEntry(num); return e && e.used ? objDict(s, e) : null; };
+    const root = getObjDict(rootRef.num);
+    if (!root) return null;
+    const pagesRef = refOf(root.dict, 'Pages');
+    if (!pagesRef) return null;
+    // Walk the Pages tree.
+    const pages = [];
+    const walk = (num, inheritedBox) => {
+      const od = getObjDict(num);
+      if (!od) return false;
+      const box = mediaBoxOf(od.dict) || inheritedBox;
+      if (/\/Type\s*\/Page(?![a-zA-Z])/.test(od.dict)) { pages.push({ num: num, dict: od.dict, body: od.body, dictStart: od.dictStart, dictEnd: od.dictEnd, box: box }); return true; }
+      const kidsM = /\/Kids\s*\[([^\]]*)\]/.exec(od.dict);
+      if (!kidsM) return false;
+      const refs = [...kidsM[1].matchAll(/(\d+)\s+(\d+)\s+R/g)].map(m => parseInt(m[1], 10));
+      for (const k of refs) if (!walk(k, box)) return false;
+      return true;
+    };
+    if (!walk(pagesRef.num, null)) return null;
+    if (!pages.length) return null;
+    // Allocate new object numbers.
+    let next = size;
+    const fontNum = next++;
+    const contentNums = pages.map(() => next++);
+    // Build page content streams.
+    const contentObjs = [];
+    for (let i = 0; i < pages.length; i++) {
+      const box = pages[i].box || [0, 0, 612, 792];
+      const topY = Math.round(box[3] - 14);
+      const text = 'q\nBT /Fwm 7.5 Tf 0.45 g 36 16 Td (' + escPdfStr(footer) + ') Tj ET\n' +
+        'BT /Fwm 1 Tf 3 Tr 36 ' + topY + ' Td (' + escPdfStr(marker) + ') Tj ET\nQ\n';
+      const comp = await deflateBytes(s2b(text));
+      contentObjs.push({ num: contentNums[i], body: '<< /Length ' + comp.length + ' /Filter /FlateDecode >>\nstream\n' + b2s(comp) + '\nendstream', pageIdx: i });
+    }
+    // Assemble the incremental revision.
+    let out = s;
+    if (!out.endsWith('\n')) out += '\n';
+    const newEntries = [];
+    const addRaw = (num, gen, bodyStr) => {
+      const off = out.length;
+      out += num + ' ' + gen + ' obj\n' + bodyStr + '\nendobj\n';
+      newEntries.push({ num: num, gen: gen, off: off });
+    };
+    addRaw(fontNum, 0, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+    for (const co of contentObjs) {
+      addRaw(co.num, 0, co.body);
+      const p = pages[co.pageIdx];
+      let newDict = addContentsRef(p.dict, co.num);
+      if (newDict === null) return null;
+      newDict = mergeFontIntoResources(newDict, fontNum, getObjDict);
+      if (newDict === null) return null;
+      const rest = p.body.slice(p.dictEnd); // '' for dict-only page objects
+      const e = getEntry(p.num);
+      addRaw(p.num, e ? e.gen : 0, newDict + rest);
+    }
+    // Info: rewrite (same number) or create, carrying the markers.
+    let infoNum;
+    if (infoRef) {
+      const io = getObjDict(infoRef.num);
+      if (!io) return null;
+      let d = io.dict;
+      if (/\/EHWM\s*\(/.test(d)) d = d.replace(/\/EHWM\s*\((?:\\.|[^\\()])*\)/, '/EHWM (' + escPdfStr(marker) + ')');
+      else d = d.replace(/^<<\s*/, '<< /EHWM (' + escPdfStr(marker) + ') ');
+      if (/\/Keywords\s*\(/.test(d)) d = d.replace(/\/Keywords\s*\((?:\\.|[^\\()])*\)/, '/Keywords (' + escPdfStr(marker) + ')');
+      else d = d.replace(/^<<\s*/, '<< /Keywords (' + escPdfStr(marker) + ') ');
+      infoNum = infoRef.num;
+      const e = getEntry(infoNum);
+      addRaw(infoNum, e ? e.gen : 0, d + io.body.slice(io.dictEnd));
+    } else {
+      infoNum = next++;
+      addRaw(infoNum, 0, '<< /Producer (pypdf) /Keywords (' + escPdfStr(marker) + ') /EHWM (' + escPdfStr(marker) + ') >>');
+    }
+    // New xref + trailer.
+    const newSize = Math.max(size, next);
+    newEntries.sort((a, b) => a.num - b.num);
+    const xrefOff = out.length;
+    let x = 'xref\n';
+    let runStart = 0;
+    while (runStart < newEntries.length) {
+      let runEnd = runStart;
+      while (runEnd + 1 < newEntries.length && newEntries[runEnd + 1].num === newEntries[runEnd].num + 1) runEnd++;
+      x += newEntries[runStart].num + ' ' + (runEnd - runStart + 1) + '\n';
+      for (let k = runStart; k <= runEnd; k++) x += String(newEntries[k].off).padStart(10, '0') + ' ' + String(newEntries[k].gen).padStart(5, '0') + ' n \n';
+      runStart = runEnd + 1;
+    }
+    x += 'trailer\n<< /Size ' + newSize + ' /Root ' + rootRef.num + ' ' + rootRef.gen + ' R /Info ' + infoNum + ' 0 R /Prev ' + firstXrefPos + ' >>\nstartxref\n' + xrefOff + '\n%%EOF\n';
+    out += x;
+    return s2b(out);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---- Pack AcademyProtect (2026-11-11): harvest-anomaly counters ----
+// Student content access (booklet serves, quiz serves, video-token
+// issues) accumulates IN MEMORY per (Vancouver day, student); a flush
+// writes the day's cumulative count record (acsec:count:<day>:<email>)
+// and, the first time a harvest threshold is crossed, the flag record
+// (acsec:flag:<day>:<email>) the owner portal's Security flags card
+// reads. Flush triggers: 25 pending events, 10 minutes since the last
+// flush, or a NEW threshold reason appearing (that flush is forced
+// immediately, inside the crossing request). One flush costs at most
+// ONE count put + ONE flag put; a quiet student costs zero KV writes.
+// Thresholds (per student, per Vancouver day): > 40 DISTINCT booklets
+// (booklet_harvest); > 15 quiz serves inside any 10 minutes OR > 120
+// quiz serves in the day (quiz_velocity); > 80 video tokens
+// (video_token_flood). State is per-isolate best-effort (a cold
+// isolate re-reads the day's KV records once, on the student's first
+// event); acsecEvent swallows its own errors — counting NEVER blocks
+// or breaks a serve.
+const ACSEC_FLUSH_EVENTS = 25, ACSEC_FLUSH_MS = 10 * 60000, ACSEC_QUIZ_WINDOW_MS = 10 * 60000;
+const ACSEC_BOOKLET_DISTINCT_MAX = 40, ACSEC_QUIZ_10MIN_MAX = 15, ACSEC_QUIZ_DAY_MAX = 120, ACSEC_VIDEO_DAY_MAX = 80;
+const acsecState = new Map(); // '<day>|<email>' -> state
+function acsecBlank(day, ne) {
+  return { day: day, email: ne, loaded: false, bookletGets: 0, booklets: new Set(), quizServes: 0, quizTimes: [], videoTokens: 0, reasons: new Set(), flushedReasons: new Set(), pending: 0, lastFlush: Date.now() };
+}
+function acsecStateFor(ne) {
+  const day = todayVancouver();
+  const key = day + '|' + ne;
+  let st = acsecState.get(key);
+  if (!st) {
+    st = acsecBlank(day, ne);
+    acsecState.set(key, st);
+    if (acsecState.size > 500) { for (const k of acsecState.keys()) { if (k !== key) acsecState.delete(k); if (acsecState.size <= 250) break; } }
+  }
+  return st;
+}
+async function acsecLoad(env, st) {
+  if (st.loaded) return st;
+  st.loaded = true;
+  try {
+    const rec = await env.LEADS.get('acsec:count:' + st.day + ':' + st.email, { type: 'json' });
+    if (rec) {
+      st.bookletGets = Number(rec.bookletGets) || 0;
+      for (const b of (Array.isArray(rec.booklets) ? rec.booklets : [])) st.booklets.add(String(b));
+      st.quizServes = Number(rec.quizServes) || 0;
+      st.videoTokens = Number(rec.videoTokens) || 0;
+    }
+    const fl = await env.LEADS.get('acsec:flag:' + st.day + ':' + st.email, { type: 'json' });
+    if (fl && Array.isArray(fl.reasons)) for (const r of fl.reasons) { st.reasons.add(String(r)); st.flushedReasons.add(String(r)); }
+  } catch (e) {}
+  return st;
+}
+function acsecReasons(st) {
+  if (st.booklets.size > ACSEC_BOOKLET_DISTINCT_MAX) st.reasons.add('booklet_harvest');
+  if (st.quizServes > ACSEC_QUIZ_DAY_MAX) st.reasons.add('quiz_velocity');
+  if (st.videoTokens > ACSEC_VIDEO_DAY_MAX) st.reasons.add('video_token_flood');
+  return st.reasons;
+}
+async function acsecFlush(env, st, force) {
+  const now = Date.now();
+  if (!force && st.pending < ACSEC_FLUSH_EVENTS && (now - st.lastFlush) < ACSEC_FLUSH_MS) return false;
+  const reasons = acsecReasons(st);
+  const newReason = [...reasons].some(function (r) { return !st.flushedReasons.has(r); });
+  try {
+    await env.LEADS.put('acsec:count:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, bookletGets: st.bookletGets, booklets: [...st.booklets], quizServes: st.quizServes, videoTokens: st.videoTokens, updatedAt: new Date().toISOString() }), { expirationTtl: 90 * 86400 });
+    if (newReason) {
+      await env.LEADS.put('acsec:flag:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, reasons: [...reasons], flaggedAt: new Date().toISOString() }), { expirationTtl: 90 * 86400 });
+      st.flushedReasons = new Set(reasons);
+    }
+  } catch (e) { return false; }
+  st.pending = 0; st.lastFlush = now;
+  return true;
+}
+async function acsecEvent(env, ne, kind, detail) {
+  try {
+    if (!ne) return;
+    const st = await acsecLoad(env, acsecStateFor(ne));
+    if (kind === 'booklet') { st.bookletGets++; if (detail) st.booklets.add(String(detail)); }
+    else if (kind === 'quiz') {
+      const now = Date.now();
+      st.quizServes++;
+      st.quizTimes.push(now);
+      st.quizTimes = st.quizTimes.filter(function (t) { return now - t < ACSEC_QUIZ_WINDOW_MS; });
+      if (st.quizTimes.length > ACSEC_QUIZ_10MIN_MAX) st.reasons.add('quiz_velocity');
+    }
+    else if (kind === 'video') { st.videoTokens++; }
+    st.pending++;
+    const reasons = acsecReasons(st);
+    const crossed = [...reasons].some(function (r) { return !st.flushedReasons.has(r); });
+    if (crossed || st.pending >= ACSEC_FLUSH_EVENTS || (Date.now() - st.lastFlush) >= ACSEC_FLUSH_MS) await acsecFlush(env, st, crossed);
+  } catch (e) {}
+}
+// Booklet stamp identity (Pack AcademyProtect): the visible footer and
+// the forensic EHWM1 marker both bind the copy to ONE student + the
+// Vancouver serve day. The sample edition binds to 'SAMPLE' instead —
+// never to a student identity.
+function acadB64Id(str) { try { return btoa(String(str)).replace(/=+$/, ''); } catch (e) { return ''; } }
+function acadBookletFooter(email) { return 'EH REALTY ACADEMY · Licensed to ' + email + ' · ' + todayVancouver() + ' · Do not distribute'; }
+function acadBookletMarker(email) { return 'EHWM1.' + acadB64Id(email + '|' + todayVancouver()); }
+function acadBookletSampleFooter() { return 'EH REALTY ACADEMY · SAMPLE edition · ' + todayVancouver() + ' · Do not distribute'; }
+function acadBookletSampleMarker() { return 'EHWM1.' + acadB64Id('SAMPLE|' + todayVancouver()); }
+
 function bookletB64Decode(b64) {
   try {
     const bin = atob(String(b64).replace(/\s/g, ''));
@@ -4052,6 +4682,15 @@ async function tutorUsageCount(env, key) {
   try { const v = await env.LEADS.get(key, { type: 'json' }); return v && Number.isInteger(v.count) && v.count > 0 ? v.count : 0; } catch (e) { return 0; }
 }
 async function tutorUsageBump(env, key) {
+  // Scan L1-L2 — DOCUMENTED ACCEPTANCE (QC Round 3 §11, Build A2 record):
+  // this read-modify-write is NOT atomic; two truly concurrent turns for
+  // the same student can undercount by a unit. Accepted deliberately: the
+  // counters guard a free-tier internal tool's daily caps (they are not
+  // billing), the providers' own free-tier limits still bind downstream,
+  // and KV offers no compare-and-swap — serialising through the thread
+  // record would couple unrelated routes (chat/quiz/debrief/voice all
+  // bump student+global+provider keys) to one hot record without
+  // eliminating the cross-key race anyway.
   const n = (await tutorUsageCount(env, key)) + 1;
   try { await env.LEADS.put(key, JSON.stringify({ count: n }), { expirationTtl: 3 * 86400 }); } catch (e) {}
   return n;
@@ -9392,9 +10031,15 @@ async function handleRequest(request, env, ctx) {
       const dcur = await env.LEADS.get(dkey);
       if (dcur === null || dcur === undefined) return json({ ok: true, deleted: false }, 200, origin);
       await env.LEADS.delete(dkey);
+      // Pack AcademyBuildA (Scan L3-N1): "delete everything" now
+      // means everything — engine keys incl. acattempt:, the tutor
+      // thread + misconceptions, the cohort snapshot, set-password
+      // tokens and live sessions go with the profile, so nothing
+      // resurrects if the same email re-enrols later.
+      const dpurged = await acadPurgeStudentData(env, dne);
       const dafter = await env.LEADS.get(dkey);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
-      return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined }, 200, origin);
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', keysRemoved: dpurged.keys.length, sessionsRevoked: dpurged.sessionsRevoked } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined, keysRemoved: dpurged.keys.length }, 200, origin);
     }
     /* Pack BookletView (2026-11-11): booklet seed, INTERNAL family —
        the mirror of student-delete above. The direct seed route
@@ -9437,6 +10082,7 @@ async function handleRequest(request, env, ctx) {
       const backBytes = bookletB64Decode((await env.LEADS.get(bkey)) || '');
       const storedSha256 = backBytes ? await bookletBytesSha256(backBytes) : null;
       try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      await bumpAcademyContent(env);
       return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
     }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
@@ -9450,7 +10096,11 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
+    // Pack AcademyBuildA2 (Finding 7, QC Round 3 addendum): tutor-seed rides the
+    // 6 MiB cap above — the compiled EN index part is ~151 KB, far past the
+    // 32 KB default that used to 413 it before the handler ran; the handler's
+    // own 2,500,000-char per-part ceiling stays the real limit.
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -10795,7 +11445,6 @@ async function handleRequest(request, env, ctx) {
       // HMAC token is the credential at playback. Deliberately BEFORE
       // the admin gate, same posture as the Stripe webhook.
       if (path === '/api/academy/video-token' && (request.method === 'POST' || request.method === 'GET')) {
-        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         if (limited('acadvid:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = {};
         if (request.method === 'POST') { try { d = (await request.json()) || {}; } catch (e) { d = {}; } }
@@ -10807,11 +11456,39 @@ async function handleRequest(request, env, ctx) {
         // the identity rides the request (the Track C student engine
         // keys identity by email) and the session above is the
         // credential; entitlement is checked FRESH against KV.
-        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
         if (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
         if (ACADEMY_VIDEO_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
         const cfgV = await academyVideoCfg(env);
         if (!cfgV || !cfgV.tokenSecret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const nowMs = Date.now();
+        // Pack AcademyBuildA (2026-11-11) — SAMPLE LESSON ALLOWANCE:
+        // {sample:true} for lesson m5-l1 / lang en ONLY mints a
+        // public sample token with NO enrolment and NO session: the
+        // claims carry scope:'sample' + wm 'SAMPLE', the same ≤10-min
+        // TTL, and the serve route re-enforces the scope against
+        // exactly m5-l1/en. Every other lesson/lang/kind is refused.
+        if (d.sample === true || q.get('sample') === '1') {
+          if (lessonId !== 'm5-l1' || lang !== 'en') return json({ ok: false, error: 'sample_not_allowed' }, 403, origin);
+          const sClaims = { sub: 'sample', lesson: lessonId, lang: lang, exp: nowMs + ACADEMY_VIDEO_TOKEN_TTL_MS, wm: 'SAMPLE', scope: 'sample' };
+          const sToken = await academyVideoMintToken(String(cfgV.tokenSecret), sClaims);
+          try {
+            const dayKeyS = 'academy:watch:' + todayVancouver().replace(/-/g, '');
+            const curS = (await env.LEADS.get(dayKeyS, { type: 'json' })) || { tokens: 0, students: {} };
+            curS.tokens = (curS.tokens || 0) + 1;
+            curS.students = curS.students || {};
+            curS.students.sample = (curS.students.sample || 0) + 1;
+            await env.LEADS.put(dayKeyS, JSON.stringify(curS), { expirationTtl: 90 * 86400 });
+          } catch (e) {}
+          return json({ ok: true, token: sToken, expiresAt: new Date(sClaims.exp).toISOString(), playlistUrl: '/api/academy/video/' + lessonId + '/' + lang + '/master.m3u8?t=' + sToken, wm: 'SAMPLE', sample: true }, 200, origin);
+        }
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        // Scan L1-H1 fix (Pack AcademyBuildA): admission is the owner
+        // session OR a student session bound to this email (the
+        // tutorAdmit pattern every tutor route already uses). Before
+        // this fix the route admitted ONLY authed(), while the portal
+        // presents its stok: token — every real student was 401'd and
+        // playback would have failed at AUTH even with cfg:b2 live.
+        if (!(await authed(request, env)) && !(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         // THE gate (spec §2.2/§4): readOnly:false — an expired profile
         // gets NO token even inside the 7-day read grace; blocked is
         // refused at the predicate, so a block bites within one TTL.
@@ -10821,21 +11498,23 @@ async function handleRequest(request, env, ctx) {
           if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
           return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
         }
-        const nowMs = Date.now();
         const sub = (await sha256hex(normEmail(email))).slice(0, 16);
         const wm = sub.slice(0, 10); // spec §5: watermark id = email-hash prefix
         const claims = { sub: sub, lesson: lessonId, lang: lang, exp: nowMs + ACADEMY_VIDEO_TOKEN_TTL_MS, wm: wm };
         const token = await academyVideoMintToken(String(cfgV.tokenSecret), claims);
         // Spec §5 access log: one aggregate counter per day (no
         // per-request records; anomaly review reads the daily totals).
+        // Scan L1-L4: the day key is a VANCOUVER day (todayVancouver),
+        // like every other academy counter — it was a UTC day.
         try {
-          const dayKey = 'academy:watch:' + new Date(nowMs).toISOString().slice(0, 10).replace(/-/g, '');
+          const dayKey = 'academy:watch:' + todayVancouver().replace(/-/g, '');
           const cur = (await env.LEADS.get(dayKey, { type: 'json' })) || { tokens: 0, students: {} };
           cur.tokens = (cur.tokens || 0) + 1;
           cur.students = cur.students || {};
           cur.students[sub] = (cur.students[sub] || 0) + 1;
           await env.LEADS.put(dayKey, JSON.stringify(cur), { expirationTtl: 90 * 86400 });
         } catch (e) {}
+        await acsecEvent(env, normEmail(email), 'video'); // Pack AcademyProtect: harvest counter on entitled token issues (the public sample path above is never counted)
         const base = '/api/academy/video/' + lessonId + '/' + lang + '/master.m3u8?t=' + token;
         return json({ ok: true, token: token, expiresAt: new Date(claims.exp).toISOString(), playlistUrl: base, wm: 'EH·' + wm }, 200, origin);
       }
@@ -10846,6 +11525,11 @@ async function handleRequest(request, env, ctx) {
         const vclaims = await academyVideoVerifyToken(String(cfgV2.tokenSecret), url.searchParams.get('t') || '', Date.now());
         if (!vclaims) return json({ ok: false, error: 'invalid_token' }, 403, origin);
         if (vclaims.lesson !== vm[1] || vclaims.lang !== vm[2]) return json({ ok: false, error: 'token_mismatch' }, 403, origin);
+        // Pack AcademyBuildA: a SAMPLE-scoped token serves m5-l1/en
+        // and NOTHING else — re-enforced here, not just at mint, so
+        // no sample token can ever be replayed against another
+        // lesson or language.
+        if (vclaims.scope === 'sample' && !(vclaims.lesson === 'm5-l1' && vclaims.lang === 'en')) return json({ ok: false, error: 'token_mismatch' }, 403, origin);
         // Pack AcademyB2Video: the media store is Backblaze B2 behind
         // cfg:b2 (the R2 binding was never provisionable — R2
         // activation needs a payment method). Unprovisioned B2 keeps
@@ -11021,6 +11705,7 @@ async function handleRequest(request, env, ctx) {
         // fails). Any step is skipped when the budget is exhausted —
         // verification never eats the student's answer.
         let verifyOutcome = null;
+        let trimmedSupported = null; // Build A2 (Scan L1-L3): the trim branch's surviving claims, hoisted so the citation step below can prune to them
         if (emptyDraft) { verifyOutcome = 'inconclusive'; await tutorVerifyLog(env, 'inconclusive'); }
         else if (!budgetLeft()) { verifyOutcome = 'skipped_budget'; await tutorVerifyLog(env, 'skipped_budget'); }
         else {
@@ -11060,6 +11745,7 @@ async function handleRequest(request, env, ctx) {
               if (regenOk) { verifyOutcome = 'regenerated'; await tutorVerifyLog(env, 'regenerated'); }
               else {
                 const supported = (trimmedFrom.supported || []).filter(Boolean);
+                trimmedSupported = supported;
                 const note = lang === 'fa' ? 'بخشی از پاسخ را نتوانستم با متن درس تأیید کنم و حذفش کردم.' : 'Part of the answer could not be verified against the lesson excerpts, so I removed it.';
                 reply = supported.length ? supported.join('\n\n') + '\n\n' + note : note + (lang === 'fa' ? ' لطفاً سؤالت را دقیق‌تر بپرس تا فقط از متن درس جواب بدهم.' : ' Please ask the question more precisely and I will answer strictly from the lesson text.');
                 verifyOutcome = 'trimmed'; await tutorVerifyLog(env, 'trimmed');
@@ -11068,7 +11754,48 @@ async function handleRequest(request, env, ctx) {
             }
           }
         }
-        const citations = Array.from(new Set(ret.strong.map(function (e) { return e.id; }))); // v2 can return a concept chunk + the lesson chunk for one lesson — cite it once
+        let citations = Array.from(new Set(ret.strong.map(function (e) { return e.id; }))); // v2 can return a concept chunk + the lesson chunk for one lesson — cite it once
+        if (verifyOutcome === 'trimmed') {
+          // Scan L1-L3 closure (QC Round 3, Build A2): (a) citations follow
+          // the claims that SURVIVED the trim — a strong excerpt is cited
+          // only if it supports at least one surviving claim (claims and
+          // excerpts are plain texts, so support is attributed by shared
+          // content words, the same texts the verifier judged); a claim
+          // with no supporting excerpt left cites nothing. (b) The trimmed
+          // reply still ENDS with a bank-drawn practice check on the topic,
+          // registered exactly like a practice-route draw so
+          // practice-answer grades it — a trimmed turn teaches instead of
+          // just apologising. An unseeded bank skips the append (nothing
+          // may be fabricated).
+          const wordsOfT = function (t) { return new Set(String(t || '').toLowerCase().split(/[^a-z0-9\u0600-\u06FF]+/).filter(function (w) { return w.length >= 4; })); };
+          const keepT = new Set();
+          for (const eT of ret.strong) {
+            const ewT = wordsOfT((eT.title || '') + ' ' + (eT.text || ''));
+            for (const cT of (trimmedSupported || [])) { let hitT = 0; for (const wT of wordsOfT(cT)) if (ewT.has(wT)) hitT++; if (hitT >= 2) { keepT.add(eT.id); break; } }
+          }
+          citations = Array.from(keepT);
+          try {
+            const bixT = await tutorBankIndex(env, lang);
+            if (bixT && bixT.qmeta && Object.keys(bixT.qmeta).length) {
+              let poolT = [];
+              const pcT = String(ret.topConcept || concept || '').trim().toLowerCase();
+              if (pcT) poolT = await tutorBankByConcept(env, lang, pcT);
+              if (!poolT.length && citations.length) poolT = Object.keys(bixT.qmeta).filter(function (x) { return bixT.qmeta[x].l === citations[0]; }).sort();
+              if (poolT.length) {
+                if (!thread.state || typeof thread.state !== 'object') thread.state = {};
+                const exT = new Set(thread.state.practice && thread.state.practice.qid ? [thread.state.practice.qid] : []);
+                const qidT = tutorPickDeterministic(poolT, ne + ':' + (thread.state.practiceCount || 0), exT) || poolT[0];
+                const qT = await tutorBankQuestion(env, lang, qidT);
+                if (qT) {
+                  thread.state.practice = { qid: qT.id, concept: qT.concept, lessonId: qT.lessonId, lang: lang, at: new Date().toISOString() };
+                  thread.state.practiceCount = (thread.state.practiceCount || 0) + 1;
+                  const payT = tutorQuestionPayload(qT);
+                  reply += '\n\n' + (lang === 'fa' ? 'تمرین کوتاه:' : 'Practice check:') + '\n' + payT.stem + '\n' + payT.options.map(function (o) { return o.key + ') ' + o.text; }).join('\n');
+                }
+              }
+            }
+          } catch (e) {}
+        }
         thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
         thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: citations });
         await tutorThreadPut(env, ne, thread, ent.enrolment);
@@ -11109,33 +11836,421 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true }, 200, origin);
       }
 
-      // ---- Academy: student session mint (BookletFix, 2026-11-11).
-      // Own auth, BEFORE the admin gate: the caller's credential at
-      // sign-in IS the enrolment — the portal's identity model keys
-      // the student by email and the gate is academyEntitlement,
-      // checked FRESH here with the booklet posture (readOnly:true —
-      // an in-grace student may hold a session; every protected call
-      // still re-checks entitlement with its own posture, so video
-      // tokens keep refusing grace). Success mints a 64-hex token
-      // stored ONLY as 'stok:' + sha256(token) → {email, exp} (24h,
-      // KV TTL) — see studentAuthed above for why the keyspace is
-      // disjoint from the owner tok: sessions.
+      // ---- Academy: student session (BookletFix lineage; contract
+      // changed by Pack AcademyBuildA, Addendum 3 §4). This route
+      // originally MINTED a stok: session from an email alone (the
+      // caller's credential at sign-in was the enrolment itself).
+      // That mint is now CLOSED: sessions are issued only by
+      // student-login and student-set-password (password auth), and
+      // this route validates + renews the presented session only —
+      // see the route body below.
       if (path === '/api/academy/student-session' && request.method === 'POST') {
         if (limited('acstudsess:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        // Pack AcademyBuildA (Addendum 3 §4): the email-only mint is
+        // CLOSED. This route now only VALIDATES + renews an existing
+        // session — the presented stok: is the credential, and no
+        // token is ever issued from an email claim again (student-
+        // login and student-set-password are the only issuers).
+        // Remember sessions get their sliding renewal here: exp is
+        // extended to a full 30 days, at most once per Vancouver day
+        // (renewedDay), so an active student is never bounced.
+        const sess = await acadSessionRecord(env, request);
+        if (!sess) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let exp = Number(sess.rec.exp);
+        let renewed = false;
+        if (sess.rec.remember) {
+          const today = todayVancouver();
+          if (sess.rec.renewedDay !== today) {
+            exp = Date.now() + ACAD_SESSION_REMEMBER_MS;
+            sess.rec.exp = exp; sess.rec.renewedDay = today;
+            await env.LEADS.put(sess.key, JSON.stringify(sess.rec), { expirationTtl: Math.floor(ACAD_SESSION_REMEMBER_MS / 1000) });
+            renewed = true;
+          }
+        }
+        return json({ ok: true, email: sess.rec.email, expiresAt: new Date(exp).toISOString(), remember: !!sess.rec.remember, renewed: renewed }, 200, origin);
+      }
+
+      // ---- Academy: student password auth (Pack AcademyBuildA,
+      // Addendum 3). Login: the PASSWORD is the credential (PBKDF2
+      // record on the profile); success issues a stok: session —
+      // 24h, or 30 days + sliding renewal with remember:true.
+      // Unknown email and wrong password answer the SAME generic
+      // invalid_credentials (no existence leak — a dummy derive on
+      // the no-record path keeps the timing uniform); an enrolled
+      // profile with no password yet answers password_not_set so
+      // the portal can explain the invite-link path; blocked and
+      // expired surface only AFTER the password checks out.
+      // Lockout: 5 fails per account → 15 minutes (acloginlock:).
+      if (path === '/api/academy/student-login' && request.method === 'POST') {
+        if (limited('acstudlogin:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         let d = {};
-        try { d = (await request.json()) || {}; } catch (e) { d = {}; }
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
         const email = String(d.email || '').trim().toLowerCase();
-        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const password = String(d.password || '');
+        if (!EMAIL_RE.test(email) || !password) return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
+        const ne = normEmail(email);
+        const lockKeyL = 'acloginlock:' + ne;
+        const lock = await env.LEADS.get(lockKeyL, { type: 'json' }).catch(() => null);
+        const nowL = Date.now();
+        if (lock && Number(lock.lockedUntil) > nowL) return json({ ok: false, error: 'locked', retryAfterMin: Math.ceil((Number(lock.lockedUntil) - nowL) / 60000) }, 429, origin);
+        const rec = await academyGet(env, email);
+        if (!rec || !rec.pw) {
+          await acadPwDerive(password, acadB64Decode('AAAAAAAAAAAAAAAAAAAAAA=='), ACAD_PW_ITER); // timing equaliser — result discarded
+          if (!rec) return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
+          return json({ ok: false, error: 'password_not_set' }, 403, origin);
+        }
+        if (!(await acadPwVerify(password, rec.pw))) {
+          const fails = ((lock && Number(lock.fails)) || 0) + 1;
+          const newLock = { fails: fails, lockedUntil: 0 };
+          if (fails >= 5) { newLock.lockedUntil = nowL + 15 * 60000; newLock.fails = 0; }
+          try { await env.LEADS.put(lockKeyL, JSON.stringify(newLock), { expirationTtl: 3600 }); } catch (e) {}
+          if (newLock.lockedUntil) return json({ ok: false, error: 'locked', retryAfterMin: 15 }, 429, origin);
+          return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
+        }
         const ent = await academyEntitlement(env, email, { readOnly: true });
         if (!ent.entitled) {
-          if (ent.error === 'not_enrolled') return json({ error: 'not_enrolled' }, 403, origin);
-          if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
-          return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
+          if (ent.error === 'blocked') return json({ ok: false, error: 'blocked' }, 403, origin);
+          return json({ ok: false, error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
         }
-        const stoken = randHex(32);
-        const sexp = Date.now() + STUDENT_SESSION_TTL_MS;
-        await env.LEADS.put('stok:' + await sha256hex(stoken), JSON.stringify({ email: normEmail(email), exp: sexp }), { expirationTtl: Math.floor(STUDENT_SESSION_TTL_MS / 1000) });
-        return json({ ok: true, token: stoken, expiresAt: new Date(sexp).toISOString() }, 200, origin);
+        try { await env.LEADS.delete(lockKeyL); } catch (e) {}
+        const sess = await acadIssueSession(env, ne, d.remember === true);
+        return json({ ok: true, token: sess.token, expiresAt: sess.expiresAt, remember: sess.remember, email: rec.email, grace: !!ent.grace }, 200, origin);
+      }
+      if (path === '/api/academy/student-logout' && request.method === 'POST') {
+        // Revokes the PRESENTED session (Scan L1-L6): a copied token
+        // stops working at logout, not at its TTL. Always ok:true —
+        // no existence oracle.
+        const sess = await acadSessionRecord(env, request);
+        if (sess) { try { await env.LEADS.delete(sess.key); } catch (e) {} }
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/academy/student-set-password' && request.method === 'POST') {
+        if (limited('acsetpw:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = {};
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const token = String(d.token || '');
+        if (!/^[0-9a-f]{64}$/.test(token)) return json({ ok: false, error: 'invalid_token' }, 400, origin);
+        const tkey = 'acsetpw:' + await sha256hex(token);
+        const trec = await env.LEADS.get(tkey, { type: 'json' }).catch(() => null);
+        if (!trec || !trec.email || !(Number(trec.exp) > Date.now())) return json({ ok: false, error: 'invalid_token' }, 400, origin);
+        const rec = await academyGet(env, trec.email);
+        if (!rec) return json({ ok: false, error: 'invalid_token' }, 400, origin);
+        if (!acadPwPolicy(d.password, rec.email)) return json({ ok: false, error: 'weak_password' }, 400, origin);
+        rec.pw = await acadPwMake(d.password);
+        await academyPut(env, rec);
+        await env.LEADS.delete(tkey); // single-use: the token dies
+        const ne2 = normEmail(rec.email);
+        await acadRevokeSessions(env, ne2, null); // every old session dies
+        try { await env.LEADS.delete('acloginlock:' + ne2); } catch (e) {}
+        const sess = await acadIssueSession(env, ne2, false);
+        return json({ ok: true, token: sess.token, expiresAt: sess.expiresAt, email: rec.email }, 200, origin);
+      }
+      if (path === '/api/academy/student-change-password' && request.method === 'POST') {
+        if (limited('acchpw:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = {};
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const sess = await acadSessionRecord(env, request);
+        if (!sess) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const rec = await academyGet(env, sess.rec.email);
+        if (!rec || !rec.pw) return json({ ok: false, error: 'password_not_set' }, 403, origin);
+        if (!(await acadPwVerify(String(d.currentPassword || ''), rec.pw))) return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
+        if (!acadPwPolicy(d.newPassword, rec.email)) return json({ ok: false, error: 'weak_password' }, 400, origin);
+        rec.pw = await acadPwMake(d.newPassword);
+        await academyPut(env, rec);
+        const ne3 = normEmail(rec.email);
+        await acadRevokeSessions(env, ne3, null); // ALL sessions die…
+        const fresh = await acadIssueSession(env, ne3, !!sess.rec.remember); // …and a fresh one is issued
+        return json({ ok: true, token: fresh.token, expiresAt: fresh.expiresAt }, 200, origin);
+      }
+
+      // ---- Academy: H3 progress sync (Pack AcademyBuildA) — the
+      // worker is the source of truth for study state. GET hydrates
+      // the portal at sign-in; progress-sync is the whole-state
+      // write-through for the two shapes the granular routes don't
+      // own (first-sign-in migration of pre-sync local state; the
+      // sample profile's seed push). Assessment writes NEVER travel
+      // the sync route — attempts + readiness snapshots are computed
+      // server-side by quiz/finish + review/answer below.
+      if (path === '/api/academy/progress' && request.method === 'GET') {
+        const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, true, origin);
+        if (g.resp) return g.resp;
+        const progress = await env.LEADS.get('acprogress:' + g.ne, { type: 'json' }).catch(() => null);
+        const mistakes = await env.LEADS.get('acmistakes:' + g.ne, { type: 'json' }).catch(() => null);
+        const readiness = await env.LEADS.get('acready:' + g.ne, { type: 'json' }).catch(() => null);
+        const attempts = {};
+        for (const ak of await listAllKeys(env, 'acattempt:' + g.ne + ':', 200)) {
+          const arec = await env.LEADS.get(ak.name, { type: 'json' }).catch(() => null);
+          if (arec) attempts[ak.name.slice(('acattempt:' + g.ne + ':').length)] = arec;
+        }
+        return json({ ok: true, progress: progress, mistakes: mistakes, readiness: readiness, attempts: attempts }, 200, origin);
+      }
+      if (path === '/api/academy/progress-sync' && request.method === 'POST') {
+        if (limited('acsync:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, false, origin);
+        if (g.resp) return g.resp;
+        if (d.progress !== undefined && d.progress !== null) {
+          const prog = d.progress;
+          if (typeof prog !== 'object' || typeof prog.lessons !== 'object' || prog.lessons === null || JSON.stringify(prog).length > 200000) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('acprogress:' + g.ne, JSON.stringify({ lessons: prog.lessons }));
+        }
+        if (d.mistakes !== undefined && d.mistakes !== null) {
+          const mist = d.mistakes;
+          if (typeof mist !== 'object' || !Array.isArray(mist.items) || mist.items.length > 2000 || JSON.stringify(mist).length > 400000) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify({ items: mist.items, totalEver: mist.totalEver | 0, resolvedEver: mist.resolvedEver | 0 }));
+        }
+        return json({ ok: true }, 200, origin);
+      }
+      if (path === '/api/academy/progress-snapshot' && request.method === 'POST') {
+        if (limited('acsnap:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, true, origin);
+        if (g.resp) return g.resp;
+        const pm = d.perModuleMastery;
+        if (!pm || typeof pm !== 'object' || Array.isArray(pm)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const clean = {};
+        for (const k of Object.keys(pm).slice(0, 16)) {
+          if (!/^m[0-8]$/.test(k)) continue;
+          const v = Number(pm[k]);
+          if (isFinite(v)) clean[k] = Math.max(0, Math.min(100, Math.round(v)));
+        }
+        await env.LEADS.put('academy:snap:' + g.ne, JSON.stringify({ perModuleMastery: clean, ts: Date.now() }));
+        return json({ ok: true }, 200, origin);
+      }
+      // Pack AcademyBuildE (2026-11-11): public course-freshness
+      // meta. No auth — the payload is only a date. updatedAt stays
+      // null until the first content seed stamps the key; both UIs
+      // hide their "last updated" line on null rather than invent
+      // a date.
+      if (path === '/api/academy/content-meta' && request.method === 'GET') {
+        return json({ ok: true, updatedAt: await academyContentUpdatedAt(env) }, 200, origin);
+      }
+      if (path === '/api/academy/cohort' && request.method === 'GET') {
+        const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, true, origin);
+        if (g.resp) return g.resp;
+        // Cohort means publish ONLY at ≥10 distinct student
+        // snapshots — below that the route answers the honest
+        // {enough:false, n} and the portal says when it unlocks.
+        // No student's individual data ever leaves this route.
+        const snapKeys = await listAllKeys(env, 'academy:snap:', 1000);
+        if (snapKeys.length < 10) return json({ ok: true, enough: false, n: snapKeys.length }, 200, origin);
+        const sums = {}, counts = {};
+        for (const k of snapKeys) {
+          const s = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+          if (!s || !s.perModuleMastery) continue;
+          for (const m of Object.keys(s.perModuleMastery)) { sums[m] = (sums[m] || 0) + s.perModuleMastery[m]; counts[m] = (counts[m] || 0) + 1; }
+        }
+        const means = {};
+        for (const m of Object.keys(sums)) means[m] = Math.round(sums[m] / counts[m]);
+        return json({ ok: true, enough: true, n: snapKeys.length, means: means }, 200, origin);
+      }
+      if (path === '/api/academy/diag-lead' && request.method === 'POST') {
+        // Public diagnostic lead (Build Line B's free-diagnostic
+        // page posts here): NO auth, NO email sending — the record
+        // lands in ACADEMY KV for the owner. A filled honeypot
+        // `website` field = a bot: silent {ok:true}, nothing stored.
+        if (limited('acdiag:' + ip, 20, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        if (String(d.website || '').length > 0) return json({ ok: true }, 200, origin);
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        const lang = ['en', 'fa', 'hi', 'zh', 'es'].indexOf(String(d.lang || '').toLowerCase()) !== -1 ? String(d.lang).toLowerCase() : 'en';
+        const scorePct = Math.max(0, Math.min(100, Math.round(Number(d.scorePct) || 0)));
+        const perModule = {};
+        if (d.perModule && typeof d.perModule === 'object') for (const k of Object.keys(d.perModule).slice(0, 16)) { if (/^m[0-8]$/.test(k)) { const v = Number(d.perModule[k]); if (isFinite(v)) perModule[k] = Math.max(0, Math.min(100, Math.round(v))); } }
+        let plan = '';
+        if (typeof d.plan === 'string') plan = d.plan.slice(0, 200);
+        else if (d.plan && typeof d.plan === 'object' && JSON.stringify(d.plan).length <= 4000) plan = d.plan;
+        // QC Round 3 §11 (Item 5 criterion 3d, Build A2): the lead lands in
+        // the EXISTING leads pipeline — the standard lead: record the owner
+        // portal already lists — with the diagnostic result attached as
+        // `diag`; there is NO parallel academy:diag: PII store. No email is
+        // queued or sent (the diagnostic page's no-email contract stands)
+        // and no perf/automation counters are touched.
+        const diagLeadId = Date.now().toString(36) + '-' + randHex(6);
+        const diagName = d.name ? String(d.name).slice(0, 120) : '';
+        const diagRec = { id: diagLeadId, created_at: new Date().toISOString(), name: diagName, intent: '', city: '', budget: 0, email: email, phone: '', message: ('Academy diagnostic completed — score ' + scorePct + '%' + (plan ? ' — plan: ' + (typeof plan === 'string' ? plan : 'personalised plan attached') : '')).slice(0, 2000), stage: 'new', notes: '', source: 'academy-diagnostic', listingId: '', chatRef: '', diag: { ts: new Date().toISOString(), name: diagName, lang: lang, scorePct: scorePct, perModule: perModule, plan: plan } };
+        await env.LEADS.put('lead:' + diagLeadId, JSON.stringify(diagRec));
+        await idxAdd(env, 'leads', diagLeadId);
+        return json({ ok: true }, 200, origin);
+      }
+
+      // ---- Academy: server-graded lesson quizzes + review answers
+      // (Pack AcademyBuildA, Scan L1-M5/H3). The shipped portal data
+      // no longer carries answer keys, so grading lives HERE against
+      // the seeded tutor bank (tutor:bank:*) — the same store the
+      // tutor's practice/quiz flows grade against, with engine-exact
+      // write semantics (see acadQuizMistakeWrite). Bank flows
+      // require the BANK only, never the tutor provider cfg.
+      if (path === '/api/academy/quiz/serve' && request.method === 'POST') {
+        if (limited('acquiz:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, false, origin);
+        if (g.resp) return g.resp;
+        const lessonId = String(d.lessonId || '').trim().toLowerCase();
+        if (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
+        const lang = TUTOR_LANGS.indexOf(String(d.lang || 'en').toLowerCase()) !== -1 ? String(d.lang).toLowerCase() : 'en';
+        const bix = await tutorBankIndex(env, lang);
+        if (!bix || !bix.qmeta || !Object.keys(bix.qmeta).length) return json({ ok: false, error: 'bank_not_seeded' }, 503, origin);
+        const pool = Object.keys(bix.qmeta).filter(function (x) { return bix.qmeta[x].l === lessonId; }).sort();
+        if (!pool.length) return json({ ok: false, error: 'no_bank_for_lesson' }, 404, origin);
+        let count = Number.isInteger(d.count) ? d.count : 10;
+        count = Math.min(20, Math.max(1, Math.min(count, pool.length)));
+        const attemptId = 'att-' + Date.now().toString(36) + '-' + randHex(6);
+        const served = pool.slice().sort(function (a, b) { return (tutorHashStr(g.ne + '|' + lessonId + '|' + attemptId + ':' + a) - tutorHashStr(g.ne + '|' + lessonId + '|' + attemptId + ':' + b)) || (a < b ? -1 : 1); }).slice(0, count);
+        const questions = [];
+        for (const qid of served) {
+          const qq = await tutorBankQuestion(env, lang, qid);
+          if (!qq) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+          questions.push({ qid: qq.id, lessonId: qq.lessonId, moduleId: qq.moduleId, concept: qq.concept, difficulty: qq.difficulty || null, trap: qq.trap || null, stem: qq.stem, options: acadServedOptions(qq, attemptId + ':' + qid) });
+        }
+        await env.LEADS.put('acquiz:' + g.ne + ':' + attemptId, JSON.stringify({ lessonId: lessonId, lang: lang, servedIds: served, answers: {}, answerAt: {}, startedAt: Date.now() }), { expirationTtl: 86400 });
+        await acsecEvent(env, g.ne, 'quiz'); // Pack AcademyProtect: harvest counter (awaited; acsecEvent swallows its own errors, so counting never blocks or breaks a serve)
+        return json({ ok: true, attemptId: attemptId, lessonId: lessonId, total: served.length, questions: questions }, 200, origin);
+      }
+      if (path === '/api/academy/quiz/answer' && request.method === 'POST') {
+        if (limited('acquiz:' + ip, 240, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, false, origin);
+        if (g.resp) return g.resp;
+        const attemptId = String(d.attemptId || '');
+        const qid = String(d.qid || '').trim().toLowerCase();
+        const chosen = String(d.chosen || '').trim().toUpperCase();
+        if (!/^[A-E]$/.test(chosen)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const akey = 'acquiz:' + g.ne + ':' + attemptId;
+        const att = await env.LEADS.get(akey, { type: 'json' }).catch(() => null);
+        if (!att || !Array.isArray(att.servedIds)) return json({ ok: false, error: 'no_active_attempt' }, 409, origin);
+        if (att.servedIds.indexOf(qid) === -1) return json({ ok: false, error: 'not_served' }, 400, origin);
+        const qq = await tutorBankQuestion(env, att.lang || 'en', qid);
+        if (!qq) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        let grade;
+        if (att.answers && att.answers[qid] !== undefined) {
+          grade = acadGradePayload(qq, att.answers[qid]); // re-answer: replay the recorded feedback, record nothing twice (engine parity)
+        } else {
+          grade = acadGradePayload(qq, chosen);
+          att.answers = att.answers || {}; att.answerAt = att.answerAt || {};
+          att.answers[qid] = chosen; att.answerAt[qid] = Date.now();
+          if (!grade.correct) { const mk = await tutorLoadMistakes(env, g.ne); acadQuizMistakeWrite(mk, qq, chosen, Date.now()); await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk)); }
+          await env.LEADS.put(akey, JSON.stringify(att), { expirationTtl: 86400 });
+        }
+        const answeredCount = Object.keys(att.answers || {}).length;
+        return json({ ok: true, qid: qid, correct: grade.correct, answeredCount: answeredCount, total: att.servedIds.length, allAnswered: answeredCount === att.servedIds.length, feedback: Object.assign({ qid: qid, concept: qq.concept, trap: qq.trap || null, chosen: att.answers[qid] }, grade) }, 200, origin);
+      }
+      if (path === '/api/academy/quiz/finish' && request.method === 'POST') {
+        if (limited('acquiz:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, false, origin);
+        if (g.resp) return g.resp;
+        const attemptId = String(d.attemptId || '');
+        const akey = 'acquiz:' + g.ne + ':' + attemptId;
+        const att = await env.LEADS.get(akey, { type: 'json' }).catch(() => null);
+        if (!att || !Array.isArray(att.servedIds)) return json({ ok: false, error: 'no_active_attempt' }, 409, origin);
+        const nowF = Date.now();
+        const feedback = [];
+        let correctCount = 0;
+        const mk = await tutorLoadMistakes(env, g.ne);
+        let mkDirty = false;
+        for (const qid of att.servedIds) {
+          const qq = await tutorBankQuestion(env, att.lang || 'en', qid);
+          if (!qq) continue;
+          const chosen = att.answers && att.answers[qid] !== undefined ? att.answers[qid] : null;
+          const grade = acadGradePayload(qq, chosen);
+          if (chosen === null) { acadQuizMistakeWrite(mk, qq, null, nowF); mkDirty = true; }
+          else if (grade.correct) correctCount++;
+          feedback.push(Object.assign({ qid: qid, concept: qq.concept, trap: qq.trap || null, chosen: chosen }, grade));
+        }
+        if (mkDirty) await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk));
+        const total = att.servedIds.length;
+        const score = total ? Math.round((correctCount / total) * 100) : 0;
+        const route = score >= 80 ? 'mastered' : score >= 70 ? 'advance_with_review' : 'review_and_retry';
+        // Pacing from SERVER receipt stamps (serve → each answer):
+        // per-question seconds, average vs the ≈1.8 min/question
+        // exam target (108s), and the slowest question.
+        let prev = att.startedAt || nowF;
+        const perQ = [];
+        for (const qid of att.servedIds) { if (att.answerAt && att.answerAt[qid]) { perQ.push({ qid: qid, secs: Math.max(0, Math.round((att.answerAt[qid] - prev) / 1000)) }); prev = att.answerAt[qid]; } }
+        let timing = null;
+        if (perQ.length) { const slowest = perQ.reduce(function (a, b) { return b.secs > a.secs ? b : a; }, perQ[0]); timing = { perQ: perQ, avgSecs: Math.round(perQ.reduce(function (s, x) { return s + x.secs; }, 0) / perQ.length), slowestQid: slowest.qid, slowestSecs: slowest.secs, targetSecsPerQ: 108 }; }
+        const arecKey = 'acattempt:' + g.ne + ':' + att.lessonId;
+        let arec = await env.LEADS.get(arecKey, { type: 'json' }).catch(() => null);
+        if (!arec || !Array.isArray(arec.history)) arec = { lessonId: att.lessonId, count: 0, best: null, last: null, history: [] };
+        arec.history.push({ attemptId: attemptId, at: nowF, servedIds: att.servedIds, answers: att.answers || {}, score: score, total: total, correctCount: correctCount, route: route, timing: timing });
+        arec.count = (arec.count || 0) + 1;
+        arec.best = arec.best == null ? score : Math.max(arec.best, score);
+        arec.last = score;
+        await env.LEADS.put(arecKey, JSON.stringify(arec));
+        let prog = await env.LEADS.get('acprogress:' + g.ne, { type: 'json' }).catch(() => null);
+        if (!prog || typeof prog !== 'object') prog = { lessons: {} };
+        if (!prog.lessons) prog.lessons = {};
+        const lp = prog.lessons[att.lessonId] || { status: 'not_started', bestScore: null, mastery: 0, attempts: 0, completedAt: null };
+        lp.attempts = (lp.attempts || 0) + 1;
+        lp.bestScore = lp.bestScore == null ? score : Math.max(lp.bestScore, score);
+        lp.mastery = lp.bestScore;
+        if (score >= 70 && !lp.completedAt) lp.completedAt = nowF;
+        lp.status = lp.mastery >= 80 ? 'mastered' : (lp.completedAt ? 'completed' : 'in_progress');
+        prog.lessons[att.lessonId] = lp;
+        await env.LEADS.put('acprogress:' + g.ne, JSON.stringify(prog));
+        await env.LEADS.delete(akey);
+        const ready = await acadSnapshotAppend(env, g.ne);
+        return json({ ok: true, attemptId: attemptId, lessonId: att.lessonId, score: score, correctCount: correctCount, total: total, route: route, feedback: feedback, timing: timing, answers: att.answers || {}, servedIds: att.servedIds, readiness: { score: ready.score, components: ready.components, history: ready.history, gate: ready.gate } }, 200, origin);
+      }
+      if (path === '/api/academy/review/answer' && request.method === 'POST') {
+        if (limited('acreview:' + ip, 240, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
+        if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const g = await tutorGate(env, email, false, origin);
+        if (g.resp) return g.resp;
+        const qid = String(d.qid || '').trim().toLowerCase();
+        const chosen = String(d.chosen || '').trim().toUpperCase();
+        if (!/^[A-E]$/.test(chosen)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const lang = TUTOR_LANGS.indexOf(String(d.lang || 'en').toLowerCase()) !== -1 ? String(d.lang).toLowerCase() : 'en';
+        const qq = await tutorBankQuestion(env, lang, qid);
+        if (!qq) return json({ ok: false, error: 'question_not_found' }, 404, origin);
+        const mk = await tutorLoadMistakes(env, g.ne);
+        const item = mk.items.find(function (i) { return i && i.qid === qid && !i.resolved; });
+        if (!item) return json({ ok: false, error: 'no_open_mistake' }, 409, origin);
+        // engine.js submitReview, verbatim semantics.
+        const nowR = Date.now();
+        const correct = chosen === qq.correct;
+        item.reviews = (item.reviews || 0) + 1;
+        if (correct) {
+          item.streak = (item.streak || 0) + 1;
+          if (item.streak >= 2) { item.resolved = true; item.resolvedAt = nowR; mk.resolvedEver = (mk.resolvedEver || 0) + 1; }
+          else { item.stage = Math.min((item.stage || 0) + 1, TUTOR_SPACING_DAYS.length - 1); item.dueAt = nowR + TUTOR_SPACING_DAYS[item.stage] * TUTOR_DAY_MS; }
+        } else { item.streak = 0; item.stage = 0; item.chosen = chosen; item.dueAt = nowR + TUTOR_DAY_MS; }
+        await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk));
+        const ready = await acadSnapshotAppend(env, g.ne);
+        return json({ ok: true, qid: qid, correct: correct, resolved: item.resolved, streak: item.streak, stage: item.stage, nextDueAt: item.resolved ? null : item.dueAt, correctKey: qq.correct, explain: qq.explain || '', options: (qq.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === qq.correct }; }), readiness: { score: ready.score, history: ready.history, gate: ready.gate } }, 200, origin);
       }
 
 
@@ -11157,8 +12272,10 @@ async function handleRequest(request, env, ctx) {
         if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
-        const cfg = await tutorCfg(env);
-        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        // Scan L1-L5 closure (QC Round 3, Build A2): bank flows require the
+        // BANK only, never the tutor provider cfg (the quiz/serve posture) —
+        // the provider-config 503 that used to sit here fired before the bank
+        // check and made practice unusable in the designed no-keys posture.
         const lang = String(d.lang || 'en').trim().toLowerCase();
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
         const bix = await tutorBankIndex(env, lang);
@@ -11220,8 +12337,10 @@ async function handleRequest(request, env, ctx) {
         if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
-        const cfg = await tutorCfg(env);
-        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        // Scan L1-L5 closure (QC Round 3, Build A2): bank flows require the
+        // BANK only, never the tutor provider cfg (the quiz/serve posture) —
+        // the provider-config 503 that used to sit here fired before the bank
+        // check and made practice unusable in the designed no-keys posture.
         const lang = String(d.lang || 'en').trim().toLowerCase();
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
         const snapQ = await tutorStudentSnapshot(env, g.ne);
@@ -11319,8 +12438,10 @@ async function handleRequest(request, env, ctx) {
         if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, d.email, false, origin);
         if (g.resp) return g.resp;
-        const cfg = await tutorCfg(env);
-        if (!tutorReady(cfg)) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        // Scan L1-L5 closure (QC Round 3, Build A2): bank flows require the
+        // BANK only, never the tutor provider cfg (the quiz/serve posture) —
+        // the provider-config 503 that used to sit here fired before the bank
+        // check and made practice unusable in the designed no-keys posture.
         const lang = String(d.lang || 'en').trim().toLowerCase();
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
         const thread = await tutorThreadGet(env, g.ne);
@@ -11378,6 +12499,10 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, done: false, item: item }, 200, origin);
       }
       if (path === '/api/academy/tutor/coach' && request.method === 'GET') {
+        // Scan L1-M3: this read is EXPENSIVE (200-key snapshot list
+        // + up to 100 bank fetches) and the portal calls it on view
+        // entries — cap it per IP in the sibling limiter style.
+        if (limited('accoach:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         const emailPre = normEmail(String(url.searchParams.get('email') || ''));
         if (!EMAIL_RE.test(emailPre)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
         if (!(await tutorAdmit(request, env, emailPre))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
@@ -11478,17 +12603,41 @@ async function handleRequest(request, env, ctx) {
         const blang = String(bp[5] || '').toLowerCase();
         const idOk = (bkind === 'module' && /^m[0-8]$/.test(bid)) || (bkind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bid) && bid.length <= 40);
         if (!idOk || BOOKLET_LANGS.indexOf(blang) === -1) return json({ ok: false, error: 'not_found' }, 404, origin);
+        // Pack AcademyBuildA: the SAMPLE allowance — lesson m5-l1,
+        // lang en, kind lesson ONLY (the exact set Build Line B's
+        // public sample page uses). No enrolment, no session; still
+        // rate-limited. A sample flag on ANY other kind/id/lang
+        // falls through to the normal authed path below and is
+        // never served publicly.
+        const sampleReq = url.searchParams.get('sample');
+        if ((sampleReq === '1' || sampleReq === 'true') && bkind === 'lesson' && bid === 'm5-l1' && blang === 'en') {
+          if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+          const sb64 = await env.LEADS.get('booklet:lesson:m5-l1:en');
+          if (!sb64) return json({ ok: false, error: 'not_found' }, 404, origin);
+          const sbytes = bookletB64Decode(sb64);
+          if (!sbytes) return json({ ok: false, error: 'not_found' }, 404, origin);
+          // Pack AcademyProtect (2026-11-11): the public sample serves
+          // the SAMPLE edition — stamped as such on every page, never
+          // with a student identity. A stamp failure serves the raw
+          // sample bytes rather than breaking the public page.
+          const sStamped = await ehPdfStamp(sbytes, { footer: acadBookletSampleFooter(), marker: acadBookletSampleMarker() });
+          return new Response(sStamped || sbytes, { status: 200, headers: Object.assign({}, cors(origin), { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline; filename="m5-l1-booklet.pdf"', 'Cache-Control': 'private, no-store', 'X-Booklet-Lang': 'en', 'X-Booklet-Sample': '1', 'X-Booklet-Stamped': sStamped ? '1' : '0' }) });
+        }
         const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
+        // Scan L1-L8 closure (QC Round 3, Build A2): the rate limiter runs
+        // BEFORE the KV auth reads on the authed path too (the sample path
+        // above already limits first) — an unauthenticated burst meets the
+        // limiter, not three KV auth lookups.
+        if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         const sessionOk = await authed(request, env);
-        // BookletFix (2026-11-11): a STUDENT session (stok:, minted by
-        // POST /api/academy/student-session at portal sign-in and bound
+        // BookletFix (2026-11-11): a STUDENT session (stok:, issued by
+        // POST /api/academy/student-login and bound
         // to this exact email) is a first-class credential here — it is
         // what a real student session actually presents. The owner
         // session and the SERVICE bearer remain the operator paths.
         const studentOk = sessionOk ? false : await studentAuthed(request, env, email);
         const serviceOk = (sessionOk || studentOk) ? false : await bookletServiceOk(request, env);
         if (!sessionOk && !studentOk && !serviceOk) return json({ ok: false, error: 'unauthorized' }, 401, origin);
-        if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         if (!EMAIL_RE.test(email)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
         const ent = await academyEntitlement(env, email, { readOnly: true });
         if (!ent.entitled) {
@@ -11498,8 +12647,13 @@ async function handleRequest(request, env, ctx) {
         }
         let servedLang = blang;
         let b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':' + blang);
-        if (!b64 && blang !== 'en') { b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':en'); servedLang = 'en'; }
-        if (!b64) return json({ ok: false, error: 'not_found' }, 404, origin);
+        // Pack AcademyBuildA: the EN fallback exists ONLY for fa —
+        // the one other produced booklet language. hi/zh/es have no
+        // booklets yet and answer the HONEST not_available_lang
+        // (no fake files, no silent EN dressed as their edition);
+        // the portal surfaces X-Booklet-Fallback in the UI (L1-M6).
+        if (!b64 && blang === 'fa') { b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':en'); servedLang = 'en'; }
+        if (!b64) return json({ ok: false, error: blang === 'en' || blang === 'fa' ? 'not_found' : 'not_available_lang' }, 404, origin);
         const bytes = bookletB64Decode(b64);
         if (!bytes) return json({ ok: false, error: 'not_found' }, 404, origin);
         const fname = bid + '-booklet' + (servedLang === 'en' ? '' : '-' + servedLang) + '.pdf';
@@ -11510,6 +12664,19 @@ async function handleRequest(request, env, ctx) {
           'X-Booklet-Lang': servedLang
         });
         if (servedLang !== blang) bh['X-Booklet-Fallback'] = 'en';
+        // Pack AcademyProtect (2026-11-11): a STUDENT serve carries
+        // that student's watermark (visible footer + forensic marker,
+        // stamped at serve time — the KV original is never modified)
+        // and feeds the harvest counters. Operator paths (owner
+        // session / SERVICE bearer) serve the raw bytes unstamped and
+        // uncounted: the stamp identifies the student copy, not the
+        // fetch. A stamp failure falls back to the raw bytes —
+        // protection must never break a legitimate serve.
+        if (studentOk) {
+          await acsecEvent(env, normEmail(email), 'booklet', bkind + ':' + bid);
+          const stamped = await ehPdfStamp(bytes, { footer: acadBookletFooter(email), marker: acadBookletMarker(email) });
+          if (stamped) { bh['X-Booklet-Stamped'] = '1'; return new Response(stamped, { status: 200, headers: bh }); }
+        }
         return new Response(bytes, { status: 200, headers: bh });
       }
 
@@ -11551,14 +12718,14 @@ async function handleRequest(request, env, ctx) {
          rule are its controls). */
       /* Pack StripeClear (2026-11-11): POST
          /api/admin/academy/stripe-clear joins the exemption — the
-         agent clear call it exists for is BARE (no Authorization
-         header at all: cfg:service is unset in the ACADEMY
-         namespace, so no scoped credential can ever be presented
-         there, and the poisoned record it removes is what blocks
-         every credentialed repair path). The route re-runs
-         admission in-handler: owner session, or the bare shape,
-         gated by the exact {"confirm":"clear-stripe"} body — see
-         the handler. The response is booleans only. */
+         route re-runs admission in-handler (owner session or the
+         SERVICE credential, gated by the exact
+         {"confirm":"clear-stripe"} body — see the handler).
+         Pack AcademyBuildA (Scan L3-N5): the original bare-agent
+         shape this exemption was written for is RETIRED; the
+         exemption itself stays because the handler's admission
+         re-run is the route's documented control. The response is
+         booleans only. */
       if (!(path === '/api/admin/academy/b2-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-provision' && request.method === 'POST') && !(path === '/api/admin/academy/stripe-clear' && request.method === 'POST') && !(await authed(request, env)) && !(await scopedAuthed(request, env, path, request.method))) {
         const admIp = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
         if (limited('adm:' + admIp, 60, 3600000)) return json({ ok: false, error: 'rate_limited' }, 429, origin);
@@ -13189,6 +14356,7 @@ async function handleRequest(request, env, ctx) {
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', bytes: upBody.bytes || null } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
       // ---- admin: Academy × Stripe config (Pack AcademyStripe) ----
@@ -13309,39 +14477,25 @@ async function handleRequest(request, env, ctx) {
         // admin gate above (see the gate comment); admission is
         // re-run here and admits EITHER an owner session (authed —
         // incl. the bridged session on the academy deployment; the
-        // portal path) OR a BARE call: no Authorization header AND
-        // neither Stripe value header. The bare shape is admitted
-        // deliberately, on the b2 posture inverted — there the value
-        // rides the Bearer; here the call carries NOTHING sensitive
-        // in either direction (the response is booleans only) and the
-        // blast radius is exactly one config record whose deletion
-        // returns the deployment to not_configured, which FAILS
-        // CLOSED (webhook 503s, enrolments stop) — strictly safer
-        // than a known-literal signing secret. Two controls narrow
-        // the admission past "any request": (1) the body must be
-        // exactly {"confirm":"clear-stripe"}, a deliberate-action
-        // token a stray or crawled POST will not carry — anything
-        // else is 400 and the record is untouched; (2) a call
-        // presenting credential material it cannot validate (a
-        // Bearer that is neither a live session nor the scoped
-        // token, or either value header) is refused 401 rather than
-        // treated as bare, so a credentialed-but-wrong caller fails
-        // closed. scopedAuthed is re-checked for symmetry with the
-        // sibling provision handlers, but the route is deliberately
-        // NOT added to the SERVICE scope set — the two admitted
-        // shapes are session and bare-agent. Idempotent: an absent
+        // portal path) OR the SERVICE credential (scopedAuthed).
+        // Pack AcademyBuildA (Scan L3-N5): the original THIRD shape
+        // — a BARE call carrying no credential at all — is RETIRED.
+        // It existed to repair a poisoned cfg:stripe on a deployment
+        // where cfg:service was unset; that repair is complete, and
+        // an unauthenticated config-delete is not a shape this
+        // worker keeps. The exact-confirm body control below is
+        // unchanged. One control still narrows every admitted
+        // call: the body must be exactly {"confirm":"clear-stripe"},
+        // a deliberate-action token a stray or crawled POST will
+        // not carry — anything else is 400 and the record is
+        // untouched. Idempotent: an absent
         // record answers cleared:false and writes no audit; a real
         // delete writes a stripe_clear audit (via only, never any
         // stored material) with the standard 730-day TTL.
         let viaClear = null;
         if (await authed(request, env)) viaClear = 'session';
         else if (await scopedAuthed(request, env, path, request.method)) viaClear = 'service';
-        else {
-          const authHC = request.headers.get('Authorization') || '';
-          const hasValueHdrC = ((request.headers.get('X-Stripe-Webhook-Secret') || '').length > 0) || ((request.headers.get('X-Stripe-Api-Key') || '').length > 0);
-          if (!authHC && !hasValueHdrC) viaClear = 'agent';
-          else return json({ ok: false, error: 'unauthorized' }, 401, origin);
-        }
+        else return json({ ok: false, error: 'unauthorized' }, 401, origin);
         let dc = null;
         try { dc = await request.json(); } catch (e) {}
         if (!dc || dc.confirm !== 'clear-stripe' || Object.keys(dc).length !== 1) return json({ ok: false, error: 'validation' }, 400, origin);
@@ -13382,6 +14536,28 @@ async function handleRequest(request, env, ctx) {
         // the dots/+tag they enrolled with).
         await academyAudit(env, 'academy.create', normEmail(email), ip, { product: product, accessMonths: months, expiresAt: expiresAt, source: rec.source });
         return json({ student: await academySummary(env, rec, nowMs) }, 201, origin);
+      }
+      // Pack AcademyBuildA (Addendum 3 §3): mint a one-time
+      // set-password link for an enrolled student. Owner SESSION
+      // only (in-handler authed() — a scoped/service credential is
+      // refused: this route hands out an account-takeover-grade
+      // link, so it stays on the interactive session). The raw
+      // token is returned ONCE inside the link and is NEVER stored
+      // or logged (only its sha256 lives in KV; the audit detail
+      // carries no token). The owner portal's "Copy invite link"
+      // action (Line C surface) calls this route.
+      if (path === '/api/admin/academy/student-invite-link' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ error: 'unauthorized' }, 401, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const email = String(d.email || '').trim().toLowerCase();
+        if (!EMAIL_RE.test(email)) return json({ error: 'invalid_email' }, 400, origin);
+        const rec = await academyGet(env, email);
+        if (!rec) return json({ error: 'not_found' }, 404, origin);
+        const minted = await acadMintSetPwToken(env, normEmail(email));
+        await academyAudit(env, 'academy.invite_link', normEmail(email), ip, { expiresAt: minted.expiresAt });
+        return json({ ok: true, link: ACAD_PORTAL_BASE + '#setpw=' + minted.token, expiresAt: minted.expiresAt }, 200, origin);
       }
       const acm = path.match(/^\/api\/admin\/academy\/students\/(.+)$/);
       if (acm) {
@@ -13435,9 +14611,10 @@ async function handleRequest(request, env, ctx) {
           if (!rec) return json({ error: 'not_found' }, 404, origin);
           const purge = new URL(request.url).searchParams.get('purgeProgress') === '1';
           await env.LEADS.delete('academy:' + ne);
-          if (purge) await academyClearEngineKeys(env, ne);
-          await academyAudit(env, 'academy.delete', ne, ip, { purgeProgress: purge });
-          return json({ deleted: true }, 200, origin);
+          let purgedKeys = 0;
+          if (purge) { const pr = await acadPurgeStudentData(env, ne); purgedKeys = pr.keys.length + pr.sessionsRevoked; }
+          await academyAudit(env, 'academy.delete', ne, ip, { purgeProgress: purge, keysRemoved: purgedKeys });
+          return json({ deleted: true, keysRemoved: purgedKeys }, 200, origin);
         }
         if (action && request.method === 'POST') {
           if (action === 'resend-invite') {
@@ -13455,12 +14632,20 @@ async function handleRequest(request, env, ctx) {
             if (!cfgMi || cfgMi.provider !== 'resend' || !cfgMi.apiKey) return json({ ok: false, error: 'not_configured' }, 503, origin);
             if (rec.status === 'blocked') return json({ error: 'student_blocked' }, 409, origin);
             const invName = String(rec.email || '').split('@')[0];
+            // Pack AcademyBuildA (Addendum 3 §3 hook): when the
+            // student has no password yet, the invite carries the
+            // one-time set-password link — the same acsetpw: token
+            // the owner invite-link route mints. Once a password is
+            // set, invites stay link-free. (cfg:mail unprovisioned →
+            // the 503 above fires first; behaviour unchanged.)
+            const invSetLink = rec.pw ? '' : ACAD_PORTAL_BASE + '#setpw=' + (await acadMintSetPwToken(env, ne)).token;
             const invPostLic = await prPostLicense(env); // Pack PNA-Fix: sign-off follows the licensure flag
             const invBody = [
               'Hi ' + invName + ',',
               '',
               'Your EH Realty Academy access is ready. Sign in to the student portal with this email address to continue your BC real estate licensing exam preparation:',
               '',
+              ...(invSetLink ? ['First, set your password (one-time link, valid 48 hours): ' + invSetLink, ''] : []),
               'https://academy.ehrealtybc.com/portal/',
               '',
               'Your access window runs until ' + String(rec.expiresAt || '').slice(0, 10) + '. The course is self-paced — lessons, quizzes and mock exams are all inside the portal.',
@@ -13529,11 +14714,12 @@ async function handleRequest(request, env, ctx) {
             return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
           }
           if (action === 'reset-progress') {
-            const removed = await academyClearEngineKeys(env, ne);
-            await academyAudit(env, 'academy.reset_progress', ne, ip, { keysRemoved: removed });
-            const keys = [];
-            for (const p of ['acprogress:', 'acmistakes:', 'acready:']) keys.push(p + ne);
-            return json({ reset: removed ? keys : [] }, 200, origin);
+            // Pack AcademyBuildA (Scan L3-N2): acattempt: records
+            // are part of the reset now — academyClearEngineKeys
+            // deletes them and reports the real key list it removed.
+            const cleared = await academyClearEngineKeys(env, ne);
+            await academyAudit(env, 'academy.reset_progress', ne, ip, { keysRemoved: cleared.count });
+            return json({ reset: cleared.keys }, 200, origin);
           }
           return json({ error: 'not_found' }, 404, origin);
         }
@@ -13848,12 +15034,14 @@ async function handleRequest(request, env, ctx) {
             if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
             await env.LEADS.put('tutor:corpus:v2:glossary', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map }));
             try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { part: 'glossary', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
             return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
           }
           if (d.part === 'v2-index') {
             if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
             try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
             return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'v2-module') {
@@ -13862,12 +15050,14 @@ async function handleRequest(request, env, ctx) {
             if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
             try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-module', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
             return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'bank-index') {
             if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
             await env.LEADS.put('tutor:bank:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta }));
             try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-index', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
             return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
           }
           const modB = String(d.module || '');
@@ -13875,6 +15065,7 @@ async function handleRequest(request, env, ctx) {
           if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
           await env.LEADS.put('tutor:bank:' + lang + ':' + modB, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions }));
           try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-module', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
           return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
         }
         if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
@@ -13882,6 +15073,7 @@ async function handleRequest(request, env, ctx) {
         if (d.part === 'index') {
           await env.LEADS.put('tutor:corpus:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
           try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'index', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
           return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
         }
         if (d.part === 'module') {
@@ -13889,6 +15081,7 @@ async function handleRequest(request, env, ctx) {
           if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
           await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
           try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'module', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
           return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
@@ -13921,6 +15114,7 @@ async function handleRequest(request, env, ctx) {
         const backBytes2 = bookletB64Decode((await env.LEADS.get('booklet:' + kind + ':' + bid + ':' + lang)) || '');
         const storedSha256 = backBytes2 ? await bookletBytesSha256(backBytes2) : null;
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        await bumpAcademyContent(env);
         return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
       }
       // ---- admin: Academy × Backblaze B2 (Pack AcademyB2Video) ----
@@ -13956,7 +15150,12 @@ async function handleRequest(request, env, ctx) {
         {
           const authH0 = request.headers.get('Authorization') || '';
           const b0 = (authH0.match(/^Bearer (.+)$/) || [])[1] || '';
-          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method)) || b0.length > 0;
+          // Pack AcademyBuildA (Scan L3-N6): admission is the owner
+          // SESSION or the SERVICE credential ONLY. The original
+          // third shape — any non-empty bearer admitted as a VALUE
+          // carrier — is closed: the portal's session+body flow is
+          // the only provisioning path.
+          const admitted = (await authed(request, env)) || (await scopedAuthed(request, env, path, request.method));
           if (!admitted) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         }
         let d = null;
@@ -13983,7 +15182,12 @@ async function handleRequest(request, env, ctx) {
           // key part — a bare service call with no distinct value is a
           // probe, not a provision.
           if (/^[0-9a-f]{48}$/.test(bearer)) return json({ ok: false, error: 'validation' }, 400, origin);
-          value = bearer;
+          // Pack AcademyBuildA (Scan L3-N6): the value-bearer shape
+          // is CLOSED — a bearer that is neither the owner session
+          // nor the service credential is not honoured here and can
+          // never become a stored key part. (Admission above
+          // already refuses it; this is the defence in depth.)
+          return json({ ok: false, error: 'unauthorized' }, 401, origin);
         } else {
           value = String(d.value || '');
         }
@@ -13997,6 +15201,21 @@ async function handleRequest(request, env, ctx) {
         await env.LEADS.put('cfg:b2', JSON.stringify(cur));
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'b2_provision', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { part: part, via: (/^[0-9a-f]{64}$/.test(bearer) || !bearer) ? 'session' : 'service_bearer' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true, part: part, complete: !!(cur.keyId && cur.appKey) }, 200, origin);
+      }
+      if (path === '/api/admin/academy/security-flags' && request.method === 'GET') {
+        // Pack AcademyProtect (2026-11-11): today's harvest-anomaly
+        // flags from the coalesced acsec counters. Owner-only by
+        // position — this handler sits behind the admin gate and the
+        // route is deliberately NOT in the SERVICE set, so neither the
+        // service credential nor any student session can read it.
+        const dayF = todayVancouver();
+        const flags = [];
+        for (const k of await listAllKeys(env, 'acsec:flag:' + dayF + ':', 500)) {
+          const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+          if (rec && rec.email) flags.push({ email: rec.email, day: rec.day || dayF, reasons: Array.isArray(rec.reasons) ? rec.reasons : [], flaggedAt: rec.flaggedAt || null });
+        }
+        flags.sort(function (a, b) { return a.email < b.email ? -1 : 1; });
+        return json({ ok: true, day: dayF, flags: flags }, 200, origin);
       }
       if (path === '/api/admin/academy/b2-status' && request.method === 'GET') {
         // Booleans only — no secret material ever leaves this route.
@@ -14737,7 +15956,9 @@ async function handleRequest(request, env, ctx) {
           rec.signals = sig;
           out.push(rec);
         }
-        return json({ ok: true, mail: out }, 200, origin);
+        // Pack AcademyBuildA (Scan L3): total + truncated ride
+        // along — the 100-record slice is no longer silent.
+        return json({ ok: true, mail: out, total: recs.length, truncated: recs.length > out.length }, 200, origin);
       }
       const mqm = path.match(/^\/api\/admin\/mailq\/([A-Za-z0-9-]+)$/);
       if (mqm && request.method === 'DELETE') {
@@ -14782,7 +16003,7 @@ async function handleRequest(request, env, ctx) {
       }
       /* Pack MailSend: mail provider provisioning — the stripe-
          provision pattern verbatim. cfg:mail {provider:'resend',
-         apiKey} is EH Realty's OWN Resend key (hello@ehrealtybc.com);
+         apiKey} is EH Realty's OWN Resend key (domain-scoped; the provision stamps the news@ehrealtybc.com default sender + the academy@ehrealtybc.com Academy sender);
          one-shot (409 once set), values never echoed, logged or
          returned. Rotation afterwards is a deliberate cfg edit, never
          a re-provision. */
@@ -14797,6 +16018,7 @@ async function handleRequest(request, env, ctx) {
         curM.provider = 'resend';
         curM.apiKey = ak;
         curM.from = MAIL_FROM;
+        curM.fromAcademy = MAIL_FROM_ACADEMY;
         curM.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:mail', JSON.stringify(curM));
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_provision', target: 'cfg:mail', ip: ip, at: new Date().toISOString(), detail: { provider: 'resend' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
@@ -14805,7 +16027,7 @@ async function handleRequest(request, env, ctx) {
       if (path === '/api/admin/mail/status' && request.method === 'GET') {
         // Booleans only — no key material ever leaves this route.
         const cfgMs = (await env.LEADS.get('cfg:mail', { type: 'json' })) || {};
-        return json({ ok: true, configured: !!cfgMs.apiKey, provider: cfgMs.apiKey ? (cfgMs.provider || null) : null, from: cfgMs.apiKey ? MAIL_FROM : null, provisionedAt: cfgMs.provisionedAt || null }, 200, origin);
+        return json({ ok: true, configured: !!cfgMs.apiKey, provider: cfgMs.apiKey ? (cfgMs.provider || null) : null, from: cfgMs.apiKey ? MAIL_FROM : null, fromAcademy: cfgMs.apiKey ? MAIL_FROM_ACADEMY : null, provisionedAt: cfgMs.provisionedAt || null }, 200, origin);
       }
 
       // ---- admin: config values in KV (e.g. cfg:gcal bridge) ----
