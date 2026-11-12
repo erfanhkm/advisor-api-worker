@@ -3719,7 +3719,13 @@ async function academyB2Request(env, method, key, opts) {
   const dates = academyB2AmzDates(Date.now());
   const signedHeaders = { 'host': host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': dates.amz };
   if (body && o.contentType) signedHeaders['content-type'] = o.contentType;
-  if (o.rangeHeader) signedHeaders['range'] = o.rangeHeader;
+  // Pack B2RangeSignFix (2026-11-12): 'range' is NEVER signed.
+  // The Probe2 bisect (live, proven-good key) showed B2 rejects
+  // every ranged read with SignatureDoesNotMatch when Range sits
+  // in SignedHeaders — this function ALSO re-sets Range on the
+  // fetch init below, so the wire value differs from the signed
+  // value. Sent-but-unsigned (Probe2 variant v6) passes B2's
+  // signature check, so Range travels on the init only.
   const signed = await academyB2Sign(cfg, { method: method, host: host, region: region, path: path, query: o.query || [], signedHeaders: signedHeaders, payloadHash: payloadHash, nowMs: Date.now() });
   const init = { method: method, headers: signed.headers };
   if (body) init.body = body;
@@ -3776,9 +3782,12 @@ async function academyB2ProbeVariant(env, variant) {
   // the same proven-good key. This rebuilds the probe's signed
   // GET with exactly ONE element changed per variant so the
   // parent can bisect which request shape B2 accepts:
-  //   1 control — byte-for-byte the academyB2Request probe shape
-  //      (signed host + x-amz-content-sha256 = empty-body hash +
-  //      x-amz-date; Range bytes=0-0 signed AND sent).
+  //   1 control — byte-for-byte the PRE-B2RangeSignFix
+  //      academyB2Request probe shape (signed host +
+  //      x-amz-content-sha256 = empty-body hash + x-amz-date;
+  //      Range bytes=0-0 signed AND sent). Kept deliberately as
+  //      the old-shape control: production ranged reads have
+  //      since moved to the v6 shape (Range sent, never signed).
   //   2 — no x-amz-content-sha256 anywhere (not signed, not sent).
   //   3 — x-amz-content-sha256 = 'UNSIGNED-PAYLOAD' (signed + sent).
   //   4 — 'host' NOT in SignedHeaders (the URL's host unchanged;
