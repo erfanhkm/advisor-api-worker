@@ -224,6 +224,11 @@ const GEN_BUMP_EXEMPT = [
   // ACADEMY KV — the same exemption as the direct route above.
   ['POST', '/api/admin/academy/tutor-seed-proxy'],
   ['POST', '/api/internal/academy/tutor-seed'],
+  // Pack R2MigProxy (2026-11-12): the migration proxy + its
+  // internal twin move bytes into the R2 bucket — exempt for the
+  // same reason (the 2026-11-10 KV write-pool lesson).
+  ['POST', '/api/admin/academy/r2-mig-proxy'],
+  ['POST', '/api/internal/academy/r2-mig'],
   // Pack Tutor2 (2026-11-11): practice/quiz/debrief/feedback/voice
   // writes land only on tutor:/ac* keys of the caller's own record.
   ['POST', '/api/academy/tutor/practice'],
@@ -1181,6 +1186,14 @@ async function scopedAuthed(request, env, path, method) {
     (method === 'PUT' && path === '/api/admin/academy/r2-object') ||
     (method === 'GET' && path === '/api/admin/academy/r2-object') ||
     (method === 'GET' && path === '/api/admin/academy/r2-list') ||
+    // Pack R2MigProxy (2026-11-12): the R2 migration PROXY joins
+    // the SERVICE set — the route itself enforces scopedAuthed
+    // ONLY and forwards the migration body to the ACADEMY
+    // deployment's internal r2-mig route under cfg:internal (the
+    // tutor-seed-proxy pattern, stood up because cfg:service
+    // exists only in the SITE namespace while the ACADEMY_VIDEO
+    // binding exists only on the academy deployment).
+    (method === 'POST' && path === '/api/admin/academy/r2-mig-proxy') ||
     // Pack L (2026-11-02): the monthly newsletter job publishes the
     // Market Pulse dataset with the service token — /api/login is
     // Turnstile-gated server-side, so a job can never hold an admin
@@ -3562,7 +3575,7 @@ async function academyContentUpdatedAt(env) {
   try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
 }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -10599,6 +10612,88 @@ async function handleRequest(request, env, ctx) {
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
       }
+    /* Pack R2MigProxy (2026-11-12): R2 migration, INTERNAL family —
+       the mirror of booklet-seed/tutor-seed above. The direct R2
+       transfer routes (/api/admin/academy/r2-object, r2-list) are
+       admitted by the admin gate (owner session or SERVICE), but
+       cfg:service lives only in the SITE namespace, so a SERVICE
+       call can never pass on the ACADEMY deployment — while the
+       ACADEMY_VIDEO binding exists only on THIS deployment. The
+       operator's migration driver therefore reaches the bucket
+       through the SITE deployment's
+       /api/admin/academy/r2-mig-proxy (SERVICE-scoped), which
+       calls this route server-to-server under the SAME
+       cfg:internal secret (X-Internal-Secret, timing-safe
+       compare). Admission is that secret ONLY and fails closed:
+       cfg:internal absent → 503 not_configured; a wrong or
+       missing secret → 401 and the binding is never touched.
+       One call executes ONE op from the JSON body
+       {op, key?, prefix?, cursor?, bodyB64?}:
+         put  — the key must match ACADEMY_B2_KEY_RE; bodyB64
+                decodes to at most 4 MiB (larger → 413); the
+                content type is recomputed HERE from the key
+                extension (the r2-object PUT's derivation — a
+                contentType field in the body is never trusted)
+                and the object lands with that type.
+         head — the r2-object probe shape {exists, size|null}.
+         list — ONE page per call (the driver paginates): the
+                binding's list under the prefix at limit 1000,
+                the page cursor passed through.
+       A missing binding is a clean 503 r2_not_configured. Every
+       executed op audits once (action 'r2_mig'; the detail
+       carries op + key/prefix only — never body content). */
+    if (path === '/api/internal/academy/r2-mig' && request.method === 'POST') {
+      const icfgM = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+      if (!icfgM || !icfgM.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+      const msec = request.headers.get('X-Internal-Secret') || '';
+      if (!msec || !timingSafeEqual(msec, String(icfgM.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+      let md = null;
+      try { md = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+      const mop = String(md.op || '');
+      if (mop !== 'put' && mop !== 'head' && mop !== 'list') return json({ ok: false, error: 'validation' }, 400, origin);
+      const mbucket = env.ACADEMY_VIDEO;
+      const mip = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
+      if (mop === 'put') {
+        const mkey = String(md.key || '');
+        if (!ACADEMY_B2_KEY_RE.test(mkey)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        if (!mbucket || typeof mbucket.put !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+        const mb64 = String(md.bodyB64 || '').replace(/\s/g, '');
+        if (!mb64 || !/^[A-Za-z0-9+/=]+$/.test(mb64)) return json({ ok: false, error: 'validation' }, 400, origin);
+        // 4 MiB decoded ceiling: the base64 length alone proves
+        // a larger payload (4 MiB encodes to 5,592,408 chars)
+        // before anything is decoded.
+        if (mb64.length > 5592408) return json({ ok: false, error: 'too_large' }, 413, origin);
+        const mbytes = bookletB64Decode(mb64);
+        if (!mbytes) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (mbytes.length > 4194304) return json({ ok: false, error: 'too_large' }, 413, origin);
+        if (!mbytes.length) return json({ ok: false, error: 'empty_body' }, 400, origin);
+        const mct = mkey.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (mkey.endsWith('.ts') ? 'video/MP2T' : (mkey.endsWith('.vtt') ? 'text/vtt' : 'application/octet-stream'));
+        try { await mbucket.put(mkey, mbytes, { httpMetadata: { contentType: mct } }); } catch (e) { return json({ ok: false, error: 'r2_put_failed' }, 502, origin); }
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'put', key: mkey, size: mbytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        return json({ ok: true, size: mbytes.length }, 200, origin);
+      }
+      if (mop === 'head') {
+        const mkey = String(md.key || '');
+        if (!ACADEMY_B2_KEY_RE.test(mkey)) return json({ ok: false, error: 'invalid_key' }, 400, origin);
+        if (!mbucket || typeof mbucket.head !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+        let mhead = null;
+        try { mhead = await mbucket.head(mkey); } catch (e) { return json({ ok: false, error: 'r2_head_failed' }, 502, origin); }
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'head', key: mkey, exists: !!mhead } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        if (!mhead) return json({ ok: true, exists: false, size: null }, 200, origin);
+        return json({ ok: true, exists: true, size: mhead.size }, 200, origin);
+      }
+      const mprefix = String(md.prefix || 'media/');
+      if (mprefix.indexOf('media/') !== 0 || mprefix.indexOf('..') !== -1) return json({ ok: false, error: 'invalid_prefix' }, 400, origin);
+      if (!mbucket || typeof mbucket.list !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+      const mcursor = (typeof md.cursor === 'string' && md.cursor) ? md.cursor : undefined;
+      let mres = null;
+      try { mres = await mbucket.list({ prefix: mprefix, limit: 1000, cursor: mcursor }); } catch (e) { return json({ ok: false, error: 'r2_list_failed' }, 502, origin); }
+      const mobjs = (mres && mres.objects) || [];
+      const mkeys = mobjs.map(function (o) { return { key: o.key, size: o.size }; });
+      const mtrunc = !!(mres && mres.truncated);
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'list', prefix: mprefix, keys: mkeys.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      return json({ ok: true, keys: mkeys, cursor: (mtrunc && mres.cursor) ? String(mres.cursor) : null, truncated: mtrunc }, 200, origin);
+    }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
@@ -10610,7 +10705,7 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/admin/academy/r2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed' || p === '/api/admin/academy/tutor-seed-proxy') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy' || p === '/api/admin/academy/r2-mig-proxy' || p === '/api/internal/academy/r2-mig') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/admin/academy/r2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed' || p === '/api/admin/academy/tutor-seed-proxy') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
     // Pack AcademyBuildA2 (Finding 7, QC Round 3 addendum): tutor-seed rides the
     // 6 MiB cap above — the compiled EN index part is ~151 KB, far past the
     // 32 KB default that used to 413 it before the handler ran; the handler's
@@ -10619,6 +10714,12 @@ async function handleRequest(request, env, ctx) {
     // the same 6 MiB group — it forwards the same seed bodies
     // verbatim. (The internal twin parses its own body in the pre-cap
     // internal family block, exactly like internal booklet-seed.)
+    // Pack R2MigProxy (2026-11-12): r2-mig-proxy + internal r2-mig
+    // ride the 10 MiB branch above — a migration PUT body is the
+    // object's base64 (≈3.1 MB for the largest packaged object)
+    // inside the JSON envelope. (The internal route parses its
+    // own body in the pre-cap internal family block, exactly like
+    // internal booklet-seed; its entry is for consistency.)
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -14909,6 +15010,40 @@ async function handleRequest(request, env, ctx) {
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', lang: String(tsd.lang || ''), part: String(tsd.part || '') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         await bumpAcademyContent(env);
+        return json(upBody, up.status, origin);
+      }
+      if (path === '/api/admin/academy/r2-mig-proxy' && request.method === 'POST') {
+        // Pack R2MigProxy (2026-11-12): SERVICE-scoped proxy to the
+        // ACADEMY deployment's internal r2-mig route (the
+        // tutor-seed-proxy pattern). The operator's migration
+        // driver authenticates HERE with the SERVICE token
+        // (cfg:service lives in this namespace); the hop to the
+        // academy deployment rides cfg:internal. An owner session
+        // never suffices — the route enforces scopedAuthed ONLY.
+        // The academy's response returns VERBATIM (status +
+        // body): the driver steers per object on the internal
+        // route's own verdicts (200 size / 400 invalid_key /
+        // 413 too_large / 503 r2_not_configured); only a dead
+        // upstream hop maps to 502 upstream_failed
+        // (upstreamStatus 0), the family shape. No site-side
+        // audit: the internal route audits each executed op
+        // (action 'r2_mig') in the ACADEMY namespace, where the
+        // objects land — a proxy audit would double the KV write
+        // cost of a 9,316-call migration for no new evidence
+        // (the direct r2-object transfer route is unaudited for
+        // the same reason).
+        if (!(await scopedAuthed(request, env, path, request.method))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let rmd = null;
+        try { rmd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const icfgR = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+        if (!icfgR || !icfgR.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let up = null;
+        let upBody = null;
+        try {
+          up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/r2-mig', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgR.secret) }, body: JSON.stringify(rmd), signal: AbortSignal.timeout(60000) });
+          upBody = await up.json().catch(() => null);
+        } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
+        if (!upBody) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
         return json(upBody, up.status, origin);
       }
       // ---- admin: Academy × Stripe config (Pack AcademyStripe) ----
