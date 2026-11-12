@@ -39,3 +39,18 @@ id = "4b95ef2b634b49319ada09aefe5fb9c1"
 # returns false) — acceptable because /api/login is site-family and
 # 404s here — and the ai-chat / seller / newsletter service checks
 # live in site-family maintenance code the scope gate never reaches.
+
+# Pack R2VideoServe (2026-11-12): the Academy media store on THIS
+# (business) account is the Cloudflare R2 bucket
+# 'eh-realty-academy-videos', bound as ACADEMY_VIDEO. The worker's
+# read layer (academyVideoGet / academyVideoHead) prefers this
+# binding and falls back to Backblaze B2 (cfg:b2) whenever the
+# binding is absent, an object is missing, or an R2 read fails —
+# so this block is ACADEMY-DEPLOYMENT ONLY: the personal
+# deployment's wrangler.toml deliberately does NOT carry it
+# (env.ACADEMY_VIDEO stays absent there and every read stays on
+# B2). The bucket must exist on the business account BEFORE this
+# config is committed (see APPLY.md).
+[[r2_buckets]]
+binding = "ACADEMY_VIDEO"
+bucket_name = "eh-realty-academy-videos"
