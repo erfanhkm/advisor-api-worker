@@ -3786,6 +3786,28 @@ function effectiveStatus(rec, nowMs) {
   if (Date.parse(rec.expiresAt) <= nowMs) return 'expired';
   return 'active';
 }
+async function academyLoadProfile(env, keyName) {
+  // Pack AcademyStudentsListFix (2026-11-12): reader-side profile
+  // guard for the two 'academy:' prefix SCANS (admin overview +
+  // students list). The prefix covers more than enrolment profiles:
+  // bumpAcademyContent() stores a PLAIN ISO STRING at
+  // 'academy:contentUpdatedAt' — a KV get with {type:'json'} on it
+  // THROWS — and progress snapshots live at 'academy:snap:<ne>' as
+  // JSON objects with no email. Either record, swept into a scan
+  // that assumed every 'academy:' value is a profile, 500s or
+  // pollutes the whole list. Rule: a key is a profile ONLY when the
+  // record loads without throwing AND is a plain object whose
+  // string email normalizes to the key's suffix (every profile
+  // write derives its key as 'academy:' + normEmail(rec.email)
+  // — academyPut). Anything else is skipped, never fatal.
+  // Single-key readers (academyGet) are deliberately untouched.
+  let rec = null;
+  try { rec = await env.LEADS.get(keyName, { type: 'json' }); } catch (e) { return null; }
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return null;
+  if (typeof rec.email !== 'string' || rec.email.length === 0) return null;
+  if (keyName !== 'academy:' + normEmail(rec.email)) return null;
+  return rec;
+}
 async function academyGet(env, email) {
   if (!email) return null;
   return await env.LEADS.get('academy:' + normEmail(email), { type: 'json' });
@@ -3817,7 +3839,7 @@ async function academySummary(env, rec, nowMs) {
   // engine-owned keys and are null until the student has studied.
   const ne = normEmail(rec.email);
   const daysLeft = Math.ceil((Date.parse(rec.expiresAt) - nowMs) / 86400000);
-  const sum = { email: rec.email, product: rec.product, status: effectiveStatus(rec, nowMs), accessMonths: rec.accessMonths, activatedAt: rec.activatedAt, expiresAt: rec.expiresAt, daysLeft: daysLeft, readiness: null, progressPct: null, lessonsMastered: null, mistakeCount: null, lastActiveAt: null, source: rec.source || 'manual', createdBy: rec.createdBy || 'admin' };
+  const sum = { email: rec.email, name: rec.name || null, product: rec.product, status: effectiveStatus(rec, nowMs), accessMonths: rec.accessMonths, activatedAt: rec.activatedAt, expiresAt: rec.expiresAt, daysLeft: daysLeft, readiness: null, progressPct: null, lessonsMastered: null, mistakeCount: null, lastActiveAt: null, source: rec.source || 'manual', createdBy: rec.createdBy || 'admin' };
   const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
   const ready = await env.LEADS.get('acready:' + ne, { type: 'json' });
   const mist = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
@@ -4254,9 +4276,9 @@ function mediaBoxOf(text) {
   const m = /\/MediaBox\s*\[\s*([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s*\]/.exec(text);
   return m ? [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])] : null;
 }
-function mergeFontIntoResources(pageDict, fontRefNum, getObjDict) {
+function mergeFontIntoResources(pageDict, fontRefNum, getObjDict, fontName) {
   // returns the new page-dict text with /Fwm available, or null
-  const fontEntry = '/Fwm ' + fontRefNum + ' 0 R';
+  const fontEntry = '/' + (fontName || 'Fwm') + ' ' + fontRefNum + ' 0 R';
   const ri = pageDict.indexOf('/Resources');
   if (ri === -1) {
     return pageDict.replace(/>>\s*$/, ' /Resources << /Font << ' + fontEntry + ' >> >> >>');
@@ -4511,10 +4533,225 @@ async function acsecEvent(env, ne, kind, detail) {
 // Vancouver serve day. The sample edition binds to 'SAMPLE' instead —
 // never to a student identity.
 function acadB64Id(str) { try { return btoa(String(str)).replace(/=+$/, ''); } catch (e) { return ''; } }
-function acadBookletFooter(email) { return 'EH REALTY ACADEMY · Licensed to ' + email + ' · ' + todayVancouver() + ' · Do not distribute'; }
+function acadBookletFooter(email, name) { const nm = String(name || '').trim(); return 'EH REALTY ACADEMY · Licensed to ' + (nm ? nm + ' (' + email + ')' : email) + ' · ' + todayVancouver() + ' · Do not distribute'; }
 function acadBookletMarker(email) { return 'EHWM1.' + acadB64Id(email + '|' + todayVancouver()); }
 function acadBookletSampleFooter() { return 'EH REALTY ACADEMY · SAMPLE edition · ' + todayVancouver() + ' · Do not distribute'; }
 function acadBookletSampleMarker() { return 'EHWM1.' + acadB64Id('SAMPLE|' + todayVancouver()); }
+// Pack AcademyStampFull: one normalizer for every profile-name write
+// (owner create/rename, Stripe enrol) — trimmed, capped at 120 chars,
+// empty becomes null (the record simply carries no name).
+function acadProfileName(v) { const n = String(v == null ? '' : v).trim().slice(0, 120); return n || null; }
+
+// Pack AcademyStampFull (2026-11-12): ehPdfStampFull — the FULL-
+// REWRITE stamper that REPLACES ehPdfStamp at both booklet serve
+// sites (the incremental revision renders blank in strict
+// renderers; root cause + proof in pack-academy-stampfull-
+// 2026-11-12.md and the 2026-11-12 FINDING in pack-academy-
+// protect-2026-11-11.md). Inlined from its production source
+// (hidden_files/eh-pdf-stamp-full.mjs, WORKER-INLINE section —
+// the STAMPFULL pins assert byte-parity). The Protect-era
+// ehPdfStamp above is superseded for serves; nothing calls it.
+// Pack AcademyStampFull (2026-11-12): span-based object extraction for
+// the full rewrite. An object's span runs from its xref offset to the
+// next boundary (the next used object's offset, the xref position, or
+// EOF); the body is recovered from the span END backwards, because a
+// compressed stream's bytes may contain the literal text 'endobj' — a
+// forward indexOf('endobj') (the old objBody) can truncate a stream.
+function pdfFullObjBody(s, num, entry, spanEnd) {
+  const m = /^(\d+) (\d+) obj\r?\n/.exec(s.slice(entry.off, entry.off + 32));
+  if (!m) return null;
+  if (parseInt(m[1], 10) !== num || parseInt(m[2], 10) !== entry.gen) return null;
+  const tail = s.slice(entry.off + m[0].length, spanEnd);
+  const em = /endobj\s*$/.exec(tail);
+  if (!em) return null;
+  return tail.slice(0, em.index).replace(/\r?\n$/, '');
+}
+function pdfFullObjDict(body) {
+  if (body === null) return null;
+  const ds = body.indexOf('<<');
+  if (ds < 0) return null;
+  const de = dictEnd(body, ds);
+  if (de < 0) return null;
+  return { body: body, dict: body.slice(ds, de), dictStart: ds, dictEnd: de };
+}
+function pdfFullAddContentsRef(pageDict, newRefNum, getBody) {
+  // Like the old addContentsRef, except a /Contents REFERENCE is
+  // resolved first: when it names an ARRAY object (the pypdf/reportlab
+  // booklet shape: /Contents N 0 R where N is '[ s1 0 R s2 0 R ]'),
+  // the array's elements are FLATTENED into the new contents array.
+  // Wrapping the array reference instead — /Contents [N 0 R ov 0 R] —
+  // nests an array inside the contents array, which strict renderers
+  // reject (poppler: "Weird page contents"; pdf.js drops the nested
+  // sub-stream and only the overlay survives). A reference to a stream
+  // object is wrapped as before; anything else is a bail.
+  const cm = /\/Contents\s+(\d+)\s+(\d+)\s+R/.exec(pageDict);
+  if (cm) {
+    const target = getBody ? getBody(parseInt(cm[1], 10)) : null;
+    if (target === null) return null;
+    const t = target.trim();
+    if (t.charAt(0) === '[') {
+      if (t.charAt(t.length - 1) !== ']') return null;
+      const inner = t.slice(1, -1).trim();
+      if (!/^[\d\sR]*$/.test(inner)) return null;
+      return pageDict.replace(cm[0], '/Contents [' + inner + ' ' + newRefNum + ' 0 R]');
+    }
+    if (t.slice(0, 2) !== '<<') return null;
+    return pageDict.replace(cm[0], '/Contents [' + cm[1] + ' ' + cm[2] + ' R ' + newRefNum + ' 0 R]');
+  }
+  const am = /\/Contents\s*\[([^\]]*)\]/.exec(pageDict);
+  if (am) return pageDict.replace(am[0], '/Contents [' + am[1] + ' ' + newRefNum + ' 0 R]');
+  if (pageDict.indexOf('/Contents') !== -1) return null; // stream-form contents — bail
+  return pageDict.replace(/>>\s*$/, ' /Contents ' + newRefNum + ' 0 R >>');
+}
+
+async function ehPdfStampFull(bytes, opts) {
+  try {
+    const footer = String(opts && opts.footer || '');
+    const marker = String(opts && opts.marker || '');
+    if (!footer || !marker) return null;
+    const s = b2s(bytes);
+    if (s.slice(0, 5) !== '%PDF-') return null;
+    if (s.indexOf('/ObjStm') !== -1) return null; // object streams — bail
+    if (s.indexOf('/XRefStm') !== -1) return null; // hybrid xref streams — bail
+    const sxIdx = s.lastIndexOf('startxref');
+    if (sxIdx < 0) return null;
+    const sxM = /startxref\s*(\d+)/.exec(s.slice(sxIdx, sxIdx + 48));
+    if (!sxM) return null;
+    const firstXrefPos = parseInt(sxM[1], 10);
+    const xr = parseXrefAt(s, firstXrefPos);
+    if (!xr) return null; // startxref not at a classic xref table (xref stream) — bail
+    if (xr.prev !== null) return null; // incremental history — bail; the booklets are single-revision
+    const trailer = xr.trailer;
+    if (/\/Encrypt\b/.test(trailer)) return null;
+    const entries = xr.entries;
+    const sizeM = /\/Size\s+(\d+)/.exec(trailer);
+    const size = sizeM ? parseInt(sizeM[1], 10) : 0;
+    const rootRef = refOf(trailer, 'Root');
+    if (!rootRef || !size) return null;
+    const infoRef = refOf(trailer, 'Info');
+    // Span boundaries: every used object's offset + the xref position
+    // + EOF. Duplicate offsets mean a corrupt table — bail.
+    const usedNums = [];
+    for (const [num, e] of entries) if (e.used) usedNums.push(num);
+    if (!usedNums.length) return null;
+    const offs = usedNums.map(function (n) { return entries.get(n).off; });
+    if (new Set(offs).size !== offs.length) return null;
+    const bounds = offs.concat([firstXrefPos, s.length]).sort(function (a, b) { return a - b; });
+    const spanEndOf = function (off) { for (let i = 0; i < bounds.length; i++) if (bounds[i] > off) return bounds[i]; return s.length; };
+    const getEntry = function (num) { return entries.get(num) || null; };
+    const getBody = function (num) { const e = getEntry(num); return e && e.used ? pdfFullObjBody(s, num, e, spanEndOf(e.off)) : null; };
+    const getObjDict = function (num) { return pdfFullObjDict(getBody(num)); };
+    // Extract EVERY used object's body up front: if any object cannot
+    // be recovered byte-exact, stamping this file is not attempted.
+    const bodies = new Map();
+    for (const n of usedNums) {
+      const b = getBody(n);
+      if (b === null) return null;
+      bodies.set(n, b);
+    }
+    const root = getObjDict(rootRef.num);
+    if (!root) return null;
+    const pagesRef = refOf(root.dict, 'Pages');
+    if (!pagesRef) return null;
+    // Walk the Pages tree.
+    const pages = [];
+    const walk = function (num, inheritedBox) {
+      const od = getObjDict(num);
+      if (!od) return false;
+      const box = mediaBoxOf(od.dict) || inheritedBox;
+      if (/\/Type\s*\/Page(?![a-zA-Z])/.test(od.dict)) { pages.push({ num: num, dict: od.dict, body: od.body, dictStart: od.dictStart, dictEnd: od.dictEnd, box: box }); return true; }
+      const kidsM = /\/Kids\s*\[([^\]]*)\]/.exec(od.dict);
+      if (!kidsM) return false;
+      const refs = [...kidsM[1].matchAll(/(\d+)\s+(\d+)\s+R/g)].map(function (m) { return parseInt(m[1], 10); });
+      for (const k of refs) if (!walk(k, box)) return false;
+      return true;
+    };
+    if (!walk(pagesRef.num, null)) return null;
+    if (!pages.length) return null;
+    // Allocate new object numbers above every existing number. Two
+    // watermark fonts: /Fwm = Helvetica-Bold (the visible footer —
+    // Erfan's 2026-11-12 ruling: bold letterforms read tighter at
+    // 7.5pt) and /Fwmr = regular Helvetica (the invisible marker).
+    let maxNum = size - 1;
+    for (const n of usedNums) if (n > maxNum) maxNum = n;
+    let next = maxNum + 1;
+    const fontNum = next++;
+    const fontRegNum = next++;
+    const contentNums = pages.map(function () { return next++; });
+    const infoNum = infoRef ? infoRef.num : next++;
+    const newSize = Math.max(size, next);
+    // Replacement bodies: the two fonts, one overlay stream per page,
+    // the edited page dicts, the rewritten Info dict. Every other
+    // used object is emitted from `bodies` byte-exact.
+    const repl = new Map();
+    repl.set(fontNum, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>');
+    repl.set(fontRegNum, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>');
+    for (let i = 0; i < pages.length; i++) {
+      const box = pages[i].box || [0, 0, 612, 792];
+      const topY = Math.round(box[3] - 14);
+      const text = 'q\nBT /Fwm 7.5 Tf 0.45 g 36 16 Td (' + escPdfStr(footer) + ') Tj ET\n' +
+        'BT /Fwmr 1 Tf 3 Tr 36 ' + topY + ' Td (' + escPdfStr(marker) + ') Tj ET\nQ\n';
+      const comp = await deflateBytes(s2b(text));
+      repl.set(contentNums[i], '<< /Length ' + comp.length + ' /Filter /FlateDecode >>\nstream\n' + b2s(comp) + '\nendstream');
+      let newDict = pdfFullAddContentsRef(pages[i].dict, contentNums[i], getBody);
+      if (newDict === null) return null;
+      newDict = mergeFontIntoResources(newDict, fontNum, getObjDict, 'Fwm');
+      if (newDict === null) return null;
+      newDict = mergeFontIntoResources(newDict, fontRegNum, getObjDict, 'Fwmr');
+      if (newDict === null) return null;
+      repl.set(pages[i].num, newDict + pages[i].body.slice(pages[i].dictEnd));
+    }
+    if (infoRef) {
+      const io = getObjDict(infoRef.num);
+      if (!io) return null;
+      let d = io.dict;
+      if (/\/EHWM\s*\(/.test(d)) d = d.replace(/\/EHWM\s*\((?:\\.|[^\\()])*\)/, '/EHWM (' + escPdfStr(marker) + ')');
+      else d = d.replace(/^<<\s*/, '<< /EHWM (' + escPdfStr(marker) + ') ');
+      if (/\/Keywords\s*\(/.test(d)) d = d.replace(/\/Keywords\s*\((?:\\.|[^\\()])*\)/, '/Keywords (' + escPdfStr(marker) + ')');
+      else d = d.replace(/^<<\s*/, '<< /Keywords (' + escPdfStr(marker) + ') ');
+      repl.set(infoNum, d + io.body.slice(io.dictEnd));
+    } else {
+      repl.set(infoNum, '<< /Producer (pypdf) /Keywords (' + escPdfStr(marker) + ') /EHWM (' + escPdfStr(marker) + ') >>');
+    }
+    // Emit the complete file: original header lines, every object in
+    // ascending number order, ONE xref table, fresh trailer (the
+    // original /ID is preserved; there is deliberately NO /Prev).
+    let out = '';
+    const nl1 = s.indexOf('\n');
+    if (nl1 < 0) return null;
+    out += s.slice(0, nl1 + 1);
+    const afterFirst = s.slice(nl1 + 1);
+    const nl2 = afterFirst.indexOf('\n');
+    if (nl2 > 0 && afterFirst.charAt(0) === '%') out += afterFirst.slice(0, nl2 + 1);
+    const emitNums = [...new Set([...usedNums, ...repl.keys()])].sort(function (a, b) { return a - b; });
+    const offsets = new Map();
+    const gens = new Map();
+    for (const n of emitNums) {
+      const body = repl.has(n) ? repl.get(n) : bodies.get(n);
+      const gen = entries.has(n) ? entries.get(n).gen : 0;
+      offsets.set(n, out.length);
+      gens.set(n, gen);
+      out += n + ' ' + gen + ' obj\n' + body + '\nendobj\n';
+    }
+    const xrefOff = out.length;
+    let x = 'xref\n0 ' + newSize + '\n';
+    x += '0000000000 65535 f \n';
+    for (let n = 1; n < newSize; n++) {
+      if (offsets.has(n)) x += String(offsets.get(n)).padStart(10, '0') + ' ' + String(gens.get(n)).padStart(5, '0') + ' n \n';
+      else { const e = entries.get(n); x += '0000000000 ' + String(e ? e.gen : 0).padStart(5, '0') + ' f \n'; }
+    }
+    const infoGen = entries.has(infoNum) ? entries.get(infoNum).gen : 0;
+    let tr = '<< /Size ' + newSize + ' /Root ' + rootRef.num + ' ' + rootRef.gen + ' R /Info ' + infoNum + ' ' + infoGen + ' R';
+    const idM = /\/ID\s*(\[[^\]]*\])/.exec(trailer);
+    if (idM) tr += ' /ID ' + idM[1];
+    tr += ' >>';
+    x += 'trailer\n' + tr + '\nstartxref\n' + xrefOff + '\n%%EOF\n';
+    out += x;
+    return s2b(out);
+  } catch (e) {
+    return null;
+  }
+}
 
 function bookletB64Decode(b64) {
   try {
@@ -5389,6 +5626,7 @@ async function academyStripeEnrol(env, sess, eventId, evtCreated, ip) {
   // same rules, profile stays blocked). A paid product REPLACES the
   // record's product/accessMonths (they describe the latest grant).
   const email = String((sess.customer_details && sess.customer_details.email) || sess.customer_email || '').trim().toLowerCase();
+  const custName = acadProfileName(sess.customer_details && sess.customer_details.name);
   if (!EMAIL_RE.test(email)) return { status: 400, body: { ok: false, error: 'no_email' } };
   const tier = await stripeSessionTier(env, sess);
   if (!tier) return { status: 400, body: { ok: false, error: 'unknown_product' } };
@@ -5397,11 +5635,12 @@ async function academyStripeEnrol(env, sess, eventId, evtCreated, ip) {
   const staleMs = typeof evtCreated === 'number' && isFinite(evtCreated) ? Math.max(0, nowMs - evtCreated * 1000) : 0;
   const existing = await academyGet(env, email);
   if (!existing) {
-    const rec = { email: email, product: tier.product, status: 'active', accessMonths: tier.accessMonths, activatedAt: nowIso, expiresAt: academyAddMonths(nowIso, tier.accessMonths), source: 'stripe', createdBy: 'stripe', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: null };
+    const rec = { email: email, name: custName, product: tier.product, status: 'active', accessMonths: tier.accessMonths, activatedAt: nowIso, expiresAt: academyAddMonths(nowIso, tier.accessMonths), source: 'stripe', createdBy: 'stripe', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: null };
     await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
     await academyAudit(env, 'academy.create', normEmail(email), ip, { product: tier.product, accessMonths: tier.accessMonths, expiresAt: rec.expiresAt, source: 'stripe', stripeEvent: eventId || null, stripeSession: sess.id || null, staleMs: staleMs });
     return { status: 200, body: { ok: true, enrolled: 'created', email: normEmail(email), product: tier.product, expiresAt: rec.expiresAt } };
   }
+  if (!existing.name && custName) existing.name = custName;
   const prev = existing.expiresAt;
   const baseIso = Date.parse(prev) > nowMs ? prev : nowIso;
   existing.product = tier.product;
@@ -12739,7 +12978,7 @@ async function handleRequest(request, env, ctx) {
           // the SAMPLE edition — stamped as such on every page, never
           // with a student identity. A stamp failure serves the raw
           // sample bytes rather than breaking the public page.
-          const sStamped = await ehPdfStamp(sbytes, { footer: acadBookletSampleFooter(), marker: acadBookletSampleMarker() });
+          const sStamped = await ehPdfStampFull(sbytes, { footer: acadBookletSampleFooter(), marker: acadBookletSampleMarker() });
           return new Response(sStamped || sbytes, { status: 200, headers: Object.assign({}, cors(origin), { 'Content-Type': 'application/pdf', 'Content-Disposition': 'inline; filename="m5-l1-booklet.pdf"', 'Cache-Control': 'private, no-store', 'X-Booklet-Lang': 'en', 'X-Booklet-Sample': '1', 'X-Booklet-Stamped': sStamped ? '1' : '0' }) });
         }
         const email = String(url.searchParams.get('email') || '').trim().toLowerCase();
@@ -12793,7 +13032,7 @@ async function handleRequest(request, env, ctx) {
         // protection must never break a legitimate serve.
         if (studentOk) {
           await acsecEvent(env, normEmail(email), 'booklet', bkind + ':' + bid);
-          const stamped = await ehPdfStamp(bytes, { footer: acadBookletFooter(email), marker: acadBookletMarker(email) });
+          const stamped = await ehPdfStampFull(bytes, { footer: acadBookletFooter(email, ent.enrolment && ent.enrolment.name), marker: acadBookletMarker(email) });
           if (stamped) { bh['X-Booklet-Stamped'] = '1'; return new Response(stamped, { status: 200, headers: bh }); }
         }
         return new Response(bytes, { status: 200, headers: bh });
@@ -14373,7 +14612,7 @@ async function handleRequest(request, env, ctx) {
         const counts = { total: 0, active: 0, blocked: 0, expired: 0, expiring14: 0 };
         const expiring = [];
         for (const k of keys) {
-          const rec = await env.LEADS.get(k.name, { type: 'json' });
+          const rec = await academyLoadProfile(env, k.name);
           if (!rec) continue;
           counts.total++;
           const st = effectiveStatus(rec, nowMs);
@@ -14406,7 +14645,7 @@ async function handleRequest(request, env, ctx) {
         const allKeys = await listAllKeys(env, 'academy:', 1000);
         const matched = [];
         for (const k of allKeys) {
-          const rec = await env.LEADS.get(k.name, { type: 'json' });
+          const rec = await academyLoadProfile(env, k.name);
           if (!rec) continue;
           if (statusF !== 'all' && effectiveStatus(rec, nowMs) !== statusF) continue;
           if (q) {
@@ -14671,7 +14910,7 @@ async function handleRequest(request, env, ctx) {
         }
         const existing = await academyGet(env, email);
         if (existing) return json({ error: 'already_exists' }, 409, origin);
-        const rec = { email: email, product: product, status: 'active', accessMonths: months, activatedAt: nowIso, expiresAt: expiresAt, source: ['manual', 'stripe', 'founding'].indexOf(String(d.source || '')) !== -1 ? String(d.source) : 'manual', createdBy: 'admin', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: d.note ? String(d.note).slice(0, 500) : null };
+        const rec = { email: email, name: acadProfileName(d.name), product: product, status: 'active', accessMonths: months, activatedAt: nowIso, expiresAt: expiresAt, source: ['manual', 'stripe', 'founding'].indexOf(String(d.source || '')) !== -1 ? String(d.source) : 'manual', createdBy: 'admin', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: d.note ? String(d.note).slice(0, 500) : null };
         await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
         // Audit target = the NORMALIZED identity (the KV key suffix) —
         // the same form the detail route's trail lookup uses, so a
@@ -14854,6 +15093,12 @@ async function handleRequest(request, env, ctx) {
             rec.status = 'active'; rec.blockedAt = null; rec.blockReason = null;
             await academyPut(env, rec);
             await academyAudit(env, 'academy.unblock', ne, ip, {});
+            return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
+          }
+          if (action === 'rename') {
+            rec.name = acadProfileName(d.name);
+            await academyPut(env, rec);
+            await academyAudit(env, 'academy.rename', ne, ip, { name: rec.name });
             return json({ student: await academySummary(env, rec, nowMs) }, 200, origin);
           }
           if (action === 'reset-progress') {
