@@ -214,6 +214,11 @@ const GEN_BUMP_EXEMPT = [
   ['POST', '/api/academy/tutor/reset'],
   ['POST', '/api/admin/academy/tutor-provision'],
   ['POST', '/api/admin/academy/tutor-seed'],
+  // Pack AcademyTutorSeedProxy (2026-11-11): the proxy + its
+  // internal twin write only tutor:corpus:/tutor:bank: keys in
+  // ACADEMY KV — the same exemption as the direct route above.
+  ['POST', '/api/admin/academy/tutor-seed-proxy'],
+  ['POST', '/api/internal/academy/tutor-seed'],
   // Pack Tutor2 (2026-11-11): practice/quiz/debrief/feedback/voice
   // writes land only on tutor:/ac* keys of the caller's own record.
   ['POST', '/api/academy/tutor/practice'],
@@ -1136,6 +1141,13 @@ async function scopedAuthed(request, env, path, method) {
     // tutor:corpus: keys built from the course's canonical lesson
     // banks; the route itself validates lang/part/shape and audits.
     (method === 'POST' && path === '/api/admin/academy/tutor-seed') ||
+    // Pack AcademyTutorSeedProxy (2026-11-11): the tutor seed PROXY
+    // joins the SERVICE set — the route itself enforces scopedAuthed
+    // ONLY and forwards the seed body to the ACADEMY deployment's
+    // internal route under cfg:internal (the booklet-seed-proxy
+    // pattern, stood up because cfg:service exists only in the SITE
+    // namespace while the corpus bytes must land in ACADEMY KV).
+    (method === 'POST' && path === '/api/admin/academy/tutor-seed-proxy') ||
     // Pack BookletView (2026-11-11): the booklet SEED joins the
     // SERVICE set (the student booklet GETs do NOT — they run their
     // own session + fresh-entitlement check, the tutor posture). The
@@ -3513,8 +3525,9 @@ function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; ret
 // The KV key 'academy:contentUpdatedAt' (ISO string, this deployment's
 // LEADS namespace) records when an admin-side route last changed
 // COURSE CONTENT. It is written ONLY by bumpAcademyContent() calls in
-// the content seed routes (tutor-seed, booklet-seed, internal
-// booklet-seed, booklet-seed-proxy) and read by the public
+// the content seed routes (tutor-seed, internal tutor-seed,
+// tutor-seed-proxy, booklet-seed, internal booklet-seed,
+// booklet-seed-proxy) and read by the public
 // GET /api/academy/content-meta, which powers the "Course content
 // last updated" line on the Academy site and in the student portal.
 // The key is ABSENT until the first content seed lands — the UIs hide
@@ -3535,7 +3548,7 @@ async function academyContentUpdatedAt(env) {
   try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
 }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -10085,6 +10098,108 @@ async function handleRequest(request, env, ctx) {
       await bumpAcademyContent(env);
       return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
     }
+    /* Pack AcademyTutorSeedProxy (2026-11-11): tutor corpus seed,
+       INTERNAL family — the mirror of booklet-seed above. The direct
+       seed route (/api/admin/academy/tutor-seed) is admitted by the
+       admin gate (owner session or SERVICE), but cfg:service lives
+       only in the SITE namespace, so the operator's unattended seed
+       reaches ACADEMY KV through the SITE deployment's
+       /api/admin/academy/tutor-seed-proxy (SERVICE-scoped), which
+       calls this route server-to-server under the SAME cfg:internal
+       secret (X-Internal-Secret, timing-safe compare). Admission is
+       that secret ONLY and fails closed: cfg:internal absent → 503
+       not_configured; a wrong or missing secret → 401 and nothing is
+       stored. The handler body below is the tutor-seed handler's,
+       VERBATIM (mechanical duplicate — byte-identical apart from the
+       route line and this gate; proof in the pack record): the gate
+       first binds the caller ip exactly as the admin block computes
+       it (that block's `let ip` is declared after this family block,
+       so the twin binds its own), then the original body runs
+       unchanged against this deployment's KV. The body's in-line
+       comment describes the DIRECT route's admission; THIS route's
+       admission is the cfg:internal gate at its head. */
+      if (path === '/api/internal/academy/tutor-seed' && request.method === 'POST') {
+        const icfgT = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+        if (!icfgT || !icfgT.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        const tsec = request.headers.get('X-Internal-Secret') || '';
+        if (!tsec || !timingSafeEqual(tsec, String(icfgT.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const ip = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
+        // Corpus seeding (Pack Tutor): the operator's build script
+        // posts the compiled lesson corpus in two part shapes —
+        // {lang, part:'index', lessons:[…]} → tutor:corpus:<lang>:index
+        // and {lang, part:'module', module:'m5', lessons:[…]} →
+        // tutor:corpus:<lang>:<module>. Admission is the admin gate
+        // (owner session, or the SERVICE token via scopedAuthed —
+        // this route is in the SERVICE set so the parent's seed script
+        // can run unattended). Content derives ONLY from the canonical
+        // lesson banks; the script is
+        // hidden_files/academy-production/tools/seed-tutor-corpus.mjs.
+        let d = null;
+        try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const lang = String(d.lang || '');
+        if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Pack Tutor2 parts: corpus v2 (concept chunks + glossary)
+        // and the graded question bank. Each part validates its own
+        // payload shape; the v1 lessons validation below does not
+        // apply to them (bank-index/glossary carry no lessons array).
+        if (d.part === 'v2-index' || d.part === 'v2-module' || d.part === 'glossary' || d.part === 'bank-index' || d.part === 'bank-module') {
+          if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
+          if (d.part === 'glossary') {
+            if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:glossary', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { part: 'glossary', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
+            return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
+          }
+          if (d.part === 'v2-index') {
+            if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
+            return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
+          }
+          if (d.part === 'v2-module') {
+            const mod2 = String(d.module || '');
+            if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
+            if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-module', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
+            return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
+          }
+          if (d.part === 'bank-index') {
+            if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
+            await env.LEADS.put('tutor:bank:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta }));
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-index', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await bumpAcademyContent(env);
+            return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
+          }
+          const modB = String(d.module || '');
+          if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
+          if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-module', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
+          return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
+        }
+        if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
+        if (d.part === 'index') {
+          await env.LEADS.put('tutor:corpus:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'index', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
+          return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
+        }
+        if (d.part === 'module') {
+          const mod = String(d.module || '');
+          if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
+          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'module', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
+          return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
+        }
+        return json({ ok: false, error: 'validation' }, 400, origin);
+      }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
     // past ~12 items before the route ever ran. One shared helper so
@@ -10096,11 +10211,15 @@ async function handleRequest(request, env, ctx) {
     // large file surfaced as a summary FAILURE instead of a truncated
     // summary. 512KB covers 48k chars even fully multi-byte/escaped;
     // the chunker still reads at most 8 x 6,000 chars of it.
-    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
+    const bodyCapFor = function (p) { if (p === '/api/admin/academy/booklet-seed' || p === '/api/admin/academy/booklet-seed-proxy') return 10485760; return (p === '/api/admin/academy/b2-object' || p === '/api/academy/tutor/chat' || p === '/api/admin/academy/tutor-seed' || p === '/api/admin/academy/tutor-seed-proxy') ? 6291456 : (p === '/api/admin/files' ? 4718592 : ((p.indexOf('/api/admin/listings') === 0 || p === '/api/admin/settings') ? 3145728 : (p === '/api/market-pool' ? 1048576 : (p === '/api/admin/brain/file-summary' ? 524288 : (p === '/api/admin/rules' ? 262144 : (p === '/api/report/property' ? 4096 : (p === '/api/admin/brain/voice' ? 12582912 : 32768))))))); };
     // Pack AcademyBuildA2 (Finding 7, QC Round 3 addendum): tutor-seed rides the
     // 6 MiB cap above — the compiled EN index part is ~151 KB, far past the
     // 32 KB default that used to 413 it before the handler ran; the handler's
     // own 2,500,000-char per-part ceiling stays the real limit.
+    // Pack AcademyTutorSeedProxy (2026-11-11): tutor-seed-proxy rides
+    // the same 6 MiB group — it forwards the same seed bodies
+    // verbatim. (The internal twin parses its own body in the pre-cap
+    // internal family block, exactly like internal booklet-seed.)
     if (request.method === 'POST' || request.method === 'PATCH' || request.method === 'PUT') {
       const cl = parseInt(request.headers.get('Content-Length') || '0', 10);
       const capLimit = bodyCapFor(path);
@@ -14356,6 +14475,30 @@ async function handleRequest(request, env, ctx) {
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
         try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', bytes: upBody.bytes || null } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        await bumpAcademyContent(env);
+        return json(upBody, up.status, origin);
+      }
+      if (path === '/api/admin/academy/tutor-seed-proxy' && request.method === 'POST') {
+        // Pack AcademyTutorSeedProxy (2026-11-11): SERVICE-scoped proxy
+        // to the ACADEMY deployment's internal tutor-seed route (the
+        // booklet-seed-proxy pattern verbatim). The operator's seed
+        // driver authenticates HERE with the SERVICE token (cfg:service
+        // lives in this namespace); the hop to the academy deployment
+        // rides cfg:internal. An owner session never suffices — the
+        // route enforces scopedAuthed ONLY.
+        if (!(await scopedAuthed(request, env, path, request.method))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let tsd = null;
+        try { tsd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const icfgTs = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+        if (!icfgTs || !icfgTs.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let up = null;
+        let upBody = null;
+        try {
+          up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/tutor-seed', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgTs.secret) }, body: JSON.stringify(tsd), signal: AbortSignal.timeout(60000) });
+          upBody = await up.json().catch(() => null);
+        } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
+        if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', lang: String(tsd.lang || ''), part: String(tsd.part || '') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
