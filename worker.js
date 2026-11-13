@@ -3120,6 +3120,237 @@ async function stampLastTouch(env, email) {
     await siteKvPut(env, 'cmeta:' + ne, JSON.stringify(cm));
   } catch (e) {}
 }
+/* ---- Pack TelephonyPreciser (2026-11-12): number enrichment +
+   the unified per-person timeline --------------------------------
+   (a) LOCAL PARSE (always on, free): parseNumLocal stamps every
+   new call/SMS record with numInfo for the COUNTERPARTY number —
+   E.164 normalisation (normPhone), a region read off the NANP
+   area code, and a line type that stays 'unknown' unless the
+   number is toll-free (the one class a local parse can honestly
+   call). source is always 'local-parse' and a derived lineType
+   is flagged as a GUESS (lineTypeGuess) — never presented as
+   provider truth.
+   (b) TWILIO LOOKUP (flag-gated, INERT by default): only when
+   cfg:calls.lookup === true AND the provider is Twilio with SID
+   + token present does scheduleLookupEnrich fetch Lookup v2
+   (caller_identity + line_type_intelligence) for the counterparty
+   and write an enrichment block { source:'lookup', ... } onto
+   the ALREADY-STORED record. Lookup is a PAID per-request API
+   and no live Twilio account exists yet, so the flag defaults
+   OFF and this path never runs in production today; a failed or
+   slow Lookup never blocks or breaks call/SMS storage (every
+   failure is swallowed).
+   (c) TIMELINE: buildTimeline merges call: + sms: records (and
+   wa: records via the waTimelineEvent merge point — see the
+   pack's APPLY.md) for one person into a single chronological,
+   channel-tagged, deduped event list behind
+   GET /api/admin/timeline. */
+const NANP_CA_REGIONS = { '204': 'Manitoba', '226': 'Ontario', '236': 'British Columbia', '249': 'Ontario', '250': 'British Columbia', '289': 'Ontario', '306': 'Saskatchewan', '343': 'Ontario', '365': 'Ontario', '367': 'Quebec', '368': 'Alberta', '403': 'Alberta', '416': 'Ontario', '418': 'Quebec', '431': 'Manitoba', '437': 'Ontario', '438': 'Quebec', '450': 'Quebec', '506': 'New Brunswick', '514': 'Quebec', '519': 'Ontario', '548': 'Ontario', '581': 'Quebec', '587': 'Alberta', '579': 'Quebec', '604': 'British Columbia', '613': 'Ontario', '639': 'Saskatchewan', '647': 'Ontario', '672': 'British Columbia', '705': 'Ontario', '709': 'Newfoundland and Labrador', '778': 'British Columbia', '780': 'Alberta', '782': 'Nova Scotia / PEI', '807': 'Ontario', '819': 'Quebec', '825': 'Alberta', '867': 'Northern Canada', '873': 'Quebec', '902': 'Nova Scotia / PEI', '905': 'Ontario' };
+const NANP_TOLLFREE = ['800', '833', '844', '855', '866', '877', '888'];
+function parseNumLocal(v) {
+  const e164 = normPhone(v);
+  const digits = e164.replace(/\D/g, '');
+  const out = { source: 'local-parse', e164: e164, region: 'unknown', lineType: 'unknown', lineTypeGuess: false };
+  if (!digits) return out;
+  const nanp = (digits.length === 11 && digits.charAt(0) === '1') ? digits.slice(1) : (digits.length === 10 ? digits : '');
+  if (nanp) {
+    const area = nanp.slice(0, 3);
+    if (NANP_TOLLFREE.indexOf(area) !== -1) { out.region = 'North America (toll-free)'; out.lineType = 'toll-free'; out.lineTypeGuess = true; return out; }
+    if (NANP_CA_REGIONS[area]) { out.region = NANP_CA_REGIONS[area]; return out; }
+    out.region = 'Canada/US (+1)';
+    return out;
+  }
+  out.region = 'International';
+  return out;
+}
+/* The one-line enrichment summary a surface (screen pop,
+   timeline) shows for a record: the Lookup block wins when
+   present (real caller name / carrier / line type); otherwise
+   the local parse's region (plus the toll-free class). '' when
+   the record carries neither. */
+function callEnrichLine(rec) {
+  try {
+    if (!rec) return '';
+    const en = rec.enrichment;
+    if (en && en.source === 'lookup') {
+      const bits = [];
+      if (en.callerName) bits.push(String(en.callerName).slice(0, 40));
+      if (en.carrier) bits.push(String(en.carrier).slice(0, 30));
+      if (en.lineType) bits.push(String(en.lineType).slice(0, 20));
+      if (bits.length) return '\u{1F4CD} ' + bits.join(' · ');
+    }
+    const ni = rec.numInfo;
+    if (ni && ni.region && ni.region !== 'unknown') return '\u{1F4CD} ' + ni.region + (ni.lineType === 'toll-free' ? ' · toll-free' : '');
+  } catch (e) {}
+  return '';
+}
+async function maybeLookupEnrich(env, kind, id, number) {
+  try {
+    const cfg = await getCallsCfg(env);
+    if (!cfg || cfg.lookup !== true) return; // the flag: default OFF, Lookup is a paid API
+    if (cfg.provider !== 'twilio' || !cfg.twilioAccountSid || !cfg.twilioAuthToken) return;
+    const e164 = normPhone(number);
+    if (phoneLast10(e164).length < 10) return;
+    const r = await fetch('https://lookups.twilio.com/v2/PhoneNumbers/' + encodeURIComponent(e164) + '?Fields=caller_identity,line_type_intelligence', {
+      signal: AbortSignal.timeout(6000),
+      headers: { Authorization: 'Basic ' + btoa(cfg.twilioAccountSid + ':' + cfg.twilioAuthToken) }
+    });
+    if (!r.ok) return;
+    const j = await r.json().catch(function () { return null; });
+    if (!j) return;
+    const block = { source: 'lookup', at: new Date().toISOString(), valid: j.valid !== false };
+    const ci = j.caller_identity || {};
+    if (ci.caller_name) block.callerName = String(ci.caller_name).slice(0, 80);
+    if (ci.caller_type) block.callerType = String(ci.caller_type).slice(0, 40);
+    const lt = j.line_type_intelligence || {};
+    if (lt.carrier_name) block.carrier = String(lt.carrier_name).slice(0, 80);
+    if (lt.type) block.lineType = String(lt.type).slice(0, 40);
+    if (lt.mobile_country_code) block.mcc = String(lt.mobile_country_code).slice(0, 8);
+    if (lt.mobile_network_code) block.mnc = String(lt.mobile_network_code).slice(0, 8);
+    const key = (kind === 'sms' ? 'sms:' : 'call:') + id;
+    const rec = await siteKvGet(env, key, { type: 'json' });
+    if (!rec || rec.enrichment) return;
+    rec.enrichment = block;
+    await siteKvPut(env, key, JSON.stringify(rec));
+  } catch (e) {}
+}
+function scheduleLookupEnrich(env, kind, id, number, ctx) {
+  const p = maybeLookupEnrich(env, kind, id, number);
+  if (ctx && typeof ctx.waitUntil === 'function') { try { ctx.waitUntil(p); return; } catch (e) {} }
+  p.catch(function () {});
+}
+function callTimelineEvent(c) {
+  const dir = c.direction === 'out' ? 'out' : 'in';
+  return {
+    channel: 'call', id: String(c.id || ''), at: String(c.startedAt || c.created_at || ''),
+    direction: dir, from: String(c.from || ''), to: String(c.to || ''),
+    other: dir === 'out' ? String(c.to || '') : String(c.from || ''),
+    status: String(c.status || ''), durationSec: Math.max(0, parseInt(c.durationSec, 10) || 0),
+    recording: !!c.recordingUrl, recRef: String(c.recordingUrl || ''), listing: String(c.listing || ''),
+    transcript: String(c.transcript || '').slice(0, 400),
+    matchedEmail: String(c.matchedEmail || ''), matchedName: String(c.matchedName || ''),
+    numInfo: c.numInfo || null, enrichment: c.enrichment || null, enrichLine: callEnrichLine(c)
+  };
+}
+function smsTimelineEvent(m) {
+  const dir = m.direction === 'out' ? 'out' : 'in';
+  return {
+    channel: 'sms', id: String(m.id || ''), at: String(m.at || m.created_at || ''),
+    direction: dir, from: String(m.from || ''), to: String(m.to || ''),
+    other: dir === 'out' ? String(m.to || '') : String(m.from || ''),
+    body: String(m.body || ''), media: Array.isArray(m.media) ? m.media.length : 0,
+    read: !!m.read,
+    matchedEmail: String(m.matchedEmail || ''), matchedName: String(m.matchedName || ''),
+    numInfo: m.numInfo || null, enrichment: m.enrichment || null, enrichLine: callEnrichLine(m)
+  };
+}
+/* MERGE POINT — WhatsApp (Pack PortalWhatsApp): when that pack's
+   wa: records land (index idx:whatsapp, key prefix 'wa:'), they
+   are expected in the sms-mirroring shape { id, direction, from,
+   to, body, media[], at, read, matchedEmail, matchedName,
+   numInfo?, enrichment? }. This adapter is the ONLY place that
+   needs to change if the landed shape differs — buildTimeline
+   and the portal consume the unified event below. A missing
+   store is a silent no-op (buildTimeline guards the read). */
+function waTimelineEvent(w) {
+  const dir = w.direction === 'out' ? 'out' : 'in';
+  return {
+    channel: 'whatsapp', id: String(w.id || ''), at: String(w.at || w.created_at || ''),
+    direction: dir, from: String(w.from || ''), to: String(w.to || ''),
+    other: dir === 'out' ? String(w.to || '') : String(w.from || ''),
+    body: String(w.body || ''), media: Array.isArray(w.media) ? w.media.length : Math.max(0, parseInt(w.mediaCount, 10) || 0),
+    read: !!w.read,
+    matchedEmail: String(w.matchedEmail || ''), matchedName: String(w.matchedName || ''),
+    numInfo: w.numInfo || null, enrichment: w.enrichment || null, enrichLine: callEnrichLine(w)
+  };
+}
+/* One real-world event = one timeline row. Two reports are
+   the same event when they agree on channel + direction + the
+   byte-identical timestamp + both parties + the FULL content
+   signature — duration AND listing for calls, the entire body
+   for messages — and, as a veto, neither report carries a
+   recording reference the other contradicts (both present and
+   different means distinct; a report that omits the reference
+   never contradicts one that carries it — see
+   timelineRecConflict). Provider ids are deliberately NOT
+   part of the identity: they are scoped to the reporting
+   channel, not the event — one call arrives as CA-... on the
+   Twilio report and cdr-... on the generic-ingest CDR — so
+   keying on them would split every cross-channel duplicate.
+   The guarantee this gives: a second report of an event never
+   changes its listing, its duration, its body, or a recording
+   reference it does carry, so duplicates always merge; and
+   two events that differ in listing, duration, body, or a
+   jointly-carried recording reference never merge. The
+   timestamp itself stays byte-exact: the same event reported
+   one second apart across providers is two rows — the
+   documented trade. */
+function timelineDedupeKey(e) {
+  const sig = e.channel === 'call' ? ('d' + (e.durationSec || 0) + '|l' + String(e.listing || '')) : ('b' + String(e.body || ''));
+  return e.channel + '|' + e.direction + '|' + e.at + '|' + phoneLast10(e.from) + '|' + phoneLast10(e.to) + '|' + sig;
+}
+/* The recording veto: two same-key call reports are DISTINCT
+   events when both carry a recording reference and the
+   references differ — one real call has one recording. When
+   only one side carries a reference (e.g. only the CDR names
+   the recording) there is no contradiction and the pair still
+   merges; equal references never veto. Messages carry no
+   recording reference, so they never veto. */
+function timelineRecConflict(a, b) {
+  const ra = String(a.recRef || ''), rb = String(b.recRef || '');
+  return !!ra && !!rb && ra !== rb;
+}
+const TIMELINE_CHANNEL_RANK = { call: 0, sms: 1, whatsapp: 2 };
+async function buildTimeline(env, q) {
+  const last = q.phone || '', emailN = q.email || '';
+  const matches = function (rec, other) {
+    if (last && phoneLast10(other) === last) return true;
+    if (emailN && rec.matchedEmail && normEmail(rec.matchedEmail) === emailN) return true;
+    return false;
+  };
+  const evs = [];
+  const cids = await idxGetMerged(env, 'calls', 'call:');
+  for (const cid of cids) {
+    const c = await siteKvGet(env, 'call:' + cid, { type: 'json' });
+    if (!c) continue;
+    const ev = callTimelineEvent(c);
+    if (matches(c, ev.other)) evs.push(ev);
+  }
+  const sids = await idxGetMerged(env, 'sms', 'sms:');
+  for (const sid2 of sids) {
+    const m = await siteKvGet(env, 'sms:' + sid2, { type: 'json' });
+    if (!m) continue;
+    const ev = smsTimelineEvent(m);
+    if (matches(m, ev.other)) evs.push(ev);
+  }
+  try {
+    const wids = await idxGetMerged(env, 'whatsapp', 'wa:');
+    for (const wid of wids) {
+      const w = await siteKvGet(env, 'wa:' + wid, { type: 'json' });
+      if (!w) continue;
+      const ev = waTimelineEvent(w);
+      if (matches(w, ev.other)) evs.push(ev);
+    }
+  } catch (e) {} // no WhatsApp store yet: the merge point simply yields nothing
+  const groups = {}, out = [];
+  for (const ev of evs) {
+    const k = timelineDedupeKey(ev);
+    const g = groups[k] || (groups[k] = []);
+    let dup = false;
+    for (const keptEv of g) { if (!timelineRecConflict(keptEv, ev)) { dup = true; break; } }
+    if (dup) continue;
+    g.push(ev);
+    out.push(ev);
+  }
+  out.sort(function (a, b) {
+    if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+    const ra = TIMELINE_CHANNEL_RANK[a.channel] || 0, rb = TIMELINE_CHANNEL_RANK[b.channel] || 0;
+    if (ra !== rb) return ra - rb;
+    return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+  });
+  const limit = Math.max(1, q.limit || 200);
+  return out.length > limit ? out.slice(out.length - limit) : out;
+}
 async function storeCall(env, rec, ctx) {
   const prov = String(rec.provider || 'generic').slice(0, 20);
   const pcid = String(rec.providerCallId || '').slice(0, 80);
@@ -3140,6 +3371,10 @@ async function storeCall(env, rec, ctx) {
     created_at: (existing && existing.created_at) || now,
     updated_at: now
   });
+  // Pack TelephonyPreciser: the local-parse stamp for the
+  // counterparty, written once (a status upsert that already
+  // carries numInfo never rewrites it).
+  if (!merged.numInfo) { try { merged.numInfo = parseNumLocal(merged.direction === 'in' ? merged.from : merged.to); } catch (e) {} }
   const isNew = !existing;
   if (isNew) {
     const other = merged.direction === 'in' ? merged.from : merged.to;
@@ -3176,6 +3411,7 @@ async function storeCall(env, rec, ctx) {
   await siteKvPut(env, 'call:' + id, JSON.stringify(merged));
   if (isNew) {
     await idxAdd(env, 'calls', id);
+    scheduleLookupEnrich(env, 'call', id, merged.direction === 'in' ? merged.from : merged.to, ctx); // Pack TelephonyPreciser: flag-gated Twilio Lookup (cfg:calls.lookup), inert by default
     // Pack ScreenPop (2026-11-12): a genuinely-new INBOUND call
     // schedules the owner's screen pop. The previous-touch summary
     // is captured BEFORE this call's own activity entry and
@@ -3272,6 +3508,12 @@ async function callScreenPop(env, call, prevTouch) {
       parts.push('Unknown caller');
     }
     if (call.listing) parts.push('Re: ' + call.listing);
+    // Pack TelephonyPreciser: the caller's enrichment summary
+    // rides LAST in the card — the 300-char body slice can only
+    // ever trim this segment, never the name/stage/score/
+    // last-touch lines the ScreenPop pins assert.
+    const enrichSeg = callEnrichLine(call);
+    if (enrichSeg) parts.push(enrichSeg);
     // Pack CallTagOutcome ADD-2 (2026-11-12): the one-tap
     // outcome actions ride the ORIGINAL pop — a second,
     // upsert-triggered push would break this pack's fire-once
@@ -3317,7 +3559,7 @@ async function readFormParams(request) {
 // arrives at the business number FROM his own number — the webhook detects
 // it and relays it to the client from the business number, so he can run
 // whole conversations from his phone's Messages app without the portal.
-async function storeSms(env, rec) {
+async function storeSms(env, rec, ctx) {
   const prov = String(rec.provider || 'generic').slice(0, 20);
   const pmid = String(rec.providerMsgId || '').slice(0, 80);
   if (!pmid) return { ok: false, error: 'providerMsgId' };
@@ -3337,10 +3579,12 @@ async function storeSms(env, rec) {
     created_at: now
   };
   const other = msg.direction === 'in' ? msg.from : msg.to;
+  try { msg.numInfo = parseNumLocal(other); } catch (e) {} // Pack TelephonyPreciser: local-parse stamp (see parseNumLocal)
   const who = await matchPhoneEmail(env, other);
   if (who) { msg.matchedEmail = who.email; msg.matchedName = who.name || ''; }
   await siteKvPut(env, 'sms:' + id, JSON.stringify(msg));
   await idxAdd(env, 'sms', id);
+  scheduleLookupEnrich(env, 'sms', id, other, ctx); // Pack TelephonyPreciser: flag-gated Twilio Lookup (cfg:calls.lookup), inert by default
   if (msg.matchedEmail) {
     await pushActivity(env, msg.matchedEmail, 'sms', (msg.direction === 'in' ? '💬 Text from client: ' : '💬 Text to client: ') + msg.body.slice(0, 120));
     await stampLastTouch(env, msg.matchedEmail); // PM8b: a matched text IS a touch
@@ -13456,7 +13700,7 @@ async function handleRequest(request, env, ctx) {
           if (relay && relay.client && params.Body) {
             // Claim the relay record BEFORE sending (cycle 27, Claude M9): a
             // Twilio webhook retry must not text the client twice.
-            const pre = await storeSms(env, { provider: 'twilio', providerMsgId: 'relay-' + (params.MessageSid || params.SmsSid || ''), direction: 'out', from: ccfg.number, to: relay.client, body: String(params.Body || '') });
+            const pre = await storeSms(env, { provider: 'twilio', providerMsgId: 'relay-' + (params.MessageSid || params.SmsSid || ''), direction: 'out', from: ccfg.number, to: relay.client, body: String(params.Body || '') }, ctx);
             if (pre.ok && pre.created) await sendSms(env, ccfg, relay.client, params.Body);
           }
           return empty;
@@ -13464,7 +13708,7 @@ async function handleRequest(request, env, ctx) {
         if (limited('smsin:' + fromN, 20, 3600000)) return empty; // inbound flood guard (cycle 27, Claude M11)
         const media = [];
         for (let i = 0; i < 6; i++) { if (params['MediaUrl' + i] && String(params['MediaUrl' + i]).indexOf('https://api.twilio.com/') === 0) media.push(params['MediaUrl' + i]); }
-        const stored = await storeSms(env, { provider: 'twilio', providerMsgId: params.MessageSid || params.SmsSid || '', direction: 'in', from: params.From || '', to: params.To || ccfg.number, body: String(params.Body || ''), media: media });
+        const stored = await storeSms(env, { provider: 'twilio', providerMsgId: params.MessageSid || params.SmsSid || '', direction: 'in', from: params.From || '', to: params.To || ccfg.number, body: String(params.Body || ''), media: media }, ctx);
         if (stored.ok && stored.msg) await forwardSmsToOwner(env, ccfg, stored.msg);
         return empty;
       }
@@ -13508,7 +13752,7 @@ async function handleRequest(request, env, ctx) {
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || typeof d !== 'object') return json({ ok: false, error: 'validation' }, 400, origin);
-        const stored = await storeSms(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }));
+        const stored = await storeSms(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }), ctx);
         if (stored.ok && stored.created && stored.msg && stored.msg.direction === 'in') await forwardSmsToOwner(env, ccfg, stored.msg);
         return json({ ok: stored.ok, id: stored.id, created: stored.created }, stored.ok ? 200 : 400, origin);
       }
@@ -18711,7 +18955,7 @@ async function handleRequest(request, env, ctx) {
         const sid = await sendSms(env, ccfg, to, body);
         if (!sid) return json({ ok: false, error: 'send_failed' }, 502, origin);
         let storedId = '', storeWarn = false;
-        try { const stored = await storeSms(env, { provider: ccfg.provider || 'generic', providerMsgId: typeof sid === 'string' ? sid : 'portal-' + randHex(8), direction: 'out', from: ccfg.number, to: to, body: body }); storedId = stored.id; } catch (e) { storeWarn = true; } // the text is already sent: a store failure must not read as a send failure (a portal retry would double-text) — cycle 30, Claude Low
+        try { const stored = await storeSms(env, { provider: ccfg.provider || 'generic', providerMsgId: typeof sid === 'string' ? sid : 'portal-' + randHex(8), direction: 'out', from: ccfg.number, to: to, body: body }, ctx); storedId = stored.id; } catch (e) { storeWarn = true; } // the text is already sent: a store failure must not read as a send failure (a portal retry would double-text) — cycle 30, Claude Low
         return json({ ok: true, id: storedId, warning: storeWarn ? 'sent_but_unstored' : undefined }, 200, origin);
       }
       if (path === '/api/admin/sms/read' && request.method === 'POST') {
@@ -18841,6 +19085,18 @@ async function handleRequest(request, env, ctx) {
         // message records (wa:) deliberately have none.
         await siteKvDelete(env, 'wadraft:' + last).catch(function () {});
         return json({ ok: true }, 200, origin);
+      }
+
+      // ---- admin: unified per-person timeline (Pack TelephonyPreciser) ----
+      if (path === '/api/admin/timeline' && request.method === 'GET') {
+        const phoneQ = phoneLast10(url.searchParams.get('phone') || '');
+        const emailQ = normEmail(url.searchParams.get('email') || '');
+        const limit = Math.min(300, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+        if (phoneQ.length < 10 && !emailQ) return json({ ok: false, error: 'validation' }, 400, origin);
+        const events = await buildTimeline(env, { phone: phoneQ, email: emailQ, limit: limit });
+        let matchedName = '';
+        for (const e of events) { if (e.matchedName) { matchedName = e.matchedName; break; } }
+        return json({ ok: true, phone: phoneQ, email: emailQ, matchedName: matchedName, count: events.length, events: events }, 200, origin);
       }
 
       // ---- admin: business call log ----
