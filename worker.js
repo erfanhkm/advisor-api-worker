@@ -108,7 +108,7 @@ const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // an address that can carry markup or break out of an attribute has no
 // business being stored and rendered in the portal later.
 const EMAIL_RE = /^[^\s@<>"'`?&#%]+@[^\s@<>"'`?&#%]+\.[^\s@<>"'`?&#%]+$/; // Pack PMV1 (PM P10): ? & % # are now excluded too — jane@x.com?subject=… passed the old class and became a mailto: header-injection vector; intake routes also cap email length
-const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2', 'tutor']; // Pack Tutor (2026-11-11): 'tutor' added — cfg:tutor holds {providers:[{kind:'groq'|'gemini'|'workers-ai', model, apiKey?}], perStudentDaily?, globalDaily?, provisionedAt} for the Academy Learning Assistant's OWN free-provider chain — completely separate from the site Brain (its keys/budgets live in the ai-chat worker; nothing is shared); written ONLY via the one-shot session-gated /api/admin/academy/tutor-provision route (409 once set unless replace:true; values never returned or logged), the cfg:mail posture. Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (scoped to the ehrealtybc.com domain only; senders per the 2026-11-11 split: news@ehrealtybc.com default, academy@ehrealtybc.com for Academy mail; the retired hello@ identity must never be used); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
+const CFG_KEYS = ['gcal', 'google', 'ingest', 'service', 'calls', 'platform', 'brain', 'apppush', 'push', 'stripe', 'mail', 'video', 'b2', 'tutor', 'media']; // Pack SystemListingMedia (2026-11-12): 'media' added — cfg:media holds {elevenLabsNarration?, estCreditsPerVideo?} for the listing tour narration gate (Academy ElevenLabs pool; default OFF; read only via the whitelisted /api/admin/media/status route, never returned whole) // Pack Tutor (2026-11-11): 'tutor' added — cfg:tutor holds {providers:[{kind:'groq'|'gemini'|'workers-ai', model, apiKey?}], perStudentDaily?, globalDaily?, provisionedAt} for the Academy Learning Assistant's OWN free-provider chain — completely separate from the site Brain (its keys/budgets live in the ai-chat worker; nothing is shared); written ONLY via the one-shot session-gated /api/admin/academy/tutor-provision route (409 once set unless replace:true; values never returned or logged), the cfg:mail posture. Pack AcademyB2Video (2026-11-10): 'b2' added — cfg:b2 holds {keyId, appKey, bucket, endpoint, provisionedAt} for the Academy Backblaze B2 store; written ONLY via the one-shot bearer-carried /api/admin/academy/b2-provision route (refuses a part once set, never returned or logged), the cfg:stripe posture. Pack AcademyR2Video (2026-11-10): 'video' added — cfg:video holds {tokenSecret} for the Academy signed-HLS video tokens; written ONLY via the one-shot /api/admin/academy/video-provision route (refuses once set, never returned or logged), the cfg:brain posture. Pack MailSend (2026-11-10): 'mail' added — cfg:mail holds {provider:'resend', apiKey} for EH Realty's OWN Resend key (scoped to the ehrealtybc.com domain only; senders per the 2026-11-11 split: news@ehrealtybc.com default, academy@ehrealtybc.com for Academy mail; the retired hello@ identity must never be used); written ONLY via the one-shot /api/admin/mail/provision route (refuses once set, never returned or logged), the cfg:stripe posture verbatim. Pack AcademyStripe (2026-11-10): 'stripe' added — cfg:stripe holds {webhookSecret} for the Academy Stripe webhook; written ONLY via the one-shot /api/admin/academy/stripe-provision route (refuses once set, never returned or logged), exactly the cfg:brain posture. Pack PMV1: 'push' added — the VAPID pair moved out of cfg:platform into its own cfg:push document (PM P13); listed so the config GET existence probe recognises it (nothing writes cfg:push through the config route — puEnsurePushKeys owns it) // admin-writable cfg: keys — config POST validates against it, config GET probes only these ('platform' added 2026-11-01: holds {postLicense} — the single built-but-gated activation flag; see files/post-licensing-activation.md; 'brain' added 2026-11-01 for the portal brain: {secret?, dailyCap?, providers?} — the secret is only ever written via the admin-config path or the one-shot brain provision route, never logged or returned; 'apppush' added 2026-11-02 for the native-app push send credentials {fcmServerKey?, apns?...} — the send side reads it on plug-in day; nothing sends while it is absent)
 const TOKEN_TTL = 86400; // 24h
 const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'www.ehrealtybc.com', 'muse.ai'];
 
@@ -16774,6 +16774,142 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true }, 200, origin);
       }
 
+      // ---- Pack SystemListingMedia (2026-11-12): listing campaign builder ----
+      // Per-listing campaign asset packs, generated in the portal from
+      // the listing record and stored here as DRAFTS on the listing's
+      // campaign record (campaign:<mls>). Per-asset status is
+      // draft|approved and approval is the owner's tap in the portal —
+      // NOTHING in this block sends or publishes anything: the email
+      // asset is queued ONCE through queueMail as a held 'manual'
+      // record addressed to the business inbox (the owner's review
+      // queue — the composer pattern), and the status route only
+      // flips a label. There is deliberately no send/publish path.
+      //
+      // The tour-video asset carries the EN narration script, built
+      // server-side from the catalog record (facts only — the same
+      // builder as hidden_files/system-listing-media/listing-facts.mjs;
+      // the two copies must be kept in step). Narration RENDERING is
+      // flag-gated behind cfg:media {elevenLabsNarration} (default
+      // OFF): the ElevenLabs Creator pool is the ACADEMY pool with a
+      // small remaining balance, so no tour narration is ever rendered
+      // unless the owner enables the flag after seeing the per-video
+      // credit estimate this block returns.
+      const CAMPAIGN_EL_CREDITS_PER_CHAR = 0.814; // eleven_v3 measured rate (Academy production ledger, 2026-11-09)
+      const CAMPAIGN_FEATURE_SPOKEN = { balcony: 'a private balcony', laundry: 'in-suite laundry', gym: 'a fitness centre', concierge: '24-hour concierge', fenced_yard: 'a fenced yard', dbl_garage: 'a double garage', fireplace: 'a fireplace', reno_kitchen: 'a renovated kitchen', suite: 'suite potential', deck: 'a deck', rooftop: 'a rooftop terrace', bike_room: 'a bike room', ac: 'air conditioning', ev: 'EV charging', playground: 'a playground', mt_view: 'mountain views', new_roof: 'a newer roof', storage: 'extra storage' };
+      function campaignTourScript(rec) {
+        const money = function (n) { return '$' + Number(n).toLocaleString('en-CA'); };
+        const lines = [];
+        lines.push('Welcome to ' + rec.street + ', in ' + rec.city + '.');
+        lines.push('Offered at ' + money(rec.price) + ' — ' + rec.beds + ' ' + (Number(rec.beds) === 1 ? 'bedroom' : 'bedrooms') + ', ' + rec.baths + ' ' + (Number(rec.baths) === 1 ? 'bathroom' : 'bathrooms') + ', and ' + Number(rec.sqft).toLocaleString('en-CA') + ' square feet of living space.');
+        if (rec.desc && rec.desc.en) lines.push(rec.desc.en);
+        const feats = (rec.features || []).filter(function (k) { return CAMPAIGN_FEATURE_SPOKEN[k]; }).slice(0, 3).map(function (k) { return CAMPAIGN_FEATURE_SPOKEN[k]; });
+        if (feats.length === 1) lines.push('Featuring ' + feats[0] + '.');
+        else if (feats.length === 2) lines.push('Featuring ' + feats[0] + ' and ' + feats[1] + '.');
+        else if (feats.length >= 3) lines.push('Highlights include ' + feats[0] + ', ' + feats[1] + ', and ' + feats[2] + '.');
+        const tail = [];
+        if (rec.year) tail.push('Built in ' + rec.year);
+        if (rec.parking === 'garage') tail.push('with garage parking');
+        else if (rec.parking === 'underground') tail.push('with underground parking');
+        if (tail.length) lines.push(tail.join(', ') + '.');
+        lines.push('Book your private viewing today at ehrealtybc.com. MLS® number ' + rec.mls + '.');
+        return lines;
+      }
+      async function campaignCfgMedia(env) {
+        let cfg = null;
+        try { cfg = await env.LEADS.get('cfg:media', { type: 'json' }); } catch (e) { cfg = null; }
+        return cfg && typeof cfg === 'object' ? cfg : {};
+      }
+      const campaignMls = function (raw) {
+        let mls = '';
+        try { mls = decodeURIComponent(raw).toUpperCase(); } catch (e) { return ''; }
+        return /^[A-Z0-9-]{3,24}$/.test(mls) ? mls : '';
+      };
+      if (path === '/api/admin/media/status' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const cfg = await campaignCfgMedia(env);
+        // Whitelisted fields ONLY — a cfg:media record may one day hold
+        // a provider key; it is never returned here.
+        return json({ ok: true, narrationEnabled: !!cfg.elevenLabsNarration, estCreditsPerVideo: Number(cfg.estCreditsPerVideo) > 0 ? Number(cfg.estCreditsPerVideo) : 450, creditsPerChar: CAMPAIGN_EL_CREDITS_PER_CHAR }, 200, origin);
+      }
+      const campGet = path.match(/^\/api\/admin\/listings\/(.+)\/campaign$/);
+      if (campGet && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const mls = campaignMls(campGet[1]);
+        if (!mls) return json({ ok: false, error: 'validation' }, 400, origin);
+        const rec = await env.LEADS.get('campaign:' + mls, { type: 'json' });
+        return json({ ok: true, campaign: rec || null }, 200, origin);
+      }
+      if (campGet && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const mls = campaignMls(campGet[1]);
+        if (!mls) return json({ ok: false, error: 'validation' }, 400, origin);
+        let d = null; try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const ain = (d.assets && typeof d.assets === 'object') ? d.assets : {};
+        const txt = function (v, cap) { return String(v == null ? '' : v).slice(0, cap); };
+        if (!ain.ig || !txt(ain.ig.text, 4000) || !ain.reel || !txt(ain.reel.text, 6000) || !ain.email || !txt(ain.email.subject, 200) || !txt(ain.email.body, 6000)) return json({ ok: false, error: 'validation' }, 400, origin);
+        await refreshCustomCatalog(env, true);
+        const lrec = catalogByMls(mls);
+        if (!lrec) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const prev = await env.LEADS.get('campaign:' + mls, { type: 'json' });
+        const now = new Date().toISOString();
+        const keep = function (kind, fresh) {
+          const old = prev && prev.assets && prev.assets[kind];
+          return Object.assign({}, fresh, { status: old && old.status === 'approved' ? 'approved' : 'draft', at: now });
+        };
+        // The narration script is built from the RICH record (the
+        // admin listings source: a custom listing wins, else the
+        // seed unless deleted) — catalogByMls resolves the LEAN
+        // matching catalog (no desc/features/year/parking), which
+        // would silently shrink the script and its credit estimate.
+        let rich = null;
+        const customRec = customListings.find(function (r) { return r.mls === mls; });
+        if (customRec) rich = customRec;
+        else if (deletedSeedMls.indexOf(mls) === -1) rich = SEED_LISTINGS.find(function (r) { return r.mls === mls; }) || null;
+        const script = campaignTourScript(rich || lrec);
+        const scriptText = script.join(' ');
+        const cfg = await campaignCfgMedia(env);
+        const assets = {
+          ig: keep('ig', { kind: 'ig', text: txt(ain.ig.text, 4000) }),
+          reel: keep('reel', { kind: 'reel', text: txt(ain.reel.text, 6000) }),
+          email: keep('email', { kind: 'email', subject: txt(ain.email.subject, 200).replace(/[\r\n]+/g, ' '), body: txt(ain.email.body, 6000), mailId: prev && prev.assets && prev.assets.email ? (prev.assets.email.mailId || null) : null }),
+          link: keep('link', { kind: 'link', url: 'https://ehrealtybc.com/present-' + mls + '.html' }),
+          video: keep('video', { kind: 'video', path: 'tours-media/tour-' + mls + '.mp4', script: scriptText, scriptLines: script, estCredits: Math.ceil(scriptText.length * CAMPAIGN_EL_CREDITS_PER_CHAR), narration: cfg.elevenLabsNarration ? 'on' : 'off' }),
+        };
+        // The email asset lands in the HELD queue exactly once (first
+        // save): a 'manual' record to the business inbox for owner
+        // review, sent:false like every held record. Regeneration
+        // never re-queues (mailId is carried over above).
+        if (!assets.email.mailId) {
+          try {
+            const mid = await queueMail(env, { kind: 'manual', to: 'erfanbcrealestate@gmail.com', lang: 'en', name: 'Campaign draft — ' + mls, subject: assets.email.subject, body: assets.email.body });
+            assets.email.mailId = mid || null;
+          } catch (e) { assets.email.mailId = null; }
+        }
+        const out = { mls: mls, assets: assets, created_at: prev && prev.created_at ? prev.created_at : now, updated_at: now };
+        await siteKvPut(env, 'campaign:' + mls, JSON.stringify(out));
+        return json({ ok: true, campaign: out }, 200, origin);
+      }
+      const campStatus = path.match(/^\/api\/admin\/listings\/(.+)\/campaign\/status$/);
+      if (campStatus && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const mls = campaignMls(campStatus[1]);
+        if (!mls) return json({ ok: false, error: 'validation' }, 400, origin);
+        let d = null; try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const kind = String(d.asset || '');
+        const status = String(d.status || '');
+        if (['ig', 'reel', 'email', 'link', 'video'].indexOf(kind) === -1 || ['draft', 'approved'].indexOf(status) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        const rec = await env.LEADS.get('campaign:' + mls, { type: 'json' });
+        if (!rec || !rec.assets || !rec.assets[kind]) return json({ ok: false, error: 'not_found' }, 404, origin);
+        // Status flips are labels only — approving an asset NEVER
+        // sends mail, publishes a post or renders a video.
+        rec.assets[kind].status = status;
+        rec.assets[kind].at = new Date().toISOString();
+        rec.updated_at = rec.assets[kind].at;
+        await siteKvPut(env, 'campaign:' + mls, JSON.stringify(rec));
+        return json({ ok: true, campaign: rec }, 200, origin);
+      }
       // ---- admin: portal-managed listings + site settings ----
       if (path === '/api/admin/listings' && request.method === 'GET') {
         if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
