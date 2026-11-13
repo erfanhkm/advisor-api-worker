@@ -6057,11 +6057,11 @@ async function tutorRetrieve2(env, lang, message, contextLessonId) {
     if (!ix) continue;
     for (const e of (Array.isArray(ix.lessons) ? ix.lessons : [])) {
       if (!e || typeof e.id !== 'string') continue;
-      cand.push({ srcLang: lg, kind: 'lesson', id: e.id, module: e.module, title: e.title, tag: null, score: tutorScoreEntry(e, q, 3, contextLessonId, 100) });
+      cand.push({ srcLang: lg, kind: 'lesson', id: e.id, module: e.module, title: e.title, tag: null, score: tutorScoreEntry(e, q, 3, null, 0) }); // Pack TutorFaRetrieval (2026-11-12): content-only ranking score — the context boost no longer ranks (the viewed lesson is appended after the strong set below)
     }
     for (const c of (Array.isArray(ix.concepts) ? ix.concepts : [])) {
       if (!c || typeof c.lessonId !== 'string' || typeof c.tag !== 'string') continue;
-      cand.push({ srcLang: lg, kind: 'concept', id: c.lessonId, module: c.module, title: c.title || c.tag, tag: c.tag, score: tutorScoreEntry({ tagsW: c.tagsW, titleW: c.titleW, termsW: c.termsW, id: c.lessonId }, q, 5, contextLessonId, 50) });
+      cand.push({ srcLang: lg, kind: 'concept', id: c.lessonId, module: c.module, title: c.title || c.tag, tag: c.tag, score: tutorScoreEntry({ tagsW: c.tagsW, titleW: c.titleW, termsW: c.termsW, id: c.lessonId }, q, 5, null, 0) });
     }
   }
   cand.sort(function (a, b) {
@@ -6085,6 +6085,35 @@ async function tutorRetrieve2(env, lang, message, contextLessonId) {
     } else {
       const rec = (Array.isArray(mod.concepts) ? mod.concepts : []).find(function (x) { return x && x.tag === c.tag && x.lessonId === c.id; });
       if (rec && typeof rec.text === 'string') strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'concept', concept: c.tag });
+    }
+  }
+  // Pack TutorFaRetrieval (2026-11-12): the lesson the student is
+  // viewing rides along as ONE extra excerpt — appended AFTER the
+  // content-ranked strong set, never ranked against it. The old
+  // unconditional +100/+50 context boost inside the ranking score
+  // let any open lesson with >= 3 concepts (e.g. m6-d1's nine)
+  // evict every on-topic excerpt for ANY question, so the provider
+  // saw only off-topic chunks and refused — pointing at the open
+  // lesson — for questions the course plainly covers, in any
+  // language. This append keeps the design intent (the viewed
+  // lesson is in context) under three guards: only when genuine
+  // content matched (an empty retrieval stays the honest
+  // not-covered path), only the lesson chunk (never a concept, so
+  // it can never become topConcept or the practice pick), and only
+  // when the lesson is not already represented in the strong set.
+  if (contextLessonId && strong.length) {
+    const represented = strong.some(function (s) { return s.id === contextLessonId; });
+    if (!represented) {
+      for (const lg of langs) {
+        const ix = idxByLang[lg];
+        const le = ix && Array.isArray(ix.lessons) ? ix.lessons.find(function (x) { return x && x.id === contextLessonId; }) : null;
+        if (!le) continue;
+        const key = lg + ':' + le.module;
+        if (!(key in modCache)) modCache[key] = await tutorCorpusV2Module(env, lg, le.module);
+        const mod = modCache[key];
+        const rec = mod && Array.isArray(mod.lessons) ? mod.lessons.find(function (l) { return l && l.id === contextLessonId; }) : null;
+        if (rec && typeof rec.text === 'string') { strong.push({ id: contextLessonId, title: rec.title || le.title, text: rec.text.slice(0, 6000), kind: 'lesson' }); break; }
+      }
     }
   }
   let nearest = null;
