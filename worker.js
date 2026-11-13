@@ -256,6 +256,10 @@ const GEN_BUMP_EXEMPT = [
   // same reason (the 2026-11-10 KV write-pool lesson).
   ['POST', '/api/admin/academy/r2-mig-proxy'],
   ['POST', '/api/internal/academy/r2-mig'],
+  // Pack KvSpillway (2026-11-12): the drain replays overflow
+  // objects into KV — machine traffic, exempt for the same reason
+  // as the migration routes above.
+  ['POST', '/api/internal/academy/kv-drain'],
   // Pack Tutor2 (2026-11-11): practice/quiz/debrief/feedback/voice
   // writes land only on tutor:/ac* keys of the caller's own record.
   ['POST', '/api/academy/tutor/practice'],
@@ -3602,7 +3606,7 @@ async function academyContentUpdatedAt(env) {
   try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
 }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; if (path === '/api/internal/academy/kv-drain') return sc === 'academy'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -3978,6 +3982,103 @@ async function academyVideoHead(env, key) {
   return await academyB2Head(env, key);
 }
 
+/* ================= Pack KvSpillway (2026-11-12) =================
+   Automatic KV -> R2 overflow ("spillway") for the Academy
+   deployment's CRITICAL key families. The business account's KV
+   hit its 1,000 puts/day free cap on 2026-11-12 (mid video
+   migration): puts throw until the 00:00 UTC reset, which would
+   have frozen enrolments, logins and progress writes for hours.
+   Covered families (and ONLY these — every other subsystem keeps
+   raw env.LEADS access and byte-identical behaviour):
+     academy:<ne>        student profiles
+     stok:<sha256>       student sessions
+     acprogress:<ne> / acready:<ne> / acmistakes:<ne> /
+     acattempt:<ne>:<id> server progress
+     academy:snap:<ne>   cohort snapshots
+     stripe:evt:<id>     Stripe webhook idempotency claims
+   Mechanism: acadKvPut tries KV first; on ANY throw it writes the
+   exact value string as one R2 object under kv-overflow/ in the
+   ACADEMY_VIDEO bucket (the video layer only ever touches media/
+   keys, so the prefixes never collide) and returns normally — the
+   write SURVIVED, just in the overflow store. acadKvGet prefers a
+   live overflow object over KV (the overflow copy is by
+   construction the newest: it exists only because a KV write
+   failed after the last KV-visible state), honouring {type:'json'}
+   exactly as KV does. acadKvDelete clears both stores. When the
+   binding is absent (the SITE deployment), every helper reduces to
+   the raw KV call — including rethrowing the original KV error —
+   so behaviour there is identical to base. Prefix SCANS
+   (listAllKeys-based: students list/overview, cohort membership,
+   session scans) still discover keys from KV only: an
+   overflow-only record is invisible to scans until the drain
+   (POST /api/internal/academy/kv-drain) replays it into KV.
+   Overflow objects are JSON envelopes {key, value, exp} where exp
+   is the epoch-ms expiry derived from the caller's KV TTL (or
+   null); an expired envelope reads as absent, exactly as an
+   expired KV key does. */
+const SPILL_PREFIX = 'kv-overflow/';
+function spillBucket(env) {
+  const b = env && env.ACADEMY_VIDEO;
+  return (b && typeof b.put === 'function' && typeof b.get === 'function') ? b : null;
+}
+async function spillObjKey(key) { return SPILL_PREFIX + (await sha256hex(key)) + '.json'; }
+async function acadKvPut(env, key, value, ttlSeconds) {
+  const opts = (typeof ttlSeconds === 'number' && ttlSeconds > 0) ? { expirationTtl: ttlSeconds } : undefined;
+  try { await env.LEADS.put(key, value, opts); return; }
+  catch (kvErr) {
+    const bucket = spillBucket(env);
+    if (!bucket) throw kvErr;
+    const ent = { key: key, value: value, exp: (opts ? Date.now() + ttlSeconds * 1000 : null) };
+    try { await bucket.put(await spillObjKey(key), JSON.stringify(ent), { httpMetadata: { contentType: 'application/json' } }); }
+    catch (e) { throw kvErr; }
+  }
+}
+async function acadKvGet(env, key, opts) {
+  const bucket = spillBucket(env);
+  if (bucket) {
+    let ent = null;
+    try {
+      const obj = await bucket.get(await spillObjKey(key));
+      if (obj) ent = JSON.parse(await obj.text());
+    } catch (e) { ent = null; }
+    if (ent && typeof ent.value === 'string' && (ent.exp === null || ent.exp === undefined || Number(ent.exp) > Date.now())) {
+      if (opts && opts.type === 'json') { try { return JSON.parse(ent.value); } catch (e) { return null; } }
+      return ent.value;
+    }
+    // miss / expired / unreadable envelope -> KV decides (an
+    // expired overflow object is cleaned up by the drain).
+  }
+  return await env.LEADS.get(key, opts);
+}
+async function acadKvDelete(env, key) {
+  let kvErr = null;
+  try { await env.LEADS.delete(key); } catch (e) { kvErr = e; }
+  const bucket = spillBucket(env);
+  if (bucket && typeof bucket.delete === 'function') {
+    try { await bucket.delete(await spillObjKey(key)); } catch (e) {}
+  }
+  if (kvErr) throw kvErr;
+}
+// Bounded overflow listing for the session-revoke sweep: parses
+// each envelope and hands {objKey, ent} to the visitor. Stops at
+// 10 pages x 200 — far beyond any plausible capped-window backlog.
+async function spillEach(env, fn) {
+  const bucket = spillBucket(env);
+  if (!bucket || typeof bucket.list !== 'function') return;
+  let cursor = undefined;
+  for (let page = 0; page < 10; page++) {
+    const lr = await bucket.list({ prefix: SPILL_PREFIX, limit: 200, cursor: cursor });
+    const objs = (lr && lr.objects) || [];
+    for (const o of objs) {
+      let ent = null;
+      try { const ob = await bucket.get(o.key); if (ob) ent = JSON.parse(await ob.text()); } catch (e) {}
+      if (ent) await fn(o.key, ent);
+    }
+    if (!lr || !lr.truncated) break;
+    cursor = lr.cursor;
+  }
+}
+
 function effectiveStatus(rec, nowMs) {
   // Spec §4.1 verbatim semantics: blocked outranks the clock; expiry at
   // expiresAt == now already counts as expired.
@@ -4010,11 +4111,11 @@ async function academyLoadProfile(env, keyName) {
 }
 async function academyGet(env, email) {
   if (!email) return null;
-  return await env.LEADS.get('academy:' + normEmail(email), { type: 'json' });
+  return await acadKvGet(env, 'academy:' + normEmail(email), { type: 'json' });
 }
 async function academyPut(env, rec) {
   rec.updatedAt = new Date().toISOString();
-  await env.LEADS.put('academy:' + normEmail(rec.email), JSON.stringify(rec));
+  await acadKvPut(env, 'academy:' + normEmail(rec.email), JSON.stringify(rec));
 }
 async function academyEntitlement(env, email, opts) {
   // THE gate (spec §2.2): requireEntitlement(email, {readOnly}) →
@@ -4040,9 +4141,9 @@ async function academySummary(env, rec, nowMs) {
   const ne = normEmail(rec.email);
   const daysLeft = Math.ceil((Date.parse(rec.expiresAt) - nowMs) / 86400000);
   const sum = { email: rec.email, name: rec.name || null, product: rec.product, status: effectiveStatus(rec, nowMs), accessMonths: rec.accessMonths, activatedAt: rec.activatedAt, expiresAt: rec.expiresAt, daysLeft: daysLeft, readiness: null, progressPct: null, lessonsMastered: null, mistakeCount: null, lastActiveAt: null, source: rec.source || 'manual', createdBy: rec.createdBy || 'admin' };
-  const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
-  const ready = await env.LEADS.get('acready:' + ne, { type: 'json' });
-  const mist = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+  const prog = await acadKvGet(env, 'acprogress:' + ne, { type: 'json' });
+  const ready = await acadKvGet(env, 'acready:' + ne, { type: 'json' });
+  const mist = await acadKvGet(env, 'acmistakes:' + ne, { type: 'json' });
   if (prog && prog.lessons) {
     const ls = Object.values(prog.lessons);
     if (ls.length) {
@@ -4088,12 +4189,12 @@ async function academyClearEngineKeys(env, ne) {
   // snapshot is not progress).
   const keys = [];
   for (const p of ['acprogress:', 'acmistakes:', 'acready:', 'tutor:thread:', 'tutor:miscon:']) {
-    if (await env.LEADS.get(p + ne) !== null) keys.push(p + ne);
-    await env.LEADS.delete(p + ne);
+    if (await acadKvGet(env, p + ne) !== null) keys.push(p + ne);
+    await acadKvDelete(env, p + ne);
   }
   for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 500)) {
     keys.push(ak.name);
-    await env.LEADS.delete(ak.name);
+    await acadKvDelete(env, ak.name);
   }
   return { count: keys.length, keys: keys };
 }
@@ -4163,7 +4264,7 @@ async function acadIssueSession(env, ne, remember) {
   const ttl = remember ? ACAD_SESSION_REMEMBER_MS : STUDENT_SESSION_TTL_MS;
   const exp = Date.now() + ttl;
   const newKey = 'stok:' + await sha256hex(token);
-  await env.LEADS.put(newKey, JSON.stringify({ email: ne, exp: exp, remember: !!remember, renewedDay: remember ? todayVancouver() : null }), { expirationTtl: Math.floor(ttl / 1000) });
+  await acadKvPut(env, newKey, JSON.stringify({ email: ne, exp: exp, remember: !!remember, renewedDay: remember ? todayVancouver() : null }), Math.floor(ttl / 1000));
   // Pack AcademyProtect (2026-11-11): SINGLE active session per
   // student — issuing a session retires every earlier one for this
   // student, so a copied or shared login dies the moment the real
@@ -4181,7 +4282,7 @@ async function acadSessionRecord(env, request) {
   const m = h.match(/^Bearer ([0-9a-f]{64})$/);
   if (!m) return null;
   const key = 'stok:' + await sha256hex(m[1]);
-  const rec = await env.LEADS.get(key, { type: 'json' });
+  const rec = await acadKvGet(env, key, { type: 'json' });
   if (!rec || !rec.email || !(Number(rec.exp) > Date.now())) return null;
   return { key: key, token: m[1], rec: rec };
 }
@@ -4192,8 +4293,25 @@ async function acadRevokeSessions(env, ne, exceptKey) {
   let removed = 0;
   for (const k of await listAllKeys(env, 'stok:', 1000)) {
     if (exceptKey && k.name === exceptKey) continue;
-    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
-    if (rec && normEmail(rec.email || '') === ne) { await env.LEADS.delete(k.name); removed++; }
+    const rec = await acadKvGet(env, k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) { await acadKvDelete(env, k.name); removed++; }
+  }
+  // Pack KvSpillway (2026-11-12): a session issued while KV puts
+  // were capped exists ONLY as an overflow object — the KV scan
+  // above cannot see it, so sweep the overflow store too, or a
+  // revoke (password change / purge) would leave it valid until
+  // its TTL. No-op when the binding is absent.
+  const sbucket = spillBucket(env);
+  if (sbucket && typeof sbucket.delete === 'function') {
+    try {
+      await spillEach(env, async function (objKey, ent) {
+        if (typeof ent.key !== 'string' || ent.key.indexOf('stok:') !== 0) return;
+        if (exceptKey && ent.key === exceptKey) return;
+        let srec = null;
+        try { srec = JSON.parse(ent.value); } catch (e) {}
+        if (srec && normEmail(srec.email || '') === ne) { try { await sbucket.delete(objKey); removed++; } catch (e) {} }
+      });
+    } catch (e) {}
   }
   return removed;
 }
@@ -4217,13 +4335,13 @@ async function acadMintSetPwToken(env, ne) {
 // weighted mean over acattempt mock-* scores; review = resolvedEver
 // / totalEver (mastery when no mistakes yet); score = .5/.3/.2.
 async function acadReadinessCompute(env, ne) {
-  const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' }).catch(() => null);
+  const prog = await acadKvGet(env, 'acprogress:' + ne, { type: 'json' }).catch(() => null);
   const lessons = prog && prog.lessons ? Object.values(prog.lessons) : [];
   const mastery = lessons.length ? Math.round(lessons.reduce(function (s, l) { return s + ((l && l.mastery) || 0); }, 0) / lessons.length) : 0;
   const mockScores = [];
   for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 200)) {
     if (ak.name.slice(('acattempt:' + ne + ':').length).indexOf('mock-') !== 0) continue;
-    const rec = await env.LEADS.get(ak.name, { type: 'json' }).catch(() => null);
+    const rec = await acadKvGet(env, ak.name, { type: 'json' }).catch(() => null);
     if (rec && Array.isArray(rec.history)) for (const h of rec.history) if (h && typeof h.score === 'number') mockScores.push({ at: h.at || 0, score: h.score });
   }
   mockScores.sort(function (a, b) { return a.at - b.at; });
@@ -4240,7 +4358,7 @@ async function acadReadinessCompute(env, ne) {
 // means three real assessments, never three page views.
 async function acadSnapshotAppend(env, ne) {
   const cur = await acadReadinessCompute(env, ne);
-  let rec = await env.LEADS.get('acready:' + ne, { type: 'json' }).catch(() => null);
+  let rec = await acadKvGet(env, 'acready:' + ne, { type: 'json' }).catch(() => null);
   if (!rec || typeof rec !== 'object') rec = { history: [] };
   if (!Array.isArray(rec.history)) rec.history = [];
   rec.history.push({ score: cur.score, at: Date.now() });
@@ -4248,7 +4366,7 @@ async function acadSnapshotAppend(env, ne) {
   rec.score = cur.score; rec.components = cur.components; rec.updatedAt = new Date().toISOString();
   const recent = rec.history.slice(-3);
   rec.gate = { threshold: 78, sustained: recent.length >= 3 && recent.every(function (h) { return h.score >= 78; }) };
-  await env.LEADS.put('acready:' + ne, JSON.stringify(rec));
+  await acadKvPut(env, 'acready:' + ne, JSON.stringify(rec));
   return rec;
 }
 
@@ -4264,8 +4382,8 @@ async function acadPurgeStudentData(env, ne) {
   const cleared = await academyClearEngineKeys(env, ne);
   keys.push.apply(keys, cleared.keys);
   for (const p of ['tutor:thread:', 'tutor:miscon:', 'academy:snap:']) {
-    if (await env.LEADS.get(p + ne) !== null) keys.push(p + ne);
-    await env.LEADS.delete(p + ne);
+    if (await acadKvGet(env, p + ne) !== null) keys.push(p + ne);
+    await acadKvDelete(env, p + ne);
   }
   for (const k of await listAllKeys(env, 'acsetpw:', 1000)) {
     const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
@@ -4997,7 +5115,7 @@ async function studentAuthed(request, env, email) {
     const h = request.headers.get('Authorization') || '';
     const m = h.match(/^Bearer ([0-9a-f]{64})$/);
     if (!m) return false;
-    const rec = await env.LEADS.get('stok:' + await sha256hex(m[1]), { type: 'json' });
+    const rec = await acadKvGet(env, 'stok:' + await sha256hex(m[1]), { type: 'json' });
     if (!rec || !rec.email || !(Number(rec.exp) > Date.now())) return false;
     return normEmail(rec.email) === normEmail(email);
   } catch (e) { return false; }
@@ -5413,7 +5531,7 @@ async function tutorStudentSnapshot(env, ne) {
   const out = { openMistakes: 0, totalEver: 0, resolvedEver: 0, topConcepts: [], openItems: [], dueItems: [], dueReview: 0, misconcepts: [], readiness: null, modules: [], weakestModule: null, lastMock: null, lastQuiz: null, text: '' };
   const nowMs = Date.now();
   try {
-    const mk = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+    const mk = await acadKvGet(env, 'acmistakes:' + ne, { type: 'json' });
     if (mk && Array.isArray(mk.items)) {
       out.totalEver = mk.totalEver | 0; out.resolvedEver = mk.resolvedEver | 0;
       const open = mk.items.filter(function (i) { return i && !i.resolved; });
@@ -5434,9 +5552,9 @@ async function tutorStudentSnapshot(env, ne) {
     }
   } catch (e) {}
   try { const mc = await env.LEADS.get('tutor:miscon:' + ne, { type: 'json' }); if (mc && Array.isArray(mc.items)) out.misconcepts = mc.items.slice(-5).map(function (i) { return i && i.concept; }).filter(Boolean); } catch (e) {}
-  try { const rd = await env.LEADS.get('acready:' + ne, { type: 'json' }); if (rd && typeof rd.score === 'number') out.readiness = { score: rd.score, components: rd.components || null }; } catch (e) {}
+  try { const rd = await acadKvGet(env, 'acready:' + ne, { type: 'json' }); if (rd && typeof rd.score === 'number') out.readiness = { score: rd.score, components: rd.components || null }; } catch (e) {}
   try {
-    const pr = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
+    const pr = await acadKvGet(env, 'acprogress:' + ne, { type: 'json' });
     if (pr && pr.lessons && typeof pr.lessons === 'object') {
       const byMod = {};
       for (const lid of Object.keys(pr.lessons)) {
@@ -5461,7 +5579,7 @@ async function tutorStudentSnapshot(env, ne) {
     for (const k of keys) {
       const lid = k.name.slice(('acattempt:' + ne + ':').length);
       let rec = null;
-      try { rec = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) {}
+      try { rec = await acadKvGet(env, k.name, { type: 'json' }); } catch (e) {}
       if (!rec || !Array.isArray(rec.history) || !rec.history.length) continue;
       const last = rec.history[rec.history.length - 1];
       if (!last || typeof last.score !== 'number') continue;
@@ -5537,7 +5655,7 @@ function tutorQuestionPayload(q) {
   return { qid: q.id, lessonId: q.lessonId, moduleId: q.moduleId, concept: q.concept, difficulty: q.difficulty || null, stem: q.stem, options: (q.options || []).map(function (o) { return { key: o.key, text: o.text }; }) };
 }
 async function tutorLoadMistakes(env, ne) {
-  try { const m = await env.LEADS.get('acmistakes:' + ne, { type: 'json' }); if (m && Array.isArray(m.items)) return m; } catch (e) {}
+  try { const m = await acadKvGet(env, 'acmistakes:' + ne, { type: 'json' }); if (m && Array.isArray(m.items)) return m; } catch (e) {}
   return { items: [], totalEver: 0, resolvedEver: 0 };
 }
 async function tutorGradeBankAnswer(env, ne, q, chosen, nowMs) {
@@ -5557,7 +5675,7 @@ async function tutorGradeBankAnswer(env, ne, q, chosen, nowMs) {
     const ex = mk.items.find(function (i) { return i && i.qid === q.id && !i.resolved; });
     if (ex) { ex.stage = 0; ex.streak = 0; ex.chosen = chosen; ex.at = nowMs; ex.dueAt = nowMs + TUTOR_DAY_MS; ex.reviews = (ex.reviews || 0) + 1; }
     else { mk.items.push({ qid: q.id, lessonId: q.lessonId, moduleId: q.moduleId, concept: q.concept, trap: q.trap || null, chosen: chosen, at: nowMs, stage: 0, dueAt: nowMs + TUTOR_SPACING_DAYS[0] * TUTOR_DAY_MS, streak: 0, resolved: false, resolvedAt: null, reviews: 0 }); mk.totalEver = (mk.totalEver || 0) + 1; }
-    try { await env.LEADS.put('acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
+    try { await acadKvPut(env, 'acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
   } else {
     const ex = mk.items.find(function (i) { return i && i.qid === q.id && !i.resolved; });
     if (ex) {
@@ -5565,7 +5683,7 @@ async function tutorGradeBankAnswer(env, ne, q, chosen, nowMs) {
       ex.streak = (ex.streak || 0) + 1;
       if (ex.streak >= 2) { ex.resolved = true; ex.resolvedAt = nowMs; mk.resolvedEver = (mk.resolvedEver || 0) + 1; resolvedNow = true; }
       else { ex.stage = Math.min((ex.stage || 0) + 1, TUTOR_SPACING_DAYS.length - 1); ex.dueAt = nowMs + TUTOR_SPACING_DAYS[ex.stage] * TUTOR_DAY_MS; }
-      try { await env.LEADS.put('acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
+      try { await acadKvPut(env, 'acmistakes:' + ne, JSON.stringify(mk)); } catch (e) {}
     }
   }
   return { correct: correct, correctKey: q.correct, explain: q.explain || '', resolvedNow: resolvedNow, options: (q.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === q.correct }; }) };
@@ -5585,7 +5703,7 @@ async function tutorLatestMockAttempt(env, ne) {
       const lid = k.name.slice(('acattempt:' + ne + ':').length);
       if (lid.indexOf('mock-') !== 0) continue;
       let rec = null;
-      try { rec = await env.LEADS.get(k.name, { type: 'json' }); } catch (e) {}
+      try { rec = await acadKvGet(env, k.name, { type: 'json' }); } catch (e) {}
       if (!rec || !Array.isArray(rec.history)) continue;
       for (const h of rec.history) {
         if (h && h.answers && Array.isArray(h.servedIds) && typeof h.at === 'number') { if (!best || h.at > best.at) best = { lessonId: lid, at: h.at, attempt: h }; }
@@ -5836,7 +5954,7 @@ async function academyStripeEnrol(env, sess, eventId, evtCreated, ip) {
   const existing = await academyGet(env, email);
   if (!existing) {
     const rec = { email: email, name: custName, product: tier.product, status: 'active', accessMonths: tier.accessMonths, activatedAt: nowIso, expiresAt: academyAddMonths(nowIso, tier.accessMonths), source: 'stripe', createdBy: 'stripe', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: null };
-    await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
+    await acadKvPut(env, 'academy:' + normEmail(email), JSON.stringify(rec));
     await academyAudit(env, 'academy.create', normEmail(email), ip, { product: tier.product, accessMonths: tier.accessMonths, expiresAt: rec.expiresAt, source: 'stripe', stripeEvent: eventId || null, stripeSession: sess.id || null, staleMs: staleMs });
     return { status: 200, body: { ok: true, enrolled: 'created', email: normEmail(email), product: tier.product, expiresAt: rec.expiresAt } };
   }
@@ -5865,15 +5983,15 @@ async function academyStripeWebhook(request, env, ip) {
   // Claim BEFORE processing (idempotency): a redelivery of this event
   // id — Stripe retries, dashboard resends — must never enrol twice.
   const claimKey = 'stripe:evt:' + evt.id;
-  try { if ((await env.LEADS.get(claimKey)) !== null) return { status: 200, body: { ok: true, duplicate: true } }; } catch (e) {}
-  try { await env.LEADS.put(claimKey, JSON.stringify({ at: new Date().toISOString(), session: sess.id || null }), { expirationTtl: 90 * 86400 }); }
+  try { if ((await acadKvGet(env, claimKey)) !== null) return { status: 200, body: { ok: true, duplicate: true } }; } catch (e) {}
+  try { await acadKvPut(env, claimKey, JSON.stringify({ at: new Date().toISOString(), session: sess.id || null }), 90 * 86400); }
   catch (e) { return { status: 500, body: { ok: false, error: 'claim_failed' } }; } // no claim, no enrolment — Stripe retries
   try {
     const out = await academyStripeEnrol(env, sess, evt.id, evt.created, ip);
-    if (out.status >= 400) { try { await env.LEADS.delete(claimKey); } catch (e) {} } // refuse cleanly: release the claim so the retry can succeed
+    if (out.status >= 400) { try { await acadKvDelete(env, claimKey); } catch (e) {} } // refuse cleanly: release the claim so the retry can succeed
     return out;
   } catch (e) {
-    try { await env.LEADS.delete(claimKey); } catch (e2) {}
+    try { await acadKvDelete(env, claimKey); } catch (e2) {}
     return { status: 500, body: { ok: false, error: 'processing_failed' } };
   }
 }
@@ -10480,16 +10598,16 @@ async function handleRequest(request, env, ctx) {
       if (!dem || !EMAIL_RE.test(dem)) return json({ ok: false, error: 'invalid_email' }, 400, origin);
       const dne = normEmail(dem);
       const dkey = 'academy:' + dne;
-      const dcur = await env.LEADS.get(dkey);
+      const dcur = await acadKvGet(env, dkey);
       if (dcur === null || dcur === undefined) return json({ ok: true, deleted: false }, 200, origin);
-      await env.LEADS.delete(dkey);
+      await acadKvDelete(env, dkey);
       // Pack AcademyBuildA (Scan L3-N1): "delete everything" now
       // means everything — engine keys incl. acattempt:, the tutor
       // thread + misconceptions, the cohort snapshot, set-password
       // tokens and live sessions go with the profile, so nothing
       // resurrects if the same email re-enrols later.
       const dpurged = await acadPurgeStudentData(env, dne);
-      const dafter = await env.LEADS.get(dkey);
+      const dafter = await acadKvGet(env, dkey);
       try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', keysRemoved: dpurged.keys.length, sessionsRevoked: dpurged.sessionsRevoked } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
       return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined, keysRemoved: dpurged.keys.length }, 200, origin);
     }
@@ -10720,6 +10838,79 @@ async function handleRequest(request, env, ctx) {
       const mtrunc = !!(mres && mres.truncated);
       try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'list', prefix: mprefix, keys: mkeys.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
       return json({ ok: true, keys: mkeys, cursor: (mtrunc && mres.cursor) ? String(mres.cursor) : null, truncated: mtrunc }, 200, origin);
+    }
+
+    /* Pack KvSpillway (2026-11-12): KV overflow drain, INTERNAL
+       family — the mirror of r2-mig above. While the business
+       account's KV puts were capped, acadKvPut diverted covered
+       writes into R2 objects under kv-overflow/; this route
+       replays them into KV once writes heal. Admission is the
+       cfg:internal secret ONLY and fails closed, exactly as the
+       sibling internal routes: cfg:internal absent -> 503
+       not_configured; wrong/missing secret -> 401 and neither
+       store is touched. Body {cursor?, limit?}: ONE list page per
+       call, at most 200 objects processed (limit clamped to
+       1..200). Per object: parse the {key, value, exp} envelope;
+       already expired (or under 60 s of life left, below KV's
+       minimum TTL) -> delete + count expired WITHOUT a KV write;
+       otherwise put into KV carrying the remaining TTL (or no TTL
+       when exp is null) and delete the object. A KV put that
+       throws (still capped) counts failed and STOPS the page —
+       the failing object and everything after it stay untouched
+       for the next call, which the caller retries with the SAME
+       cursor. An unreadable object (get/parse failure) counts
+       failed and the page continues (it can never drain; the
+       drain leaves it in place for inspection rather than
+       deleting data it cannot read). Response {ok, drained,
+       expired, failed, cursor, remaining}: cursor continues the
+       listing when the page completed truncated, echoes the
+       request cursor when stopped early, else null; remaining is
+       the unprocessed tail of THIS page (0 when the page
+       completed; null when the listing continues beyond it).
+       Every call audits once (action 'kv_drain', counts only). */
+    if (path === '/api/internal/academy/kv-drain' && request.method === 'POST') {
+      const icfgKv = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
+      if (!icfgKv || !icfgKv.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+      const kvsec = request.headers.get('X-Internal-Secret') || '';
+      if (!kvsec || !timingSafeEqual(kvsec, String(icfgKv.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+      let kvd = null;
+      try { kvd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+      const kvbucket = env.ACADEMY_VIDEO;
+      if (!kvbucket || typeof kvbucket.list !== 'function' || typeof kvbucket.get !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+      let kvlimit = Math.floor(Number(kvd.limit));
+      if (!isFinite(kvlimit) || kvlimit < 1) kvlimit = 200;
+      if (kvlimit > 200) kvlimit = 200;
+      const kvreqCursor = (typeof kvd.cursor === 'string' && kvd.cursor) ? kvd.cursor : undefined;
+      let kvres = null;
+      try { kvres = await kvbucket.list({ prefix: SPILL_PREFIX, limit: kvlimit, cursor: kvreqCursor }); } catch (e) { return json({ ok: false, error: 'r2_list_failed' }, 502, origin); }
+      const kvobjs = (kvres && kvres.objects) || [];
+      const kvip = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
+      let drained = 0, expired = 0, failed = 0, stopped = false;
+      for (let kvi = 0; kvi < kvobjs.length; kvi++) {
+        const ko = kvobjs[kvi];
+        let ent = null;
+        try { const kob = await kvbucket.get(ko.key); if (kob) ent = JSON.parse(await kob.text()); } catch (e) { ent = null; }
+        if (!ent || typeof ent.key !== 'string' || typeof ent.value !== 'string') { failed++; continue; }
+        const nowKv = Date.now();
+        const expKv = (ent.exp === null || ent.exp === undefined) ? null : Number(ent.exp);
+        if (expKv !== null && (!isFinite(expKv) || expKv - nowKv < 60000)) {
+          try { await kvbucket.delete(ko.key); } catch (e) {}
+          expired++;
+          continue;
+        }
+        try {
+          if (expKv !== null) await env.LEADS.put(ent.key, ent.value, { expirationTtl: Math.floor((expKv - nowKv) / 1000) });
+          else await env.LEADS.put(ent.key, ent.value);
+        } catch (e) { failed++; stopped = true; break; }
+        try { await kvbucket.delete(ko.key); } catch (e) {}
+        drained++;
+      }
+      const processed = drained + expired + failed;
+      const pageDone = !stopped && processed >= kvobjs.length;
+      const outCursor = stopped ? (kvreqCursor || null) : (pageDone && kvres.truncated && kvres.cursor ? String(kvres.cursor) : null);
+      const remaining = stopped ? (kvobjs.length - processed) : (pageDone && kvres.truncated ? null : 0);
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'kv_drain', target: SPILL_PREFIX, ip: kvip, at: new Date().toISOString(), detail: { via: 'internal', drained: drained, expired: expired, failed: failed } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      return json({ ok: true, drained: drained, expired: expired, failed: failed, cursor: outCursor, remaining: remaining }, 200, origin);
     }
     // Pack E (RDR-01 M4): /api/market-pool joins the larger-cap paths —
     // a full pool item is ~2.7KB, so the 32KB default cap 413'd batches
@@ -12507,7 +12698,7 @@ async function handleRequest(request, env, ctx) {
           if (sess.rec.renewedDay !== today) {
             exp = Date.now() + ACAD_SESSION_REMEMBER_MS;
             sess.rec.exp = exp; sess.rec.renewedDay = today;
-            await env.LEADS.put(sess.key, JSON.stringify(sess.rec), { expirationTtl: Math.floor(ACAD_SESSION_REMEMBER_MS / 1000) });
+            await acadKvPut(env, sess.key, JSON.stringify(sess.rec), Math.floor(ACAD_SESSION_REMEMBER_MS / 1000));
             renewed = true;
           }
         }
@@ -12565,7 +12756,7 @@ async function handleRequest(request, env, ctx) {
         // stops working at logout, not at its TTL. Always ok:true —
         // no existence oracle.
         const sess = await acadSessionRecord(env, request);
-        if (sess) { try { await env.LEADS.delete(sess.key); } catch (e) {} }
+        if (sess) { try { await acadKvDelete(env, sess.key); } catch (e) {} }
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/academy/student-set-password' && request.method === 'POST') {
@@ -12621,12 +12812,12 @@ async function handleRequest(request, env, ctx) {
         if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const g = await tutorGate(env, email, true, origin);
         if (g.resp) return g.resp;
-        const progress = await env.LEADS.get('acprogress:' + g.ne, { type: 'json' }).catch(() => null);
-        const mistakes = await env.LEADS.get('acmistakes:' + g.ne, { type: 'json' }).catch(() => null);
-        const readiness = await env.LEADS.get('acready:' + g.ne, { type: 'json' }).catch(() => null);
+        const progress = await acadKvGet(env, 'acprogress:' + g.ne, { type: 'json' }).catch(() => null);
+        const mistakes = await acadKvGet(env, 'acmistakes:' + g.ne, { type: 'json' }).catch(() => null);
+        const readiness = await acadKvGet(env, 'acready:' + g.ne, { type: 'json' }).catch(() => null);
         const attempts = {};
         for (const ak of await listAllKeys(env, 'acattempt:' + g.ne + ':', 200)) {
-          const arec = await env.LEADS.get(ak.name, { type: 'json' }).catch(() => null);
+          const arec = await acadKvGet(env, ak.name, { type: 'json' }).catch(() => null);
           if (arec) attempts[ak.name.slice(('acattempt:' + g.ne + ':').length)] = arec;
         }
         return json({ ok: true, progress: progress, mistakes: mistakes, readiness: readiness, attempts: attempts }, 200, origin);
@@ -12643,12 +12834,12 @@ async function handleRequest(request, env, ctx) {
         if (d.progress !== undefined && d.progress !== null) {
           const prog = d.progress;
           if (typeof prog !== 'object' || typeof prog.lessons !== 'object' || prog.lessons === null || JSON.stringify(prog).length > 200000) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('acprogress:' + g.ne, JSON.stringify({ lessons: prog.lessons }));
+          await acadKvPut(env, 'acprogress:' + g.ne, JSON.stringify({ lessons: prog.lessons }));
         }
         if (d.mistakes !== undefined && d.mistakes !== null) {
           const mist = d.mistakes;
           if (typeof mist !== 'object' || !Array.isArray(mist.items) || mist.items.length > 2000 || JSON.stringify(mist).length > 400000) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify({ items: mist.items, totalEver: mist.totalEver | 0, resolvedEver: mist.resolvedEver | 0 }));
+          await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify({ items: mist.items, totalEver: mist.totalEver | 0, resolvedEver: mist.resolvedEver | 0 }));
         }
         return json({ ok: true }, 200, origin);
       }
@@ -12669,7 +12860,7 @@ async function handleRequest(request, env, ctx) {
           const v = Number(pm[k]);
           if (isFinite(v)) clean[k] = Math.max(0, Math.min(100, Math.round(v)));
         }
-        await env.LEADS.put('academy:snap:' + g.ne, JSON.stringify({ perModuleMastery: clean, ts: Date.now() }));
+        await acadKvPut(env, 'academy:snap:' + g.ne, JSON.stringify({ perModuleMastery: clean, ts: Date.now() }));
         return json({ ok: true }, 200, origin);
       }
       // Pack AcademyBuildE (2026-11-11): public course-freshness
@@ -12694,7 +12885,7 @@ async function handleRequest(request, env, ctx) {
         if (snapKeys.length < 10) return json({ ok: true, enough: false, n: snapKeys.length }, 200, origin);
         const sums = {}, counts = {};
         for (const k of snapKeys) {
-          const s = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+          const s = await acadKvGet(env, k.name, { type: 'json' }).catch(() => null);
           if (!s || !s.perModuleMastery) continue;
           for (const m of Object.keys(s.perModuleMastery)) { sums[m] = (sums[m] || 0) + s.perModuleMastery[m]; counts[m] = (counts[m] || 0) + 1; }
         }
@@ -12797,7 +12988,7 @@ async function handleRequest(request, env, ctx) {
           grade = acadGradePayload(qq, chosen);
           att.answers = att.answers || {}; att.answerAt = att.answerAt || {};
           att.answers[qid] = chosen; att.answerAt[qid] = Date.now();
-          if (!grade.correct) { const mk = await tutorLoadMistakes(env, g.ne); acadQuizMistakeWrite(mk, qq, chosen, Date.now()); await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk)); }
+          if (!grade.correct) { const mk = await tutorLoadMistakes(env, g.ne); acadQuizMistakeWrite(mk, qq, chosen, Date.now()); await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk)); }
           await env.LEADS.put(akey, JSON.stringify(att), { expirationTtl: 86400 });
         }
         const answeredCount = Object.keys(att.answers || {}).length;
@@ -12830,7 +13021,7 @@ async function handleRequest(request, env, ctx) {
           else if (grade.correct) correctCount++;
           feedback.push(Object.assign({ qid: qid, concept: qq.concept, trap: qq.trap || null, chosen: chosen }, grade));
         }
-        if (mkDirty) await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk));
+        if (mkDirty) await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk));
         const total = att.servedIds.length;
         const score = total ? Math.round((correctCount / total) * 100) : 0;
         const route = score >= 80 ? 'mastered' : score >= 70 ? 'advance_with_review' : 'review_and_retry';
@@ -12843,14 +13034,14 @@ async function handleRequest(request, env, ctx) {
         let timing = null;
         if (perQ.length) { const slowest = perQ.reduce(function (a, b) { return b.secs > a.secs ? b : a; }, perQ[0]); timing = { perQ: perQ, avgSecs: Math.round(perQ.reduce(function (s, x) { return s + x.secs; }, 0) / perQ.length), slowestQid: slowest.qid, slowestSecs: slowest.secs, targetSecsPerQ: 108 }; }
         const arecKey = 'acattempt:' + g.ne + ':' + att.lessonId;
-        let arec = await env.LEADS.get(arecKey, { type: 'json' }).catch(() => null);
+        let arec = await acadKvGet(env, arecKey, { type: 'json' }).catch(() => null);
         if (!arec || !Array.isArray(arec.history)) arec = { lessonId: att.lessonId, count: 0, best: null, last: null, history: [] };
         arec.history.push({ attemptId: attemptId, at: nowF, servedIds: att.servedIds, answers: att.answers || {}, score: score, total: total, correctCount: correctCount, route: route, timing: timing });
         arec.count = (arec.count || 0) + 1;
         arec.best = arec.best == null ? score : Math.max(arec.best, score);
         arec.last = score;
-        await env.LEADS.put(arecKey, JSON.stringify(arec));
-        let prog = await env.LEADS.get('acprogress:' + g.ne, { type: 'json' }).catch(() => null);
+        await acadKvPut(env, arecKey, JSON.stringify(arec));
+        let prog = await acadKvGet(env, 'acprogress:' + g.ne, { type: 'json' }).catch(() => null);
         if (!prog || typeof prog !== 'object') prog = { lessons: {} };
         if (!prog.lessons) prog.lessons = {};
         const lp = prog.lessons[att.lessonId] || { status: 'not_started', bestScore: null, mastery: 0, attempts: 0, completedAt: null };
@@ -12860,7 +13051,7 @@ async function handleRequest(request, env, ctx) {
         if (score >= 70 && !lp.completedAt) lp.completedAt = nowF;
         lp.status = lp.mastery >= 80 ? 'mastered' : (lp.completedAt ? 'completed' : 'in_progress');
         prog.lessons[att.lessonId] = lp;
-        await env.LEADS.put('acprogress:' + g.ne, JSON.stringify(prog));
+        await acadKvPut(env, 'acprogress:' + g.ne, JSON.stringify(prog));
         await env.LEADS.delete(akey);
         const ready = await acadSnapshotAppend(env, g.ne);
         return json({ ok: true, attemptId: attemptId, lessonId: att.lessonId, score: score, correctCount: correctCount, total: total, route: route, feedback: feedback, timing: timing, answers: att.answers || {}, servedIds: att.servedIds, readiness: { score: ready.score, components: ready.components, history: ready.history, gate: ready.gate } }, 200, origin);
@@ -12892,7 +13083,7 @@ async function handleRequest(request, env, ctx) {
           if (item.streak >= 2) { item.resolved = true; item.resolvedAt = nowR; mk.resolvedEver = (mk.resolvedEver || 0) + 1; }
           else { item.stage = Math.min((item.stage || 0) + 1, TUTOR_SPACING_DAYS.length - 1); item.dueAt = nowR + TUTOR_SPACING_DAYS[item.stage] * TUTOR_DAY_MS; }
         } else { item.streak = 0; item.stage = 0; item.chosen = chosen; item.dueAt = nowR + TUTOR_DAY_MS; }
-        await env.LEADS.put('acmistakes:' + g.ne, JSON.stringify(mk));
+        await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk));
         const ready = await acadSnapshotAppend(env, g.ne);
         return json({ ok: true, qid: qid, correct: correct, resolved: item.resolved, streak: item.streak, stage: item.stage, nextDueAt: item.resolved ? null : item.dueAt, correctKey: qq.correct, explain: qq.explain || '', options: (qq.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === qq.correct }; }), readiness: { score: ready.score, history: ready.history, gate: ready.gate } }, 200, origin);
       }
@@ -15329,7 +15520,7 @@ async function handleRequest(request, env, ctx) {
         const existing = await academyGet(env, email);
         if (existing) return json({ error: 'already_exists' }, 409, origin);
         const rec = { email: email, name: acadProfileName(d.name), product: product, status: 'active', accessMonths: months, activatedAt: nowIso, expiresAt: expiresAt, source: ['manual', 'stripe', 'founding'].indexOf(String(d.source || '')) !== -1 ? String(d.source) : 'manual', createdBy: 'admin', createdAt: nowIso, updatedAt: nowIso, blockedAt: null, blockReason: null, note: d.note ? String(d.note).slice(0, 500) : null };
-        await env.LEADS.put('academy:' + normEmail(email), JSON.stringify(rec));
+        await acadKvPut(env, 'academy:' + normEmail(email), JSON.stringify(rec));
         // Audit target = the NORMALIZED identity (the KV key suffix) —
         // the same form the detail route's trail lookup uses, so a
         // gmail student's trail is complete (their stored email keeps
@@ -15374,7 +15565,7 @@ async function handleRequest(request, env, ctx) {
           if (!rec) return json({ error: 'not_found' }, 404, origin);
           const summary = await academySummary(env, rec, nowMs);
           const student = Object.assign({}, summary, { createdAt: rec.createdAt || rec.activatedAt, updatedAt: rec.updatedAt || null, blockedAt: rec.blockedAt || null, blockReason: rec.blockReason || null, note: rec.note || null });
-          const prog = await env.LEADS.get('acprogress:' + ne, { type: 'json' });
+          const prog = await acadKvGet(env, 'acprogress:' + ne, { type: 'json' });
           const perModuleMap = {};
           if (prog && prog.lessons) {
             for (const lid of Object.keys(prog.lessons)) {
@@ -15389,7 +15580,7 @@ async function handleRequest(request, env, ctx) {
           const quizHistory = [];
           const mocks = [];
           for (const ak of await listAllKeys(env, 'acattempt:' + ne + ':', 200)) {
-            const arec = await env.LEADS.get(ak.name, { type: 'json' });
+            const arec = await acadKvGet(env, ak.name, { type: 'json' });
             if (!arec) continue;
             for (const a of arec.history || []) {
               if (a.score === null || a.score === undefined) continue;
@@ -15400,7 +15591,7 @@ async function handleRequest(request, env, ctx) {
           }
           quizHistory.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
           mocks.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
-          const mist = await env.LEADS.get('acmistakes:' + ne, { type: 'json' });
+          const mist = await acadKvGet(env, 'acmistakes:' + ne, { type: 'json' });
           const conceptCounts = {};
           if (mist && Array.isArray(mist.items)) for (const m of mist.items) { if (m && m.concept) conceptCounts[m.concept] = (conceptCounts[m.concept] || 0) + 1; }
           const topConcepts = Object.keys(conceptCounts).map(function (c) { return { concept: c, count: conceptCounts[c] }; }).sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
@@ -15410,7 +15601,7 @@ async function handleRequest(request, env, ctx) {
         if (!action && request.method === 'DELETE') {
           if (!rec) return json({ error: 'not_found' }, 404, origin);
           const purge = new URL(request.url).searchParams.get('purgeProgress') === '1';
-          await env.LEADS.delete('academy:' + ne);
+          await acadKvDelete(env, 'academy:' + ne);
           let purgedKeys = 0;
           if (purge) { const pr = await acadPurgeStudentData(env, ne); purgedKeys = pr.keys.length + pr.sessionsRevoked; }
           await academyAudit(env, 'academy.delete', ne, ip, { purgeProgress: purge, keysRemoved: purgedKeys });
