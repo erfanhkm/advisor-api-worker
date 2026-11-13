@@ -256,6 +256,10 @@ const GEN_BUMP_EXEMPT = [
   // same reason (the 2026-11-10 KV write-pool lesson).
   ['POST', '/api/admin/academy/r2-mig-proxy'],
   ['POST', '/api/internal/academy/r2-mig'],
+  // Pack PortalUsageLeads (2026-11-12): the Academy usage probe
+  // is a read-only machine read (tutor counters + R2 inventory) —
+  // no KV write of any kind; exempt for the same reason.
+  ['POST', '/api/internal/academy/usage'],
   // Pack KvSpillway (2026-11-12): the drain replays overflow
   // objects into KV — machine traffic, exempt for the same reason
   // as the migration routes above.
@@ -1128,6 +1132,10 @@ async function scopedAuthed(request, env, path, method) {
   const INGEST = (method === 'POST' && path === '/api/market-leads') || (method === 'GET' && path === '/api/radar-settings') || (method === 'GET' && path === '/api/market-leads') || (path === '/api/radar-seen' && (method === 'GET' || method === 'POST')) || (path === '/api/market-pool' && (method === 'GET' || method === 'POST')) || (path === '/api/radar-coverage' && (method === 'GET' || method === 'POST'));
   const SERVICE = (path === '/api/admin/maintenance' && (method === 'GET' || method === 'POST')) ||
     (method === 'POST' && path === '/api/admin/backup-stamp') ||
+    // Pack PortalUsageLeads (2026-11-12): the hourly usage-alert
+    // job reads the split usage payload headlessly (the portal
+    // renders the same payload under the owner session).
+    (method === 'GET' && path === '/api/admin/usage-split') ||
     (method === 'GET' && (path === '/api/leads' || path === '/api/admin/users' || path === '/api/admin/newsletter' || path === '/api/admin/viewings' || path === '/api/admin/mailq')) ||
     // Pack AcademyAdmin (2026-11-09): the Academy GET reads (overview,
     // students list + detail) join the read-only SERVICE set (same
@@ -4896,7 +4904,7 @@ async function seedRunUsed(env, runId) { if (!runId) return 0; try { const c = a
 async function seedRunGuard(env, runId, projected) { const used = await seedRunUsed(env, runId); return (used + projected > SEED_PUT_BUDGET) ? { ok: false, used: used } : { ok: true, used: used }; }
 async function seedRunCommit(env, runId, used, puts) { if (!runId) return; try { await env.LEADS.put('seedrun:' + runId, JSON.stringify({ puts: used + puts, updatedAt: new Date().toISOString() }), { expirationTtl: 7 * 86400 }); } catch (e) {} }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
-function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; if (path === '/api/internal/academy/kv-drain') return sc === 'academy'; if (path === '/api/internal/site/kv-spill') return sc === 'academy'; if (path === '/api/internal/site/kv-drain') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
+function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; if (path === '/api/internal/academy/usage') return sc === 'academy'; if (path === '/api/internal/academy/kv-drain') return sc === 'academy'; if (path === '/api/internal/site/kv-spill') return sc === 'academy'; if (path === '/api/internal/site/kv-drain') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
    is re-asked at most once a minute; logout on the site side therefore
    takes ≤60 s to bite on the academy side. Negatives are NEVER cached
@@ -9496,7 +9504,20 @@ async function puPipeline(env) {
     if (columns[st].length > 120) columnsTruncated = true;
     columns[st] = columns[st].slice(0, 120);
   });
-  const out = { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at };
+  // Pack PortalUsageLeads (2026-11-12): board-wide temperature
+  // counts under the TODAY hotLeads segment's EXACT rule — closed
+  // and dropped leads leave the temperature buckets — so the
+  // Pipeline filter chips can never disagree with the Today card.
+  // The columns are capped at 120 cards per stage; these counts
+  // are computed from the full scored set and are not capped.
+  const bandCounts = { all: sm.leads.length, hot: 0, warm: 0, cold: 0, closed: 0, dropped: 0 };
+  sm.leads.forEach(function (l) {
+    const s = sm.map[l.id]; if (!s) return;
+    if (l.stage === 'closed') bandCounts.closed++;
+    else if (l.stage === 'dropped') bandCounts.dropped++;
+    else bandCounts[s.band]++;
+  });
+  const out = { stages: STAGES.slice(), columns: columns, counts: counts, total: sm.leads.length, scoresAt: sm.at, bandCounts: bandCounts };
   if (normalized) out.normalizedStages = normalized;
   // Pack PK (01-H1 + 01-M3): the board forwards the aggregation's
   // degraded state and sources (the gen cache keys its eviction off
@@ -12884,6 +12905,54 @@ async function handleRequest(request, env, ctx) {
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
       }
+    /* Pack PortalUsageLeads (2026-11-12): the read-only Academy
+       usage probe behind the portal's split usage section. Same
+       cfg:internal gate as the r2-mig route below, but NO audit
+       write of any kind — this account hit its daily KV write cap
+       on 2026-11-12 partly through per-op audit writes, so a usage
+       probe must never become a consumer. Returns the tutor credit
+       counters (Vancouver day — the same keys the tutor-insights
+       card reads), the student profile count, the R2 bucket
+       inventory (objects/bytes incl. the kv-overflow/ spillway
+       prefix) and this namespace's own lists counter. */
+    if (path === '/api/internal/academy/usage' && request.method === 'POST') {
+      const icfgU = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(function () { return null; });
+      if (!icfgU || !icfgU.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
+      const usec = request.headers.get('X-Internal-Secret') || '';
+      if (!usec || !timingSafeEqual(usec, String(icfgU.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+      const uout = { ok: true, at: new Date().toISOString() };
+      try {
+        const tcfgU = await tutorCfg(env);
+        const capsU = tutorCaps(tcfgU);
+        const tdayU = todayVancouver();
+        const provU = {};
+        for (const p of ['groq', 'gemini', 'workers-ai']) provU[p] = await tutorUsageCount(env, 'tutor:usage:' + tdayU + ':prov:' + p);
+        uout.tutor = { configured: tutorReady(tcfgU), day: tdayU, globalUsed: await tutorUsageCount(env, 'tutor:usage:' + tdayU + ':_global'), globalCap: capsU.global, perStudentCap: capsU.perStudent, perProvider: provU, voiceUsed: await tutorUsageCount(env, 'tutor:voiceusage:' + tdayU + ':_global') };
+      } catch (e) { uout.tutor = null; }
+      try {
+        const namesU = await listAllKeys(env, 'academy:', 5000);
+        let nU = 0;
+        for (const k of namesU) { const suf = String(k.name || k).slice('academy:'.length); if (suf.indexOf('@') > 0 && suf.indexOf('snap:') !== 0) nU++; }
+        uout.students = nU;
+      } catch (e) { uout.students = null; }
+      if (env.ACADEMY_VIDEO) {
+        try {
+          let objects = 0, bytes = 0, mediaBytes = 0, overflow = 0, cursor = undefined, pages = 0, truncated = false;
+          do {
+            const page = await env.ACADEMY_VIDEO.list({ limit: 1000, cursor: cursor });
+            pages++;
+            const objs = page.objects || [];
+            for (const o of objs) { objects++; bytes += o.size || 0; if (o.key.indexOf('media/') === 0) mediaBytes += o.size || 0; if (o.key.indexOf('kv-overflow/') === 0) overflow++; }
+            truncated = !!page.truncated;
+            cursor = page.truncated ? page.cursor : undefined;
+          } while (cursor && pages < 60);
+          uout.r2 = { objects: objects, bytes: bytes, mediaBytes: mediaBytes, overflowObjects: overflow, truncated: truncated };
+        } catch (e) { uout.r2 = null; }
+      } else uout.r2 = null;
+      try { const lvU = await env.LEADS.get('usage:lists:' + utcDay(), { type: 'json' }); uout.kvListsToday = (typeof lvU === 'number') ? lvU : ((lvU && typeof lvU.count === 'number') ? lvU.count : 0); } catch (e) { uout.kvListsToday = null; }
+      try { const b2u = await env.LEADS.get('cfg:b2', { type: 'json' }); uout.b2 = { configured: !!(b2u && b2u.keyId && b2u.appKey) }; } catch (e) { uout.b2 = { configured: false }; }
+      return json(uout, 200, origin);
+    }
     /* Pack R2MigProxy (2026-11-12): R2 migration, INTERNAL family —
        the mirror of booklet-seed/tutor-seed above. The direct R2
        transfer routes (/api/admin/academy/r2-object, r2-list) are
@@ -20384,6 +20453,87 @@ async function handleRequest(request, env, ctx) {
         const ai = await aiInternal(env, '/api/internal/usage', {});
         if (!ai || !ai.ok) return json({ ok: false, partial: true, error: (ai && ai.error) || 'ai_unavailable', brain: brainLocal, note: 'Chat/search counters live in the ai-chat worker and could not be read this time; the portal-brain counters above are local to this worker and were read directly.' }, 200, origin);
         return json(Object.assign({}, ai, { brain: brainLocal, remoteBrain: ai.brain || null }), 200, origin);
+      }
+
+      // ---- admin: split usage (Pack PortalUsageLeads, 2026-11-12) ----
+      // One payload behind Maintenance's two usage sections and the
+      // hourly 80% alert job (SERVICE-admitted in scopedAuthed).
+      // Metric shape: {key,label,used,limit,unit,pct,resetText,
+      // resetKind,fallback,state,note?,extra?}. used/limit are null
+      // whenever a number would be a lie: KV writes have no
+      // self-counter on either account (provider-metered — cap
+      // events surface as Cloudflare alert emails), and the
+      // ElevenLabs balance is read live by the alert job, not from
+      // the portal. Academy-side numbers arrive through the
+      // cfg:internal bridge (the read-only probe above; NO audit
+      // writes); a dead bridge degrades the Academy section to one
+      // honest unreadable entry, never to zeros. The mail row
+      // counts UNSENT records only — the queue list also shows
+      // already-sent history, which is why its total can read
+      // higher than this number (49 listed vs 46 unsent on
+      // 2026-11-12).
+      if (path === '/api/admin/usage-split' && request.method === 'GET') {
+        const pctOf = function (u, l) { return (typeof u === 'number' && typeof l === 'number' && l > 0) ? Math.round(u / l * 1000) / 10 : null; };
+        const RESET_UTC = 'Resets 17:00 Vancouver (00:00 UTC)';
+        const siteM = [], acadM = [];
+        const aiU = await aiInternal(env, '/api/internal/usage', {});
+        if (aiU && aiU.ok && aiU.chat) {
+          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: aiU.chat.used, limit: aiU.chat.budget, unit: 'chats', pct: pctOf(aiU.chat.used, aiU.chat.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI); at zero the assistant answers with a polite fallback.', state: 'ok' });
+          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: aiU.search.used, limit: aiU.search.budget, unit: 'searches', pct: pctOf(aiU.search.used, aiU.search.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'ok' });
+        } else {
+          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: null, limit: 700, unit: 'chats', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI).', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
+          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: null, limit: 150, unit: 'searches', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
+        }
+        const bcfgS = await brainCfg(env);
+        const busedS = await brainUsage(env);
+        siteM.push({ key: 'brain', label: 'Portal brain calls', used: busedS, limit: bcfgS.dailyCap, unit: 'calls', pct: pctOf(busedS, bcfgS.dailyCap), resetText: 'Resets midnight Vancouver', resetKind: 'vancouver-day', fallback: 'Soft cap — past it the brain degrades to rules-only answers; nothing breaks.', state: 'ok' });
+        let listsS = null;
+        try { const lvS = await env.LEADS.get('usage:lists:' + utcDay(), { type: 'json' }); listsS = (typeof lvS === 'number') ? lvS : ((lvS && typeof lvS.count === 'number') ? lvS.count : 0); } catch (e) {}
+        siteM.push({ key: 'kv_lists', label: 'LEADS KV list ops', used: listsS, limit: 1000, unit: 'lists', pct: pctOf(listsS, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Portal lists are generation-cached; reads keep working — only freshness suffers.', state: listsS === null ? 'unreadable' : 'ok' });
+        siteM.push({ key: 'kv_writes', label: 'LEADS KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 is LIVE on the site deployment too (resilience P0-2, deployed 2026-11-12): on a write-cap day, records divert to R2 and drain back into KV after the reset.', state: 'provider-metered', note: 'No self-counter exists; cap events surface as Cloudflare alert emails.' });
+        let mqUnsent = null, mqOldest = null;
+        try {
+          const mk = await listAllKeys(env, 'mailq:', 2000);
+          let n = 0, oldest = null;
+          for (let i = 0; i < mk.length; i += 20) {
+            const batch = await Promise.all(mk.slice(i, i + 20).map(function (k) { return env.LEADS.get(String(k.name || k), { type: 'json' }).catch(function () { return null; }); }));
+            for (const mr of batch) { if (mr && !mr.sent) { n++; if (mr.created_at && (!oldest || mr.created_at < oldest)) oldest = mr.created_at; } }
+          }
+          mqUnsent = n; mqOldest = oldest;
+        } catch (e) {}
+        siteM.push({ key: 'mail_queue', label: 'Mail queue — unsent', used: mqUnsent, limit: null, unit: 'emails', pct: null, resetText: 'No reset — the queue drains only when sending is provisioned.', resetKind: 'none', fallback: 'None — mail sending is unprovisioned (cfg:mail unset, auto-send off); held mail waits for the December activation.', state: mqUnsent === null ? 'unreadable' : 'info', note: 'Unsent records only. The queue list also counts already-sent history, so its total can read higher.', extra: { oldestUnsentAt: mqOldest } });
+        let bkS = null;
+        try { bkS = await env.LEADS.get('backup:last', { type: 'json' }); } catch (e) {}
+        siteM.push({ key: 'kv_backup', label: 'Last KV backup (LEADS)', used: null, limit: null, unit: '', pct: null, resetText: 'Auto-backup runs nightly from Dec 1; the weekly snapshot stamps here too.', resetKind: 'none', fallback: 'In-namespace rollback copy only — the off-platform export is resilience P0-4.', state: 'info', note: bkS ? null : 'No backup stamp recorded yet.', extra: bkS ? { at: bkS.at || null, keys: bkS.keys || 0 } : null });
+        let canS = null, maintAt = null;
+        try { const ml = await env.LEADS.get('maint:last', { type: 'json' }); if (ml) { maintAt = ml.at || null; canS = ml.canary || null; } } catch (e) {}
+        siteM.push({ key: 'canary', label: 'Worker health (canary)', used: null, limit: null, unit: '', pct: null, resetText: 'Checked on every maintenance run.', resetKind: 'none', fallback: 'The 5-minute failover monitor watches the public surfaces independently.', state: 'info', note: canS ? (canS.ok ? 'Last maintenance canary passed.' : 'Last maintenance canary flagged a problem — see the Maintenance report.') : 'No maintenance report yet.', extra: { at: maintAt, ok: canS ? !!canS.ok : null } });
+        let au = null, auErr = null;
+        try {
+          const icfgS = await env.LEADS.get('cfg:internal', { type: 'json' });
+          if (icfgS && icfgS.secret) {
+            const ctl = new AbortController(); const tm = setTimeout(function () { ctl.abort(); }, 30000);
+            const rr = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/usage', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgS.secret), 'User-Agent': 'advisor-api/usage-split' }, body: '{}' });
+            clearTimeout(tm);
+            const jj = await rr.json().catch(function () { return null; });
+            if (rr.ok && jj && jj.ok) au = jj; else auErr = 'bridge_' + rr.status;
+          } else auErr = 'not_configured';
+        } catch (e) { auErr = 'unreachable'; }
+        if (au) {
+          if (au.tutor) acadM.push({ key: 'tutor_credits', label: 'Tutor chat credits', used: au.tutor.globalUsed, limit: au.tutor.globalCap, unit: 'credits', pct: pctOf(au.tutor.globalUsed, au.tutor.globalCap), resetText: 'Resets midnight Vancouver (Vancouver day)', resetKind: 'vancouver-day', fallback: 'Dual-provider chain (Groq + Gemini) with Workers AI behind it; per-student cap ' + au.tutor.perStudentCap + '/day.', state: 'ok', extra: { perProvider: au.tutor.perProvider || {}, perStudentCap: au.tutor.perStudentCap, voiceUsed: au.tutor.voiceUsed } });
+          if (typeof au.kvListsToday === 'number') acadM.push({ key: 'academy_kv_lists', label: 'ACADEMY KV list ops', used: au.kvListsToday, limit: 1000, unit: 'lists', pct: pctOf(au.kvListsToday, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Reads are generous (100k/day); list calls are cached where it matters.', state: 'ok' });
+          acadM.push({ key: 'academy_kv_writes', label: 'ACADEMY KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 (Pack KvSpillway) is LIVE — the video migration is complete and the spillway deployed on 2026-11-12 — so logins, sessions and progress saves keep working through a cap day, and the drain replays them after the reset.', state: 'provider-metered', note: 'No self-counter exists. This account hit the cap on 2026-11-12 (tutor seed + migration audit writes); student logins were blocked until the 17:00 Vancouver reset.' });
+          if (au.r2) {
+            acadM.push({ key: 'r2_storage', label: 'R2 video storage', used: au.r2.bytes, limit: 10737418240, unit: 'bytes', pct: pctOf(au.r2.bytes, 10737418240), resetText: 'Storage is a monthly-cycle quota — it does not reset daily; reads are 10M/month with free egress.', resetKind: 'monthly', fallback: 'If R2 is unreachable, video reads fall back to the B2 copy automatically.', state: 'ok', extra: { objects: au.r2.objects, mediaBytes: au.r2.mediaBytes, overflowObjects: au.r2.overflowObjects } });
+            acadM.push({ key: 'r2_spillway', label: 'KV spillway overflow (in R2)', used: au.r2.overflowObjects, limit: null, unit: 'objects', pct: null, resetText: 'Drained back into KV after the daily reset (17:00 Vancouver).', resetKind: 'none', fallback: 'This IS the fallback working — overflow records are served from R2 until drained.', state: 'info', note: au.r2.overflowObjects > 0 ? 'Records the KV write cap diverted to R2.' : 'Empty — no spill has occurred.' });
+          }
+          acadM.push({ key: 'b2_backup', label: 'B2 backup copy (video)', used: null, limit: 2500, unit: 'Class B reads/day', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'B2 IS the fallback for R2 reads; the R2 copy is primary.', state: 'provider-metered', note: 'Provider-metered. The 2,500/day Class B read cap was exceeded on 2026-11-12 (verification reads). Fallback key state: ' + (au.b2 && au.b2.configured ? 'stored.' : 'NOT stored — the fallback is unarmed until a fresh key is provisioned.') });
+          acadM.push({ key: 'elevenlabs', label: 'ElevenLabs credits', used: null, limit: 121759, unit: 'credits', pct: null, resetText: 'Monthly subscription cycle (Creator plan, 121,759 credits).', resetKind: 'monthly', fallback: 'None — narration pauses when the pool empties; recorded lessons are unaffected.', state: 'external', note: 'The portal cannot read this balance directly; the hourly alert job reads it live. Last live read (2026-11-13): 109,230 of 121,759 used (~90%) — already past the 80% alert line.' });
+          if (typeof au.students === 'number') acadM.push({ key: 'students', label: 'Academy students', used: au.students, limit: null, unit: 'students', pct: null, resetText: '—', resetKind: 'none', fallback: '', state: 'info' });
+        } else {
+          acadM.push({ key: 'academy_bridge', label: 'Academy usage', used: null, limit: null, unit: '', pct: null, resetText: '', resetKind: 'none', fallback: '', state: 'unreadable', note: 'Academy probe failed (' + (auErr || 'unknown') + ') — Academy numbers are unavailable right now. Nothing is hidden; the probe itself failed.' });
+        }
+        return json({ ok: true, at: new Date().toISOString(), site: { label: 'EH REALTY — Site usage', metrics: siteM }, academy: { label: 'EH REALTY ACADEMY — Academy usage', metrics: acadM } }, 200, origin);
       }
 
       // ---- admin: KV backup stamp (the weekly backup job reports success here) ----
