@@ -19134,7 +19134,30 @@ async function handleRequest(request, env, ctx) {
         const key = String(d.key || '');
         if (CFG_KEYS.indexOf(key) === -1 || d.value === null || typeof d.value !== 'object' || Array.isArray(d.value) || JSON.stringify(d.value).length > 8192) return json({ ok: false, error: 'validation' }, 400, origin);
         const cfgPrevS = await env.LEADS.get('cfg:' + key).catch(function () { return null; });
-        await siteKvPut(env, 'cfg:' + key, JSON.stringify(d.value), { baseHash: cfgPrevS ? await sha256hex(cfgPrevS) : null }); // Pack SiteKvSpillway: only allow-listed non-secret cfg (cfg:platform) actually spills; secret-bearing keys degrade to the raw put inside siteKvPut
+        /* Pack CallsConfigPreserve (2026-11-12): for cfg:calls ONLY, a
+           non-empty post MERGES over the stored config instead of
+           replacing it wholesale — the portal Calls card posts only its
+           six known fields and this route never returns stored values,
+           so a wholesale replace silently wiped sibling-owned fields
+           (cfg:calls.whatsapp template registry, allowlist/blocklist +
+           guardian overrides, transcribe/voicemail flags). Posted
+           fields win; a posted field set to null DELETES the stored
+           field; an exactly-{} post (the card's two-step Clear) still
+           replaces wholesale; the 8,192-byte cap applies to the MERGED
+           result and an over-cap merge is refused before any write,
+           leaving the stored config untouched. Every other key keeps
+           wholesale replace. */
+        let cfgWriteVal = d.value;
+        if (key === 'calls' && Object.keys(d.value).length > 0) {
+          let cfgStoredObj = null;
+          try { cfgStoredObj = cfgPrevS ? JSON.parse(cfgPrevS) : null; } catch (e) { cfgStoredObj = null; }
+          if (!cfgStoredObj || typeof cfgStoredObj !== 'object' || Array.isArray(cfgStoredObj)) cfgStoredObj = {};
+          const cfgMerged = Object.assign({}, cfgStoredObj);
+          for (const cfgFk of Object.keys(d.value)) { if (d.value[cfgFk] === null) delete cfgMerged[cfgFk]; else cfgMerged[cfgFk] = d.value[cfgFk]; }
+          if (JSON.stringify(cfgMerged).length > 8192) return json({ ok: false, error: 'validation' }, 400, origin);
+          cfgWriteVal = cfgMerged;
+        }
+        await siteKvPut(env, 'cfg:' + key, JSON.stringify(cfgWriteVal), { baseHash: cfgPrevS ? await sha256hex(cfgPrevS) : null }); // Pack SiteKvSpillway: only allow-listed non-secret cfg (cfg:platform) actually spills; secret-bearing keys degrade to the raw put inside siteKvPut
         await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'config_set', target: key, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
         return json({ ok: true }, 200, origin);
       }
