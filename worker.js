@@ -11921,7 +11921,18 @@ async function handleRequest(request, env, ctx) {
         if (limited('uv:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         const email = await userAuth(request, env);
         if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
-        if (!(await emailVerified(env, email))) return json({ ok: false, error: 'unverified' }, 403, origin);
+        // Pack MyViewingsFix (2026-11-12): NO emailVerified gate on
+        // this route (nor on cancel/reschedule below) — session auth
+        // plus the per-record email match further down scope the list
+        // to the account's own bookings. Verification gates outbound
+        // mail (saved-search alerts, automations), not read access to
+        // your own requests: registration writes verified:false and
+        // the only flip is the emailed verify link, so the gate made
+        // My viewings permanently empty for email-registered
+        // customers whenever that mail cannot be delivered (live
+        // defect, role-check 2026-11-12: the booking WAS recorded
+        // and visible in the owner portal while the customer saw
+        // "No viewings booked yet.").
         let vids = (await env.LEADS.get('uvw:' + email, { type: 'json' })) || null;
         if (!vids) {
           // one-time self-healing migration from the legacy vu: marker keys
@@ -11951,7 +11962,9 @@ async function handleRequest(request, env, ctx) {
         if (limited('vw:' + ip, 20, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin); // namespaced (Pack A): see the login limiter — same max+window used to mean a shared bucket
         const email = await userAuth(request, env);
         if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
-        if (!(await emailVerified(env, email))) return json({ ok: false, error: 'unverified' }, 403, origin);
+        // Pack MyViewingsFix: no emailVerified gate here either (see
+        // the GET route above) — userAuth + the rec.email ownership
+        // check immediately below are the access control.
         const rec = await env.LEADS.get('viewing:' + uvm[1], { type: 'json' });
         if (!rec || rec.email !== email) return json({ ok: false, error: 'not_found' }, 404, origin);
         let d = null;
