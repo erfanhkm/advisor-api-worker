@@ -3073,6 +3073,507 @@ async function allTasks(env) {
   return out;
 }
 
+
+/* ================= Pack SystemDealsCMA (2026-11-12) =================
+   SYSTEM D — Transaction management + CMA engine (owner portal only).
+
+   DEALS: deal:<id> records (parties linked by email/person id, property
+   by MLS ref or free address, price, the seven BC deal dates, stage
+   pipeline Offer -> Subjects -> Firm -> Completion -> Closed, per-stage
+   document CHECKLISTS — templates are checklists only, never the legal
+   documents). DEADLINE ENGINE: a pure function of the deal record (see
+   dealDeadlines for the stated rules). CONTRACT dates are used EXACTLY
+   as entered — BC Contracts of Purchase and Sale state calendar dates
+   and time is of the essence, so nothing rolls them; a weekend/holiday
+   landing is FLAGGED, never moved. DERIVED preparation reminders roll
+   BACKWARD to the previous business day (they must fire early, never
+   late); the one forward-rolled reminder (title-search follow-up)
+   counts business days forward. Deadlines materialise as ordinary
+   task: records (rule:'deal') so they surface in Today / Follow-ups
+   through the existing channels, and overdue ones raise ONE portal
+   Web Push per deal per state change (puNotifyPush — the ScreenPop
+   channel). CMA: comparable ranking over the listings abstraction
+   (SEED_LISTINGS overridden by the owner's KV listings, tombstones
+   removed — the same merge every catalog consumer reads), adjustments
+   entered ONLY by the owner (the engine adds none and invents no sold
+   price), an indicated range computed from the chosen comps alone, and
+   a Black & Gold PDF built whole from scratch at view time (the
+   platform's full-build PDF discipline — no incremental edits). While
+   cfg:platform.postLicense is false the catalog is the sample set, so
+   every report is stamped sampleData and the PDF is watermarked and
+   carries the neutral PNA-Fix footer; post-licensing the identical
+   engine reads the live feed and the licensed footer applies. */
+
+// ---------- BC holidays 2026-2027 (business-day rules) ----------
+// Statutory holidays observed in BC plus Land Title Office closure
+// days. Dates derived from the statutory rules (e.g. Family Day = 3rd
+// Monday of February; Victoria Day = Monday on or before May 24; Good
+// Friday from Easter) and cross-checked against the Province of BC
+// holiday calendar. When a holiday / registry closure falls on a
+// weekend, the weekday it is actually observed on is ALSO listed,
+// marked '(observed)' — the nominal weekend date is calendrically
+// inert (already a non-business day), so the observed weekday is the
+// entry that moves the business-day math: Boxing Day 2026 falls on a
+// Saturday, so the closure bites on Mon 2026-12-28; in 2027 Christmas
+// Day (Sat) is observed Fri 2027-12-24 and Boxing Day (Sun) on Mon
+// 2027-12-27. The pin file exercises the weekday-rule entries
+// behaviourally (BC Day, Labour Day, Christmas, Boxing Day incl. its
+// 2026 observed closure, Family Day, Victoria Day).
+const DEAL_HOLIDAYS = {
+  '2026-01-01': "New Year's Day", '2026-02-16': 'Family Day', '2026-04-03': 'Good Friday',
+  '2026-05-18': 'Victoria Day', '2026-07-01': 'Canada Day', '2026-08-03': 'BC Day',
+  '2026-09-07': 'Labour Day', '2026-09-30': 'National Day for Truth and Reconciliation',
+  '2026-10-12': 'Thanksgiving Day', '2026-11-11': 'Remembrance Day', '2026-12-25': 'Christmas Day',
+  '2026-12-26': 'Boxing Day (registry closure)', '2026-12-28': 'Boxing Day (observed)',
+  '2027-01-01': "New Year's Day", '2027-02-15': 'Family Day', '2027-03-26': 'Good Friday',
+  '2027-05-24': 'Victoria Day', '2027-07-01': 'Canada Day', '2027-08-02': 'BC Day',
+  '2027-09-06': 'Labour Day', '2027-09-30': 'National Day for Truth and Reconciliation',
+  '2027-10-11': 'Thanksgiving Day', '2027-11-11': 'Remembrance Day', '2027-12-24': 'Christmas Day (observed)',
+  '2027-12-25': 'Christmas Day', '2027-12-26': 'Boxing Day (registry closure)', '2027-12-27': 'Boxing Day (observed)'
+};
+function dealIsBusinessDay(ymd) {
+  const t = Date.parse(ymd + 'T00:00:00Z');
+  if (isNaN(t)) return false;
+  const dow = new Date(t).getUTCDay();
+  return dow !== 0 && dow !== 6 && !DEAL_HOLIDAYS[ymd];
+}
+function dealRollBackBusiness(ymd) { let c = ymd, n = 0; while (!dealIsBusinessDay(c) && n < 12) { c = addDaysYmd(c, -1); n++; } return c; }
+function dealAddBusinessDays(ymd, n) {
+  let c = ymd, left = n, guard = 0;
+  while (left > 0 && guard < 40) { c = addDaysYmd(c, 1); guard++; if (dealIsBusinessDay(c)) left--; }
+  return c;
+}
+
+// ---------- date / record hygiene ----------
+function dealYmd(v) { // '' -> '' (unset); valid YMD -> itself; anything else -> null (invalid)
+  if (v === null || v === undefined || v === '') return '';
+  const s = String(v).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const t = Date.parse(s + 'T00:00:00Z');
+  if (isNaN(t) || new Date(t).toISOString().slice(0, 10) !== s) return null;
+  return s;
+}
+const DEAL_STAGES = ['offer', 'subjects', 'firm', 'completion', 'closed', 'collapsed'];
+const DEAL_DATE_KEYS = ['offer', 'acceptance', 'subjectsRemoval', 'depositDue', 'completion', 'adjustment', 'possession'];
+const DEAL_STRATA_TYPES = ['condo', 'apartment', 'townhouse'];
+function dealCleanParty(p) {
+  p = (p && typeof p === 'object') ? p : {};
+  return { personId: cleanText(p.personId || '', 80), email: normEmail(String(p.email || '')), name: cleanText(p.name || '', 120) };
+}
+function dealSanitize(input, prev) {
+  const d = (input && typeof input === 'object') ? input : {};
+  const base = prev || {
+    id: '', side: 'buy', stage: 'offer', buyer: { personId: '', email: '', name: '' }, seller: { personId: '', email: '', name: '' },
+    property: { mls: '', address: '', city: '', type: '' }, price: null, depositAmount: null, strata: false,
+    dates: { offer: '', acceptance: '', subjectsRemoval: '', depositDue: '', completion: '', adjustment: '', possession: '' },
+    conditions: [], checklist: {}, notes: '', pushMark: ''
+  };
+  const out = JSON.parse(JSON.stringify(base));
+  if (d.side !== undefined) { if (d.side !== 'buy' && d.side !== 'sell') return { error: 'side' }; out.side = d.side; }
+  if (d.stage !== undefined) { if (DEAL_STAGES.indexOf(d.stage) === -1) return { error: 'stage' }; out.stage = d.stage; }
+  if (d.buyer !== undefined) out.buyer = dealCleanParty(d.buyer);
+  if (d.seller !== undefined) out.seller = dealCleanParty(d.seller);
+  if (d.property !== undefined) {
+    const p = (d.property && typeof d.property === 'object') ? d.property : {};
+    out.property = { mls: cleanText(p.mls || '', 24).toUpperCase(), address: cleanText(p.address || '', 160), city: cleanText(p.city || '', 60), type: cleanText(p.type || '', 24).toLowerCase() };
+  }
+  const money = function (v) { if (v === null || v === '') return null; const n = Number(v); return (isFinite(n) && n >= 0 && n <= 100000000) ? Math.round(n) : undefined; };
+  if (d.price !== undefined) { const m = money(d.price); if (m === undefined) return { error: 'price' }; out.price = m; }
+  if (d.depositAmount !== undefined) { const m = money(d.depositAmount); if (m === undefined) return { error: 'depositAmount' }; out.depositAmount = m; }
+  if (d.strata !== undefined) out.strata = d.strata === true;
+  else if (!prev && d.property !== undefined) out.strata = DEAL_STRATA_TYPES.indexOf(out.property.type) !== -1;
+  if (d.dates !== undefined) {
+    const dd = (d.dates && typeof d.dates === 'object') ? d.dates : {};
+    for (const k of DEAL_DATE_KEYS) {
+      if (dd[k] === undefined) continue;
+      const v = dealYmd(dd[k]);
+      if (v === null) return { error: 'dates.' + k };
+      out.dates[k] = v;
+    }
+  }
+  if (d.conditions !== undefined) {
+    if (!Array.isArray(d.conditions) || d.conditions.length > 12) return { error: 'conditions' };
+    const conds = [];
+    const usedKeys = {};
+    for (const c0 of d.conditions) {
+      const c = (c0 && typeof c0 === 'object') ? c0 : {};
+      const label = cleanText(c.label || '', 120);
+      if (!label) return { error: 'conditions.label' };
+      const due = dealYmd(c.due);
+      if (due === null) return { error: 'conditions.due' };
+      // Bare key (no prefix — the deadline engine adds 'cond-'): a
+      // client-supplied key wins, else a slug of the label, else random.
+      let key = cleanText(c.key || '', 40).replace(/^cond-/, '');
+      if (!key) key = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      if (!key) key = 'c' + randHex(3);
+      if (usedKeys[key]) key = key + '-' + randHex(2);
+      usedKeys[key] = 1;
+      conds.push({ key: key, label: label, due: due, done: c.done === true });
+    }
+    out.conditions = conds;
+  }
+  if (d.checklistSet !== undefined) {
+    const cs = (d.checklistSet && typeof d.checklistSet === 'object') ? d.checklistSet : {};
+    const tpl = DEAL_CHECKLIST.filter(function (i) { return i.stage === cs.stage && i.key === cs.key; })[0];
+    if (!tpl) return { error: 'checklistSet' };
+    if (!out.checklist[cs.stage]) out.checklist[cs.stage] = {};
+    out.checklist[cs.stage][cs.key] = cs.done === true;
+  }
+  if (d.notes !== undefined) out.notes = cleanText(d.notes, 2000);
+  return { deal: out };
+}
+
+// ---------- document checklists (templates — checklists, not documents) ----------
+// applies: 'all' | 'strata' (deal.strata) | 'buy' / 'sell' (the side the
+// owner represents — FINTRAC, financing and PDS duties follow the client).
+const DEAL_CHECKLIST = [
+  { stage: 'offer', key: 'cps', label: 'Contract of Purchase and Sale — fully executed copy on file', applies: 'all' },
+  { stage: 'offer', key: 'fintrac-buyer', label: 'FINTRAC — buyer identity verified and recorded', applies: 'buy' },
+  { stage: 'offer', key: 'fintrac-seller', label: 'FINTRAC — seller identity verified and recorded', applies: 'sell' },
+  { stage: 'offer', key: 'pds-request', label: 'Property Disclosure Statement requested from the seller', applies: 'buy' },
+  { stage: 'offer', key: 'pds-provide', label: 'Property Disclosure Statement completed by the seller', applies: 'sell' },
+  { stage: 'offer', key: 'preapproval', label: 'Buyer mortgage pre-approval letter on file', applies: 'buy' },
+  { stage: 'offer', key: 'deposit-plan', label: 'Deposit method confirmed (bank draft / wire instructions)', applies: 'all' },
+  { stage: 'subjects', key: 'pds-review', label: 'PDS received, reviewed with the client and acknowledged', applies: 'all' },
+  { stage: 'subjects', key: 'title-search', label: 'Title search ordered and reviewed (charges, easements, covenants)', applies: 'all' },
+  { stage: 'subjects', key: 'form-b', label: 'Strata Form B — Information Certificate received and reviewed', applies: 'strata' },
+  { stage: 'subjects', key: 'strata-docs', label: 'Strata documents reviewed (bylaws, minutes, depreciation report)', applies: 'strata' },
+  { stage: 'subjects', key: 'inspection', label: 'Home inspection completed and report reviewed', applies: 'all' },
+  { stage: 'subjects', key: 'financing', label: 'Financing confirmed in writing by the lender', applies: 'buy' },
+  { stage: 'subjects', key: 'insurance', label: 'Home insurance arranged (binder effective on completion)', applies: 'buy' },
+  { stage: 'firm', key: 'subjects-removed', label: 'Subject removal signed and delivered to the other side', applies: 'all' },
+  { stage: 'firm', key: 'deposit-delivered', label: 'Deposit delivered and receipt confirmed', applies: 'all' },
+  { stage: 'firm', key: 'form-f', label: 'Strata Form F — Certificate of Payment obtained', applies: 'strata' },
+  { stage: 'firm', key: 'conveyancer', label: 'Lawyer / notary engaged and file opened', applies: 'all' },
+  { stage: 'completion', key: 'adjustments-review', label: 'Statement of adjustments reviewed with the client', applies: 'all' },
+  { stage: 'completion', key: 'funds', label: 'Balance of funds confirmed ready for completion', applies: 'buy' },
+  { stage: 'completion', key: 'registration', label: 'Transfer registered at the Land Title Office', applies: 'all' },
+  { stage: 'completion', key: 'keys', label: 'Keys and possession handover arranged', applies: 'all' },
+  { stage: 'closed', key: 'file-complete', label: 'File complete — every document stored', applies: 'all' },
+  { stage: 'closed', key: 'fintrac-file', label: 'FINTRAC records retained on file (5-year retention)', applies: 'all' }
+];
+function dealChecklistItems(deal) {
+  return DEAL_CHECKLIST.filter(function (i) {
+    if (i.applies === 'all') return true;
+    if (i.applies === 'strata') return deal.strata === true;
+    return i.applies === deal.side;
+  }).map(function (i) {
+    const st = (deal.checklist && deal.checklist[i.stage]) || {};
+    return { stage: i.stage, key: i.key, label: i.label, applies: i.applies, done: st[i.key] === true };
+  });
+}
+
+// ---------- deadline engine (pure; rules stated in the header) ----------
+function dealDeadlines(deal, today) {
+  today = today || todayVancouver();
+  const d = deal.dates || {};
+  const out = [];
+  const push = function (key, label, date, kind, derived) {
+    if (!date) return;
+    out.push({
+      key: key, label: label, date: date, kind: kind, derived: !!derived,
+      weekendOrHoliday: !dealIsBusinessDay(date),
+      status: date < today ? 'overdue' : (date === today ? 'today' : 'upcoming')
+    });
+  };
+  if (d.offer) push('offer-date', 'Offer presented', d.offer, 'contract');
+  if (d.acceptance) {
+    push('acceptance', 'Offer accepted', d.acceptance, 'contract');
+    push('title-followup', 'Order / review title search (2 business days after acceptance)', dealAddBusinessDays(d.acceptance, 2), 'reminder', true);
+  }
+  if (d.subjectsRemoval) {
+    push('subjects-removal', 'Subject removal deadline', d.subjectsRemoval, 'contract');
+    push('subjects-removal-soon', 'Subject removal in 2 days — confirm every subject', addDaysYmd(d.subjectsRemoval, -2), 'reminder', true);
+  }
+  const depDerived = !d.depositDue && !!d.subjectsRemoval;
+  const depDate = d.depositDue || (d.subjectsRemoval ? addDaysYmd(d.subjectsRemoval, 1) : '');
+  if (depDate) push('deposit-due', depDerived ? 'Deposit due (within 24 hours of subject removal — CPS standard term)' : 'Deposit due', depDate, 'contract', depDerived);
+  if (d.adjustment) push('adjustment-date', 'Adjustment date (statements calculated to this date)', d.adjustment, 'contract');
+  if (d.completion) {
+    push('completion', 'Completion date', d.completion, 'contract');
+    push('adjustments-review', 'Review statement of adjustments', dealRollBackBusiness(addDaysYmd(d.completion, -3)), 'reminder', true);
+    push('funds-check', 'Confirm closing funds are ready', dealRollBackBusiness(addDaysYmd(d.completion, -1)), 'reminder', true);
+  }
+  if (d.possession) push('possession', 'Possession date', d.possession, 'contract');
+  (deal.conditions || []).forEach(function (c) {
+    if (c && c.due && !c.done) push('cond-' + c.key, 'Subject: ' + c.label, c.due, 'contract');
+  });
+  out.sort(function (a, b) { return a.date < b.date ? -1 : (a.date > b.date ? 1 : (a.key < b.key ? -1 : 1)); });
+  return out;
+}
+const DEAL_TASK_KEYS = ['subjects-removal', 'subjects-removal-soon', 'deposit-due', 'adjustments-review', 'funds-check', 'possession', 'title-followup'];
+async function dealSyncTasks(env, deal) {
+  // Materialise the engine's deadlines as ordinary tasks (rule:'deal')
+  // so Today / Follow-ups surface them unchanged. Done tasks are never
+  // touched; a moved date updates the open task; a vanished deadline
+  // removes its open task; a closed/collapsed deal clears its own.
+  const today = todayVancouver();
+  const addr = ((deal.property && (deal.property.address || deal.property.mls)) || 'Deal').slice(0, 80);
+  const email = (deal.side === 'buy' ? (deal.buyer.email || deal.seller.email) : (deal.seller.email || deal.buyer.email)) || '';
+  const want = {};
+  if (deal.stage !== 'closed' && deal.stage !== 'collapsed') {
+    for (const dl of dealDeadlines(deal, today)) {
+      if (DEAL_TASK_KEYS.indexOf(dl.key) === -1) continue;
+      if (dl.date < addDaysYmd(today, -30) || dl.date > addDaysYmd(today, 400)) continue;
+      want['dlt_' + deal.id + '_' + dl.key] = dl;
+    }
+  }
+  const existing = (await allTasks(env)).filter(function (t) { return t && t.rule === 'deal' && t.dealId === deal.id; });
+  const seen = {};
+  for (const t of existing) {
+    seen[t.id] = 1;
+    if (t.done) continue;
+    const w = want[t.id];
+    if (!w) { await siteKvDelete(env, 'task:' + t.id); await idxRemove(env, 'tasks', t.id); continue; }
+    if (t.due !== w.date || t.email !== email) { t.due = w.date; t.email = email; t.text = 'Deal deadline: ' + w.label + ' — ' + addr; await siteKvPut(env, 'task:' + t.id, JSON.stringify(t)); }
+  }
+  for (const id of Object.keys(want)) {
+    if (seen[id]) continue;
+    const w = want[id];
+    const t = { id: id, email: email, text: 'Deal deadline: ' + w.label + ' — ' + addr, due: w.date, done: false, created_at: new Date().toISOString(), rule: 'deal', dealId: deal.id };
+    await siteKvPut(env, 'task:' + id, JSON.stringify(t));
+    await idxAdd(env, 'tasks', id);
+  }
+  // One Web Push per deal when its overdue/due-today set changes.
+  const hot = dealDeadlines(deal, today).filter(function (x) { return x.status !== 'upcoming' && DEAL_TASK_KEYS.indexOf(x.key) !== -1; });
+  if (hot.length && deal.stage !== 'closed' && deal.stage !== 'collapsed') {
+    const mark = today + '|' + hot.map(function (x) { return x.key + '@' + x.date; }).join(',');
+    if (deal.pushMark !== mark) {
+      deal.pushMark = mark;
+      try { await puNotifyPush(env, { title: 'Deal deadline — ' + addr, body: hot[0].label + ' — ' + hot[0].date + (hot.length > 1 ? ' (+' + (hot.length - 1) + ' more)' : ''), url: 'https://ehrealtybc.com/portal-9f3k7x2q.html' }); } catch (e) {}
+    }
+  } else if (deal.pushMark) deal.pushMark = '';
+  return deal;
+}
+async function dealAll(env) {
+  const out = [];
+  let cursor = undefined;
+  do {
+    const page = await kvList(env, { prefix: 'deal:', limit: 200, cursor: cursor });
+    for (const k of page.keys) {
+      try { const r = await env.LEADS.get(k.name, { type: 'json' }); if (r && r.id) out.push(r); } catch (e) {}
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && out.length < 400);
+  out.sort(function (a, b) { return String(b.updated_at || '').localeCompare(String(a.updated_at || '')); });
+  return out;
+}
+async function dealGet(env, id) { try { return await env.LEADS.get('deal:' + id, { type: 'json' }); } catch (e) { return null; } }
+function dealPublic(deal, today) {
+  const dls = dealDeadlines(deal, today);
+  const open = dls.filter(function (x) { return x.kind === 'contract' || DEAL_TASK_KEYS.indexOf(x.key) !== -1; });
+  return Object.assign({}, deal, { deadlines: dls, nextDeadline: open[0] || null, checklistItems: dealChecklistItems(deal) });
+}
+
+// ---------- CMA engine ----------
+async function cmaFullCatalog(env) {
+  await refreshCustomCatalog(env);
+  const byMls = Object.create(null);
+  SEED_LISTINGS.forEach(function (r) { if (r && r.mls) byMls[r.mls] = r; });
+  customListings.forEach(function (r) { if (r && r.mls) byMls[r.mls] = r; });
+  deletedSeedMls.forEach(function (m) { if (!customListings.some(function (r) { return r.mls === m; })) delete byMls[m]; });
+  return Object.keys(byMls).map(function (k) { return byMls[k]; }).filter(function (r) { return r && !r._deleted; });
+}
+function cmaFamily(t) { return (t === 'house' || t === 'duplex') ? 'detached' : 'strata'; }
+function cmaSubjectNorm(input, catalog) {
+  const d = (input && typeof input === 'object') ? input : {};
+  let base = null;
+  if (d.mls) { const m = String(d.mls).toUpperCase(); base = catalog.filter(function (r) { return r.mls === m; })[0] || null; if (!base) return null; }
+  const num = function (v, cur) { if (v === undefined || v === null || v === '') return cur; const n = Number(v); return isFinite(n) ? n : cur; };
+  const s = base ? JSON.parse(JSON.stringify(base)) : { mls: '', street: '', city: '', type: '', price: null, beds: null, baths: null, sqft: null, year: null, lot: null };
+  if (d.address !== undefined) s.street = cleanText(d.address, 160);
+  if (d.city !== undefined) s.city = cleanText(d.city, 60);
+  if (d.type !== undefined) s.type = cleanText(d.type, 24).toLowerCase();
+  s.beds = num(d.beds, s.beds); s.baths = num(d.baths, s.baths); s.sqft = num(d.sqft, s.sqft); s.year = num(d.year, s.year); s.price = num(d.price, s.price);
+  s.address = s.street || ''; // report-facing field name
+  return s;
+}
+function cmaScore(subject, c) {
+  const parts = { city: 0, type: 0, beds: 0, baths: 0, sqft: 0, year: 0 };
+  if (subject.city && c.city && String(subject.city).toLowerCase() === String(c.city).toLowerCase()) parts.city = 100;
+  if (subject.type && c.type) { if (subject.type === c.type) parts.type = 40; else if (cmaFamily(subject.type) === cmaFamily(c.type)) parts.type = 20; }
+  if (subject.beds != null && c.beds != null) { const df = Math.abs(Number(subject.beds) - Number(c.beds)); parts.beds = df === 0 ? 15 : (df === 1 ? 8 : (df === 2 ? 3 : 0)); }
+  if (subject.baths != null && c.baths != null) { const df = Math.abs(Number(subject.baths) - Number(c.baths)); parts.baths = df === 0 ? 6 : (df <= 1 ? 3 : 0); }
+  if (subject.sqft > 0 && c.sqft > 0) { const r = Math.abs(Number(c.sqft) - Number(subject.sqft)) / Number(subject.sqft); parts.sqft = r <= 0.10 ? 25 : (r <= 0.20 ? 15 : (r <= 0.35 ? 5 : 0)); }
+  if (subject.year > 0 && c.year > 0) { const df = Math.abs(Number(c.year) - Number(subject.year)); parts.year = df <= 5 ? 10 : (df <= 10 ? 5 : 0); }
+  const score = parts.city + parts.type + parts.beds + parts.baths + parts.sqft + parts.year;
+  return { score: score, parts: parts };
+}
+function cmaCandidates(subject, catalog) {
+  return catalog.filter(function (c) { return c.mls !== subject.mls; })
+    .map(function (c) { const sc = cmaScore(subject, c); return { mls: c.mls, street: c.street || '', city: c.city || '', type: c.type || '', price: c.price != null ? c.price : null, status: c.status || 'active', beds: c.beds != null ? c.beds : null, baths: c.baths != null ? c.baths : null, sqft: c.sqft != null ? c.sqft : null, year: c.year != null ? c.year : null, lot: c.lot != null ? c.lot : null, listed: c.listed || '', score: sc.score, parts: sc.parts }; })
+    .filter(function (c) { return c.score > 0; })
+    .sort(function (a, b) { return b.score - a.score || String(a.mls).localeCompare(String(b.mls)); })
+    .slice(0, 12);
+}
+function cmaCompute(subject, comps) {
+  const rows = comps.map(function (c) {
+    const adjTotal = (c.adjustments || []).reduce(function (s, a) { return s + (Number(a.amount) || 0); }, 0);
+    const adjusted = (Number(c.price) || 0) + adjTotal;
+    return Object.assign({}, c, { adjTotal: adjTotal, adjusted: adjusted, adjPerSqft: c.sqft > 0 ? adjusted / c.sqft : null });
+  });
+  const prices = rows.map(function (r) { return r.adjusted; }).sort(function (a, b) { return a - b; });
+  const psf = rows.map(function (r) { return r.adjPerSqft; }).filter(function (x) { return x != null; }).sort(function (a, b) { return a - b; });
+  const median = function (arr) { if (!arr.length) return null; const m = Math.floor(arr.length / 2); return arr.length % 2 ? arr[m] : (arr[m - 1] + arr[m]) / 2; };
+  const medPsf = median(psf);
+  return {
+    rows: rows,
+    low: prices.length ? prices[0] : null,
+    high: prices.length ? prices[prices.length - 1] : null,
+    mid: prices.length ? Math.round((prices[0] + prices[prices.length - 1]) / 2) : null,
+    medianPerSqft: medPsf != null ? Math.round(medPsf) : null,
+    indicated: (medPsf != null && subject.sqft > 0) ? Math.round(medPsf * Number(subject.sqft)) : null
+  };
+}
+async function cmaAll(env) {
+  const out = [];
+  let cursor = undefined;
+  do {
+    const page = await kvList(env, { prefix: 'cma:', limit: 200, cursor: cursor });
+    for (const k of page.keys) {
+      try { const r = await env.LEADS.get(k.name, { type: 'json' }); if (r && r.id) out.push(r); } catch (e) {}
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor && out.length < 400);
+  out.sort(function (a, b) { return String(b.created_at || '').localeCompare(String(a.created_at || '')); });
+  return out;
+}
+
+// ---------- CMA PDF (built whole from scratch — core fonts only) ----------
+// PDF strings are byte strings: every character must fit WinAnsi. Smart
+// punctuation is folded to ASCII/Latin-1 before escaping (the s2b byte
+// discipline the booklet pipeline uses).
+function pdfEsc(t) {
+  return escPdfStr(String(t == null ? '' : t).replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-').replace(/[^\x00-\xff]/g, '?'));
+}
+const PDF_W = { ' ': 278, '!': 278, '"': 355, '#': 556, '$': 556, '%': 889, '&': 667, "'": 191, '(': 333, ')': 333, '*': 389, '+': 584, ',': 278, '-': 333, '.': 278, '/': 278, ':': 278, ';': 278, '<': 584, '=': 584, '>': 584, '?': 556, '@': 1015, 'A': 667, 'B': 667, 'C': 722, 'D': 722, 'E': 667, 'F': 611, 'G': 778, 'H': 722, 'I': 278, 'J': 500, 'K': 667, 'L': 556, 'M': 833, 'N': 722, 'O': 778, 'P': 667, 'Q': 778, 'R': 722, 'S': 667, 'T': 611, 'U': 722, 'V': 667, 'W': 944, 'X': 667, 'Y': 667, 'Z': 611, '[': 278, '\\': 278, ']': 278, '^': 469, '_': 556, '`': 333, 'a': 556, 'b': 556, 'c': 500, 'd': 556, 'e': 556, 'f': 278, 'g': 556, 'h': 556, 'i': 222, 'j': 222, 'k': 500, 'l': 222, 'm': 833, 'n': 556, 'o': 556, 'p': 556, 'q': 556, 'r': 333, 's': 500, 't': 278, 'u': 556, 'v': 500, 'w': 722, 'x': 500, 'y': 500, 'z': 500, '{': 334, '|': 260, '}': 334, '~': 584, '·': 278, '®': 556 };
+function pdfTw(str, size) { let w = 0; const s = String(str); for (let i = 0; i < s.length; i++) w += (PDF_W[s[i]] || (s[i] >= '0' && s[i] <= '9' ? 556 : 556)); return w * size / 1000; }
+function cmaPdfBytes(report, postLic) {
+  const GOLD = '0.788 0.635 0.294', DGOLD = '0.62 0.49 0.20', INK = '0.082 0.075 0.055', GREY = '0.42 0.41 0.39', LGREY = '0.945 0.937 0.918', BAND = '0.043 0.043 0.043', WHITE = '1 1 1';
+  const money = function (n) { return n == null ? '-' : '$' + Math.round(Number(n)).toLocaleString('en-CA'); };
+  const dateStr = String(report.created_at || '').slice(0, 10);
+  const footer = postLic ? 'EH REALTY · Erfan Hakimian, licensed REALTOR® in British Columbia' : 'EH REALTY · Prepared by Erfan Hakimian, EH Realty';
+  const pages = [];
+  let pg = null, cy = 0;
+  function txt(x, base, font, size, col, str, right) {
+    let xx = x; if (right) xx = x - pdfTw(str, size);
+    pg.ops.push(col + ' rg BT /' + font + ' ' + size + ' Tf ' + xx.toFixed(1) + ' ' + base.toFixed(1) + ' Td (' + pdfEsc(str) + ') Tj ET');
+  }
+  function startPage() {
+    pg = { ops: [] }; pages.push(pg);
+    pg.ops.push(BAND + ' rg 0 734 612 58 re f');
+    txt(48, 763, 'F3', 19, GOLD, 'EH REALTY');
+    txt(48, 749, 'F1', 7, GOLD, 'B Y   E R F A N   H A K I M I A N');
+    txt(564, 760, 'F2', 8.5, WHITE, 'COMPARATIVE MARKET ANALYSIS', true);
+    txt(564, 748, 'F1', 7.5, '0.75 0.74 0.72', 'Prepared ' + dateStr, true);
+    if (report.sampleData) pg.ops.push('q 0.905 0.895 0.875 rg BT /F2 38 Tf 0.788 -0.616 0.616 0.788 60 520 Tm (SAMPLE DATA - NOT FOR RELIANCE) Tj ET Q');
+    cy = 706;
+  }
+  function need(h) { if (cy - h < 78) startPage(); }
+  function rule(col, wdt) { pg.ops.push(col + ' RG ' + (wdt || 0.8) + ' w 48 ' + (cy + 3).toFixed(1) + ' m 564 ' + (cy + 3).toFixed(1) + ' l S'); }
+  function heading(str) { need(26); cy -= 6; txt(48, cy, 'F2', 10.5, INK, str); cy -= 5; rule(GOLD, 1.1); cy -= 15; }
+  function kv(label, value) { need(14); txt(48, cy, 'F1', 9, GREY, label); txt(150, cy, 'F1', 9.5, INK, value); cy -= 14; }
+  startPage();
+  txt(48, cy, 'F3', 17, INK, 'Comparative Market Analysis'); cy -= 16;
+  txt(48, cy, 'F1', 9, GREY, (report.subject.city || 'British Columbia') + ' · ' + (report.comps.length) + ' comparable(s) selected by the preparer' + (report.clientName ? ' · Prepared for ' + report.clientName : '')); cy -= 20;
+  if (report.sampleData) {
+    need(34);
+    pg.ops.push('1 w ' + GOLD + ' RG 48 ' + (cy - 22).toFixed(1) + ' 516 30 re S');
+    txt(56, cy - 8, 'F2', 8.5, DGOLD, 'SAMPLE DATA');
+    txt(56, cy - 19, 'F1', 8, INK, 'Prepared with sample listing data for setup and review. Not a market valuation - do not rely on it.');
+    cy -= 34;
+  }
+  heading('SUBJECT PROPERTY');
+  const s = report.subject || {};
+  kv('Address', (s.address || s.street || '-') + (s.mls ? '  (MLS ' + s.mls + ')' : ''));
+  kv('City / Type', (s.city || '-') + ' / ' + (s.type || '-'));
+  kv('Beds / Baths', (s.beds != null ? s.beds : '-') + ' bd / ' + (s.baths != null ? s.baths : '-') + ' ba');
+  kv('Living area', s.sqft ? Number(s.sqft).toLocaleString('en-CA') + ' sqft' : '-');
+  kv('Year built', s.year ? String(s.year) : '-');
+  if (s.price != null) kv('Asking price', money(s.price));
+  cy -= 6;
+  heading('INDICATED VALUE (from the selected comparables)');
+  const ind = report.indicated || {};
+  need(46);
+  pg.ops.push(LGREY + ' rg 48 ' + (cy - 38).toFixed(1) + ' 516 44 re f');
+  pg.ops.push('1 w ' + GOLD + ' RG 48 ' + (cy - 38).toFixed(1) + ' 516 44 re S');
+  txt(60, cy - 4, 'F1', 9, GREY, 'Adjusted comparable range');
+  txt(60, cy - 20, 'F2', 14, INK, money(ind.low) + '  -  ' + money(ind.high));
+  if (ind.indicated != null) { txt(564, cy - 4, 'F1', 9, GREY, 'Sqft-weighted indication', true); txt(564, cy - 20, 'F2', 14, INK, money(ind.indicated), true); }
+  cy -= 50;
+  txt(48, cy, 'F1', 8, GREY, 'The range is the lowest and highest ADJUSTED prices of the comparables below. The indication weights them by living area.'); cy -= 20;
+  heading('COMPARABLES');
+  (report.comps || []).forEach(function (c, i) {
+    need(40);
+    // Band registered to the header text: baseline is cy, 9pt bold ascends
+    // ~7pt above it, so the rect spans [cy-4, cy+10] and fully backs the
+    // glyphs (QC D-2: the old [cy-13, cy+4] band cut the ascenders off).
+    pg.ops.push(BAND + ' rg 48 ' + (cy - 4).toFixed(1) + ' 516 14 re f');
+    txt(54, cy, 'F2', 9, WHITE, 'Comparable ' + (i + 1) + ' - ' + (c.street || c.address || ''));
+    txt(558, cy, 'F2', 9, GOLD, money(c.adjusted), true);
+    cy -= 15;
+    const sub = [c.city || '', c.type || '', (c.beds != null ? c.beds + ' bd' : ''), (c.baths != null ? c.baths + ' ba' : ''), (c.sqft ? Number(c.sqft).toLocaleString('en-CA') + ' sqft' : ''), (c.year ? 'built ' + c.year : ''), (c.status === 'sold' ? 'SOLD' : 'asking price')].filter(Boolean).join(' · ');
+    txt(54, cy, 'F1', 8.5, GREY, sub); cy -= 13;
+    txt(54, cy, 'F1', 9, INK, 'Price ' + money(c.price) + (c.adjPerSqft ? '  ·  ' + money(Math.round(c.adjPerSqft)) + '/sqft adjusted' : ''));
+    txt(558, cy, 'F1', 9, INK, 'Adjustments ' + (c.adjTotal ? (c.adjTotal > 0 ? '+' : '') + money(c.adjTotal) : '$0'), true);
+    cy -= 13;
+    (c.adjustments || []).forEach(function (a) {
+      need(11);
+      txt(66, cy, 'F1', 8, GREY, '- ' + a.label + ': ' + (Number(a.amount) > 0 ? '+' : '') + money(a.amount));
+      cy -= 11;
+    });
+    if (!(c.adjustments || []).length) { txt(66, cy, 'F1', 8, GREY, '- No adjustments entered'); cy -= 11; }
+    cy -= 8;
+  });
+  need(60);
+  heading('METHOD AND NOTES');
+  const method = 'Comparables were ranked by location and physical similarity and selected by the preparer. Every adjustment shown was entered by the preparer - the engine applies no automatic adjustments and uses no data beyond the listings shown. Prices are asking prices unless a comparable is marked SOLD.';
+  (function () {
+    const words = method.split(' '); let line = '';
+    const lines = [];
+    for (const w of words) { if (pdfTw(line + ' ' + w, 8.5) > 510 && line) { lines.push(line); line = w; } else line = line ? line + ' ' + w : w; }
+    if (line) lines.push(line);
+    for (const L of lines) { need(12); txt(48, cy, 'F1', 8.5, INK, L); cy -= 12; }
+  })();
+  if (report.notes) { cy -= 4; txt(48, cy, 'F2', 9, INK, 'Preparer notes'); cy -= 12; txt(48, cy, 'F1', 8.5, INK, String(report.notes).slice(0, 300)); cy -= 12; }
+  cy -= 8; need(14);
+  txt(48, cy, 'F1', 9, INK, postLic ? 'Prepared by Erfan Hakimian, licensed REALTOR® in British Columbia.' : 'Prepared by Erfan Hakimian, EH Realty.');
+  // ---- assemble (one sequential build; classic xref) ----
+  const streams = pages.map(function (p, i) {
+    const ops = p.ops.slice();
+    ops.push(GOLD + ' RG 0.7 w 48 44 m 564 44 l S');
+    const f = footer + '   ·   Page ' + (i + 1) + ' of ' + pages.length;
+    ops.push(GREY + ' rg BT /F1 7 Tf ' + (306 - pdfTw(f, 7) / 2).toFixed(1) + ' 33 Td (' + pdfEsc(f) + ') Tj ET');
+    return ops.join('\n');
+  });
+  const nPages = streams.length;
+  const kids = streams.map(function (_, i) { return (6 + 2 * i) + ' 0 R'; }).join(' ');
+  const objs = [];
+  objs[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+  objs[2] = '<< /Type /Pages /Kids [' + kids + '] /Count ' + nPages + ' >>';
+  objs[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>';
+  objs[4] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>';
+  objs[5] = '<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>';
+  streams.forEach(function (st, i) {
+    objs[6 + 2 * i] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> /Contents ' + (7 + 2 * i) + ' 0 R >>';
+    objs[7 + 2 * i] = { stream: st };
+  });
+  let out = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let n = 1; n < objs.length; n++) {
+    if (!objs[n]) continue;
+    offsets[n] = out.length;
+    if (typeof objs[n] === 'string') out += n + ' 0 obj\n' + objs[n] + '\nendobj\n';
+    else out += n + ' 0 obj\n<< /Length ' + objs[n].stream.length + ' >>\nstream\n' + objs[n].stream + '\nendstream\nendobj\n';
+  }
+  const xrefAt = out.length;
+  const size = objs.length;
+  out += 'xref\n0 ' + size + '\n0000000000 65535 f \n';
+  for (let n = 1; n < size; n++) out += String(offsets[n] || 0).padStart(10, '0') + ' 00000 n \n';
+  out += 'trailer\n<< /Size ' + size + ' /Root 1 0 R >>\nstartxref\n' + xrefAt + '\n%%EOF\n';
+  return s2b(out);
+}
+
 // ---- business calls (plumbing built Oct 2026; the dedicated number itself
 // activates with the domain in Dec 2026 — config lives in KV cfg:calls =
 // { provider, number, forwardTo, secret, twilioAccountSid, twilioAuthToken },
@@ -17261,6 +17762,133 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, client: rec }, 200, origin);
       }
 
+
+      // ---- admin: deals + CMA (Pack SystemDealsCMA, 2026-11-12) ----
+      // Owner-portal only: every route re-checks the owner session.
+      if (path === '/api/admin/deals/deadlines' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const today = todayVancouver();
+        const horizon = addDaysYmd(today, 7);
+        const overdue = [], dueToday = [], next7 = [];
+        for (const deal of await dealAll(env)) {
+          if (deal.stage === 'closed' || deal.stage === 'collapsed') continue;
+          const addr = (deal.property && (deal.property.address || deal.property.mls)) || 'Deal';
+          for (const dl of dealDeadlines(deal, today)) {
+            const row = { dealId: deal.id, address: addr, key: dl.key, label: dl.label, date: dl.date, kind: dl.kind, weekendOrHoliday: dl.weekendOrHoliday };
+            if (dl.status === 'overdue') overdue.push(row);
+            else if (dl.status === 'today') dueToday.push(row);
+            else if (dl.date <= horizon) next7.push(row);
+          }
+        }
+        const byDate = function (a, b) { return a.date < b.date ? -1 : 1; };
+        overdue.sort(byDate); dueToday.sort(byDate); next7.sort(byDate);
+        return json({ ok: true, today: today, overdue: overdue, dueToday: dueToday, next7: next7 }, 200, origin);
+      }
+      if (path === '/api/admin/deals' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const today = todayVancouver();
+        const deals = (await dealAll(env)).map(function (d) { return dealPublic(d, today); });
+        return json({ ok: true, deals: deals }, 200, origin);
+      }
+      if (path === '/api/admin/deals' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let d = null; try { d = await request.json(); } catch (e) {}
+        const s = dealSanitize(d || {}, null);
+        if (s.error) return json({ ok: false, error: 'validation', field: s.error }, 400, origin);
+        const deal = s.deal;
+        deal.id = 'dl_' + randHex(6);
+        deal.created_at = new Date().toISOString();
+        deal.updated_at = deal.created_at;
+        await dealSyncTasks(env, deal);
+        await env.LEADS.put('deal:' + deal.id, JSON.stringify(deal));
+        return json({ ok: true, deal: dealPublic(deal) }, 200, origin);
+      }
+      const dealM = path.match(/^\/api\/admin\/deals\/([A-Za-z0-9_-]{1,80})$/);
+      if (dealM && (request.method === 'GET' || request.method === 'PATCH' || request.method === 'DELETE')) {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const deal = await dealGet(env, dealM[1]);
+        if (!deal) return json({ ok: false, error: 'not_found' }, 404, origin);
+        if (request.method === 'GET') return json({ ok: true, deal: dealPublic(deal) }, 200, origin);
+        if (request.method === 'DELETE') {
+          deal.stage = 'collapsed'; // reuse the sync to clear its open tasks
+          await dealSyncTasks(env, deal);
+          await env.LEADS.delete('deal:' + deal.id);
+          return json({ ok: true }, 200, origin);
+        }
+        let d = null; try { d = await request.json(); } catch (e) {}
+        const s = dealSanitize(d || {}, deal);
+        if (s.error) return json({ ok: false, error: 'validation', field: s.error }, 400, origin);
+        const upd = s.deal;
+        upd.updated_at = new Date().toISOString();
+        await dealSyncTasks(env, upd);
+        await env.LEADS.put('deal:' + upd.id, JSON.stringify(upd));
+        return json({ ok: true, deal: dealPublic(upd) }, 200, origin);
+      }
+      if (path === '/api/admin/cma/candidates' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let d = null; try { d = await request.json(); } catch (e) {}
+        const catalog = await cmaFullCatalog(env);
+        const subject = cmaSubjectNorm((d || {}).subject || {}, catalog);
+        if (!subject) return json({ ok: false, error: 'validation', field: 'subject.mls' }, 400, origin);
+        return json({ ok: true, subject: subject, candidates: cmaCandidates(subject, catalog) }, 200, origin);
+      }
+      if (path === '/api/admin/cma' && request.method === 'GET') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const list = (await cmaAll(env)).map(function (r) {
+          return { id: r.id, created_at: r.created_at, clientName: r.clientName || '', sampleData: !!r.sampleData, subject: { address: (r.subject || {}).address || '', city: (r.subject || {}).city || '', mls: (r.subject || {}).mls || '' }, compCount: (r.comps || []).length, indicated: { low: (r.indicated || {}).low, high: (r.indicated || {}).high, indicated: (r.indicated || {}).indicated } };
+        });
+        return json({ ok: true, reports: list }, 200, origin);
+      }
+      if (path === '/api/admin/cma' && request.method === 'POST') {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let d = null; try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const catalog = await cmaFullCatalog(env);
+        const subject = cmaSubjectNorm(d.subject || {}, catalog);
+        if (!subject) return json({ ok: false, error: 'validation', field: 'subject' }, 400, origin);
+        const byMls = Object.create(null);
+        catalog.forEach(function (r) { byMls[r.mls] = r; });
+        const mlsList = Array.isArray(d.compMls) ? d.compMls.map(function (m) { return String(m || '').toUpperCase(); }).filter(Boolean) : [];
+        if (!mlsList.length || mlsList.length > 12) return json({ ok: false, error: 'validation', field: 'compMls' }, 400, origin);
+        const adjIn = (d.adjustments && typeof d.adjustments === 'object') ? d.adjustments : {};
+        const comps = [];
+        for (const m of mlsList) {
+          const rec = byMls[m];
+          if (!rec) return json({ ok: false, error: 'unknown_comp', mls: m }, 400, origin);
+          const adjs = [];
+          for (const a0 of (Array.isArray(adjIn[m]) ? adjIn[m] : []).slice(0, 10)) {
+            const a = (a0 && typeof a0 === 'object') ? a0 : {};
+            const label = cleanText(a.label || '', 80);
+            const amount = Number(a.amount);
+            if (!label || !isFinite(amount) || Math.abs(amount) > 10000000) return json({ ok: false, error: 'validation', field: 'adjustments' }, 400, origin);
+            adjs.push({ label: label, amount: Math.round(amount) });
+          }
+          comps.push({ mls: rec.mls, street: rec.street || '', city: rec.city || '', type: rec.type || '', status: rec.status || 'active', price: rec.price != null ? rec.price : null, beds: rec.beds != null ? rec.beds : null, baths: rec.baths != null ? rec.baths : null, sqft: rec.sqft != null ? rec.sqft : null, year: rec.year != null ? rec.year : null, lot: rec.lot != null ? rec.lot : null, listed: rec.listed || '', adjustments: adjs });
+        }
+        const calc = cmaCompute(subject, comps);
+        const postLic = await prPostLicense(env);
+        const report = {
+          id: 'cma_' + randHex(6), created_at: new Date().toISOString(),
+          subject: subject, comps: calc.rows, indicated: { low: calc.low, high: calc.high, mid: calc.mid, medianPerSqft: calc.medianPerSqft, indicated: calc.indicated },
+          clientName: cleanText(d.clientName || '', 120), notes: cleanText(d.notes || '', 1000),
+          sampleData: !postLic, postLicense: postLic
+        };
+        await env.LEADS.put('cma:' + report.id, JSON.stringify(report));
+        return json({ ok: true, report: report }, 200, origin);
+      }
+      const cmaM = path.match(/^\/api\/admin\/cma\/([A-Za-z0-9_-]{1,80})(\/pdf)?$/);
+      if (cmaM && (request.method === 'GET' || request.method === 'DELETE')) {
+        if (!(await authed(request, env))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        let rep = null;
+        try { rep = await env.LEADS.get('cma:' + cmaM[1], { type: 'json' }); } catch (e) {}
+        if (!rep) return json({ ok: false, error: 'not_found' }, 404, origin);
+        if (request.method === 'DELETE') { await env.LEADS.delete('cma:' + cmaM[1]); return json({ ok: true }, 200, origin); }
+        if (cmaM[2] === '/pdf') {
+          const bytes = cmaPdfBytes(rep, rep.postLicense === true);
+          return new Response(bytes, { status: 200, headers: Object.assign({}, cors(origin), { 'Content-Type': 'application/pdf', 'Content-Disposition': 'attachment; filename="cma-' + rep.id + '.pdf"', 'Cache-Control': 'private, no-store' }) });
+        }
+        return json({ ok: true, report: rep }, 200, origin);
+      }
       // ---- admin: CRM ----
       if (path === '/api/admin/crm/merge' && request.method === 'POST') {
         let d = null; try { d = await request.json(); } catch (e) {}
