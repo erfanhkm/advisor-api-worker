@@ -4137,7 +4137,7 @@ async function idxRemove(env, name, id) {
 // rebuild (it replaces, with an empty-list guard); this is the cheap
 // safety net in between. One list per collection, at most daily —
 // list calls are the scarce resource, so it stays exactly that cheap.
-const IDX_RECONCILE_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:']]; // Pack PMV2: files + pushsubs join the daily union net too
+const IDX_RECONCILE_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:'], ['pclients', 'pclient:']]; // Pack PMV2: files + pushsubs join the daily union net too; Pack SystemPastClients: pclients joins the union net
 async function idxReconcile(env) {
   try {
     const last = Number(await env.LEADS.get('idxreconcile:at')) || 0;
@@ -7872,6 +7872,317 @@ async function runViewingReminders(env) {
 //   try/catch: one failing never blocks the other;
 // - every outcome lands in automation:last so the portal can show
 //   whether the automations ran, and how (F-05 M3).
+/* ================= Pack SystemPastClients (2026-11-12) =================
+   SYSTEM E — the Past-Client Club. Owner-added past-client records
+   live under pclient:<id> (index 'pclients'); the Deals workspace
+   (System D) will create the SAME records from closed deals later —
+   the join contract is in hidden_files/system-past-clients/APPLY.md.
+
+   The touchpoint engine (runPastClientTouches) runs inside
+   runAutomations under its lock and only ever PREPARES:
+   - drafts go through queueMail (kind 'pastclient', deterministic
+     keys, explicit subject + aiText) and land HELD in the outbox for
+     the owner's review / edit / release — this pack adds NO send
+     path, NO release call and NO send scheduling anywhere;
+   - each preparation also creates an ordinary task: record (the
+     Today desk surfaces it) telling the owner a draft is waiting;
+   - a yearly EQUITY update is computed by the platform's ONE
+     valuation path (valuationEstimate — the hv machinery behind
+     POST /api/valuation) against the recorded closing price. When
+     that path returns no honest estimate ({none: reason}), NO draft
+     is composed: the cycle is marked 'needs_data' on the record and
+     the owner's task says so — a figure is never invented.
+   Cadence guard: at most one prepared touch per client per 60 days
+   across ALL types, enforced at preparation time from the record's
+   own touches.lastPreparedAt; a paused client is skipped whole.
+   Equity updates apply to 'bought' clients only (a seller no longer
+   owns the home); the equity target sits at the half-anniversary
+   (closing + 6 months, then yearly) so the two yearly touches
+   alternate instead of colliding on the anniversary date. */
+
+const PCLUB_WINDOW_DAYS = 75; // catch-up window after a target date
+const PCLUB_CADENCE_DAYS = 60;
+const PCLUB_RUN_CAP = 50;
+
+function pcParseYmd(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || ''));
+  if (!m) return null;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  return { y: y, m: mo, d: d };
+}
+function pcFmtYmd(y, m, d) { return y + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0'); }
+function pcIsLeap(y) { return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
+function pcDaysInMonth(y, m) { return [31, pcIsLeap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]; }
+function pcAnnivYmd(closing, years) {
+  const y = closing.y + years;
+  let d = closing.d;
+  if (closing.m === 2 && d === 29 && !pcIsLeap(y)) d = 28; // Feb 29 closings celebrate on Feb 28
+  return pcFmtYmd(y, closing.m, d);
+}
+function pcAddMonthsYmd(ymd, months) {
+  const p = pcParseYmd(ymd);
+  if (!p) return null;
+  const total = p.y * 12 + (p.m - 1) + months;
+  const y = Math.floor(total / 12), mo = (total % 12) + 1;
+  return pcFmtYmd(y, mo, Math.min(p.d, pcDaysInMonth(y, mo)));
+}
+function pcDaysBetween(a, b) { return Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000); }
+function pcMoney(n) { return '$' + Math.round(Number(n) || 0).toLocaleString('en-CA'); }
+function pcOrdinal(n) {
+  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+function pcFirstName(rec) { return String((rec && rec.name) || '').split(' ')[0] || 'there'; }
+
+/* The due candidates for one record on `today` (Vancouver YMD).
+   Returns { anniv: {years, target} | null, equity: {cycle, target} | null }.
+   A candidate is due when its target date has arrived, is still inside
+   the catch-up window, and its cycle is not already prepared. */
+function pcDueTouches(rec, today) {
+  const out = { anniv: null, equity: null };
+  const cp = pcParseYmd(rec && rec.closingDate);
+  if (!cp) return out;
+  const tp = pcParseYmd(today);
+  if (!tp) return out;
+  const touches = rec.touches || {};
+  const years = tp.y - cp.y;
+  if (years >= 1) {
+    const target = pcAnnivYmd(cp, years);
+    if (today >= target && pcDaysBetween(target, today) <= PCLUB_WINDOW_DAYS && (!touches.anniv || touches.anniv.cycle !== years)) {
+      out.anniv = { years: years, target: target };
+    }
+  }
+  if (rec.side === 'bought') {
+    // half-anniversaries: closing + 6 months, then every 12 months
+    for (let k = 0; k <= years + 1; k++) {
+      const t = pcAddMonthsYmd(rec.closingDate, 6 + 12 * k);
+      if (!t || t > today) break;
+      if (pcDaysBetween(t, today) <= PCLUB_WINDOW_DAYS && (!touches.equity || touches.equity.cycle !== t)) {
+        out.equity = { cycle: t, target: t }; // latest due target wins
+      }
+    }
+  }
+  return out;
+}
+
+/* The next touch (due now or upcoming) for the portal list. */
+function pcNextTouch(rec, today) {
+  if (!rec) return null;
+  if (rec.paused) return { state: 'paused' };
+  const cp = pcParseYmd(rec.closingDate);
+  if (!cp) return { state: 'bad_date' };
+  const due = pcDueTouches(rec, today);
+  if (due.anniv) return { state: 'due', type: 'anniversary', date: due.anniv.target, years: due.anniv.years };
+  if (due.equity) return { state: 'due', type: 'equity', date: due.equity.target };
+  const tp = pcParseYmd(today);
+  const touches = rec.touches || {};
+  let best = null;
+  const consider = function (type, date, years) {
+    if (date && date >= today && (!best || date < best.date)) best = { state: 'upcoming', type: type, date: date, years: years || null };
+  };
+  // upcoming cycles only — a cycle already prepared is never shown
+  // again as "next" (its target can still be today when it fired
+  // this morning).
+  for (let y = Math.max(1, tp.y - cp.y); y <= tp.y - cp.y + 1; y++) {
+    if (touches.anniv && touches.anniv.cycle === y) continue;
+    consider('anniversary', pcAnnivYmd(cp, y), y);
+  }
+  if (rec.side === 'bought') {
+    for (let k = 0; k <= tp.y - cp.y + 1; k++) {
+      const t = pcAddMonthsYmd(rec.closingDate, 6 + 12 * k);
+      if (touches.equity && touches.equity.cycle === t) continue;
+      consider('equity', t, null);
+    }
+  }
+  return best;
+}
+
+function pcComposeAnniversary(rec, years) {
+  const first = pcFirstName(rec);
+  const addr = (rec.property && rec.property.address) || '';
+  const city = (rec.property && rec.property.city) || '';
+  const place = (addr + (city ? ', ' + city : '')) || 'your home';
+  const fa = rec.lang === 'fa';
+  if (fa) {
+    const verb = rec.side === 'sold' ? 'فروختید' : 'خریدید';
+    const subject = 'سالگرد ' + (rec.side === 'sold' ? 'فروش' : 'خرید') + ' خانه‌تان مبارک — EH Realty';
+    const lines = [
+      'سلام ' + first + ' عزیز،',
+      '',
+      'سالگرد ' + (rec.side === 'sold' ? 'فروش' : 'خرید') + ' خانه‌تان مبارک! در تاریخ ' + rec.closingDate + ' خانه‌ی ' + place + ' را ' + verb + '. امیدوارم این مدت برایتان پر از خاطره‌های خوب بوده باشد.',
+      '',
+      'اگر دوستان، خانواده یا همکارانتان به خرید یا فروش خانه فکر می‌کنند، ممنون می‌شوم نام من را به آن‌ها معرفی کنید. معرفی از طرف مشتریانی مثل شما قلب کار من است و قول می‌دهم بهترین مراقبت را از آن‌ها بکنم.',
+      '',
+      'با احترام،',
+      'عرفان حکیمیان — EH Realty'
+    ];
+    return { subject: subject, text: lines.join('\n') };
+  }
+  const subject = 'Happy ' + pcOrdinal(years) + ' anniversary of your home ' + (rec.side === 'sold' ? 'sale' : 'purchase') + ' — EH Realty';
+  const lines = [
+    'Hi ' + first + ',',
+    '',
+    'Happy ' + pcOrdinal(years) + ' anniversary! On ' + rec.closingDate + ' you ' + (rec.side === 'sold' ? 'sold your home at ' : 'bought your home at ') + place + '. ' + (rec.side === 'sold' ? 'I hope life has been good since the move.' : 'I hope the home has been treating you well.'),
+    ''
+  ];
+  if (rec.side !== 'sold') lines.push('If you are ever curious what your home is worth in today\'s market — or you are thinking about a change — I am glad to prepare a proper valuation for you, with no obligation.', '');
+  lines.push(
+    'And if someone you know — a friend, family member or colleague — is thinking of buying or selling, I would be honoured if you passed my name along. Referrals from clients like you are the heart of my business, and I will take excellent care of them.',
+    '',
+    'Warm regards,',
+    'Erfan Hakimian — EH Realty'
+  );
+  return { subject: subject, text: lines.join('\n') };
+}
+
+function pcComposeEquity(rec, est) {
+  const first = pcFirstName(rec);
+  const prop = rec.property || {};
+  const place = ((prop.address || '') + (prop.city ? ', ' + prop.city : '')) || 'your home';
+  const mid = Math.round((est.low + est.high) / 2);
+  const pct = rec.closingPrice > 0 ? Math.round(((mid - rec.closingPrice) / rec.closingPrice) * 1000) / 10 : null;
+  const fa = rec.lang === 'fa';
+  if (fa) {
+    const subject = 'به‌روزرسانی ارزش خانه‌تان — EH Realty';
+    const lines = [
+      'سلام ' + first + ' عزیز،',
+      '',
+      'یک به‌روزرسانی کوتاه درباره‌ی خانه‌تان در ' + place + '. وقتی در تاریخ ' + rec.closingDate + ' آن را خریدید، قیمت ' + pcMoney(rec.closingPrice) + ' بود.',
+      '',
+      'بر اساس آگهی‌های مشابه امروز در ' + (prop.city || '') + ' (مبنای ' + est.comps + ' آگهی مشابه)، خانه‌ای مثل خانه‌ی شما در حال حاضر در بازه‌ی ' + pcMoney(est.low) + ' تا ' + pcMoney(est.high) + ' برآورد می‌شود' + (pct !== null ? ' — یعنی نقطه‌ی میانی حدود ' + pcMoney(mid) + '، تقریباً ' + (pct >= 0 ? '+' : '') + pct + '٪ نسبت به قیمت خرید شما' : '') + '. این یک برآورد خودکار از داده‌های آگهی‌هاست، نه ارزیابی رسمی؛ برای رقم دقیق، بازدید حضوری لازم است که هر وقت بخواهید با خوشحالی انجامش می‌دهم — کافی است به همین ایمیل پاسخ دهید.',
+      '',
+      'با احترام،',
+      'عرفان حکیمیان — EH Realty'
+    ];
+    return { subject: subject, text: lines.join('\n') };
+  }
+  const subject = 'Your home\'s value today — EH Realty';
+  const lines = [
+    'Hi ' + first + ',',
+    '',
+    'A quick update on your home at ' + place + '. When you bought it on ' + rec.closingDate + ', the price was ' + pcMoney(rec.closingPrice) + '.',
+    '',
+    'Based on comparable listings in ' + (prop.city || 'your area') + ' today (' + est.comps + ' comparables), a home like yours is currently estimated in the range of ' + pcMoney(est.low) + ' – ' + pcMoney(est.high) + (pct !== null ? ' — a midpoint of about ' + pcMoney(mid) + ', roughly ' + (pct >= 0 ? '+' : '') + pct + '% compared with your purchase price' : '') + '. This is an automated estimate from listing data, not an appraisal; a precise figure needs an in-person look, which I am happy to do whenever useful — just reply to this email.',
+    '',
+    'Warm regards,',
+    'Erfan Hakimian — EH Realty'
+  ];
+  return { subject: subject, text: lines.join('\n') };
+}
+
+async function pcLoadAll(env) {
+  const ids = await idxGetMerged(env, 'pclients', 'pclient:', 500);
+  const out = [];
+  for (const id of ids) {
+    try { const r = await siteKvGet(env, 'pclient:' + id, { type: 'json' }); if (r) out.push(r); } catch (e) {}
+  }
+  return out;
+}
+
+async function pcCreateTask(env, rec, kind, cycle, text) {
+  const tid = 'pct-' + (await sha256hex('pclub:' + kind + ':' + rec.id + ':' + cycle)).slice(0, 16);
+  const existing = await siteKvGet(env, 'task:' + tid, { type: 'json' }).catch(function () { return null; });
+  if (!existing) {
+    await siteKvPut(env, 'task:' + tid, JSON.stringify({ id: tid, email: rec.email || '', text: text, due: todayVancouver(), done: false, created_at: new Date().toISOString(), rule: 'past-clients', ref: rec.id }));
+  }
+  await idxAdd(env, 'tasks', tid); // every run, like the rules engine — a lost index entry self-heals
+  return tid;
+}
+
+/* The touchpoint engine. Best-effort per client (one bad record never
+   aborts the run); returns a summary for the automations heartbeat. */
+async function runPastClientTouches(env) {
+  const out = { scanned: 0, prepared: 0, drafts: 0, needsData: 0, cadenceSkipped: 0, suppressed: 0, errors: 0, partial: false };
+  const today = todayVancouver();
+  let ids = [];
+  try { ids = await idxGetMerged(env, 'pclients', 'pclient:', 500); } catch (e) { out.errors++; return out; }
+  if (ids.length > PCLUB_RUN_CAP) { ids = ids.slice(0, PCLUB_RUN_CAP); out.partial = true; }
+  for (const id of ids) {
+    if (kvLeft(env) <= 0) { out.partial = true; break; }
+    let rec = null;
+    try { rec = await siteKvGet(env, 'pclient:' + id, { type: 'json' }); } catch (e) { out.errors++; continue; }
+    if (!rec) continue;
+    out.scanned++;
+    try {
+      if (rec.paused) continue;
+      if (!pcParseYmd(rec.closingDate)) { out.errors++; continue; }
+      const touches = rec.touches || (rec.touches = {});
+      const lastP = touches.lastPreparedAt ? String(touches.lastPreparedAt).slice(0, 10) : null;
+      if (lastP && pcDaysBetween(lastP, today) < PCLUB_CADENCE_DAYS) { out.cadenceSkipped++; continue; }
+      const due = pcDueTouches(rec, today);
+      if (!due.anniv && !due.equity) continue;
+      let changed = false;
+      // Anniversary first; a successful preparation stamps
+      // lastPreparedAt, which makes the cadence guard block the
+      // equity candidate in this same run (one touch per client).
+      if (due.anniv) {
+        const c = pcComposeAnniversary(rec, due.anniv.years);
+        const key = 'pclub:anniv:' + rec.id + ':' + due.anniv.years;
+        let mid = null, suppressed = false;
+        try {
+          mid = await queueMail(env, { kind: 'pastclient', to: rec.email, lang: validLang(rec.lang), name: rec.name || '', ref: rec.id, subject: c.subject, aiText: c.text, pcTouch: { type: 'anniversary', years: due.anniv.years, cycle: due.anniv.years } }, { key: key, consentBasis: 'client_relationship' });
+        } catch (e) { suppressed = true; }
+        if (mid === null) {
+          // dedupe (draft already held) or queue-boundary policy
+          // (ban / do-not-contact): either way the cycle is settled —
+          // the deterministic id names the held record when it exists.
+          const held = await siteKvGet(env, 'mailq:' + 'k-' + (await sha256hex(key)).slice(0, 40), { type: 'json' }).catch(function () { return null; });
+          if (held) mid = held.id; else suppressed = true;
+        }
+        if (mid) {
+          touches.anniv = { cycle: due.anniv.years, mailId: mid, at: today };
+          touches.lastPreparedAt = new Date().toISOString();
+          touches.lastType = 'anniversary';
+          changed = true; out.prepared++; out.drafts++;
+          await pcCreateTask(env, rec, 'anniversary', due.anniv.years, 'Review held draft — ' + pcOrdinal(due.anniv.years) + ' purchase-anniversary message for ' + (rec.name || rec.email));
+        } else if (suppressed) {
+          touches.anniv = { cycle: due.anniv.years, mailId: null, suppressed: true, at: today };
+          changed = true; out.suppressed++;
+        }
+      }
+      const stillClear = !(touches.lastPreparedAt && pcDaysBetween(String(touches.lastPreparedAt).slice(0, 10), today) < PCLUB_CADENCE_DAYS);
+      if (due.equity && stillClear) {
+        let est = null;
+        try { est = await valuationEstimate(env, { city: (rec.property || {}).city || '', type: (rec.property || {}).type || '', sqft: (rec.property || {}).sqft || 0 }); } catch (e) { est = { none: 'error' }; }
+        if (est && !est.none && isFinite(est.low) && isFinite(est.high)) {
+          const c = pcComposeEquity(rec, est);
+          const key = 'pclub:equity:' + rec.id + ':' + due.equity.cycle;
+          let mid = null, suppressed = false;
+          try {
+            mid = await queueMail(env, { kind: 'pastclient', to: rec.email, lang: validLang(rec.lang), name: rec.name || '', ref: rec.id, subject: c.subject, aiText: c.text, pcTouch: { type: 'equity', cycle: due.equity.cycle } }, { key: key, consentBasis: 'client_relationship' });
+          } catch (e) { suppressed = true; }
+          if (mid === null) {
+            const held = await siteKvGet(env, 'mailq:' + 'k-' + (await sha256hex(key)).slice(0, 40), { type: 'json' }).catch(function () { return null; });
+            if (held) mid = held.id; else suppressed = true;
+          }
+          if (mid) {
+            touches.equity = { cycle: due.equity.cycle, mailId: mid, state: 'ready', estimate: { low: est.low, high: est.high, comps: est.comps, basis: est.basis, at: today }, at: today };
+            touches.lastPreparedAt = new Date().toISOString();
+            touches.lastType = 'equity';
+            changed = true; out.prepared++; out.drafts++;
+            await pcCreateTask(env, rec, 'equity', due.equity.cycle, 'Review held draft — yearly equity update for ' + (rec.name || rec.email));
+          } else if (suppressed) {
+            touches.equity = { cycle: due.equity.cycle, mailId: null, state: 'suppressed', at: today };
+            changed = true; out.suppressed++;
+          }
+        } else {
+          // NO honest estimate — never invent a figure: mark the
+          // cycle needs_data and tell the owner via a task instead
+          // of preparing a draft.
+          touches.equity = { cycle: due.equity.cycle, mailId: null, state: 'needs_data', reason: (est && est.none) || 'error', at: today };
+          changed = true; out.needsData++;
+          await pcCreateTask(env, rec, 'equity-needs-data', due.equity.cycle, 'Equity update for ' + (rec.name || rec.email) + ' needs data (' + ((est && est.none) || 'error') + ') — no draft prepared');
+        }
+      }
+      if (changed) await siteKvPut(env, 'pclient:' + rec.id, JSON.stringify(rec));
+    } catch (e) { out.errors++; }
+  }
+  return out;
+}
+
 async function runAutomations(env, source) {
   let held = null;
   try { held = await env.LEADS.get('lock:automations'); } catch (e) { held = null; }
@@ -7924,6 +8235,13 @@ async function runAutomations(env, source) {
     // Portal brain (2026-11-01): personalised follow-up drafts for due
     // items, capped per run, inside the same lock + budget discipline.
     try { result.brainDrafts = await brainFollowupDrafts(env); } catch (e) { result.brainDrafts = { error: 'failed' }; }
+    // Pack SystemPastClients: past-client touchpoint preparation
+    // (anniversary + equity drafts, HELD only) runs beside the
+    // score persistence — outside the catalog-freshness branch, so
+    // a stale catalog never blocks an anniversary; the equity path
+    // goes through valuationEstimate and degrades to needs-data
+    // when no honest estimate exists.
+    try { result.pastClients = await runPastClientTouches(countKvEnv(env, 150)); } catch (e) { result.pastClients = { error: 'failed' }; }
     // Bump the admin-cache generation (Pack D, F-03S L1): mutating
     // HTTP requests bump admin:gen in the fetch wrapper, but the cron
     // path has no wrapper — without this, leads/viewings the runner
@@ -16689,6 +17007,124 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, task: t }, 200, origin);
       }
 
+      // ---- admin: past clients (Pack SystemPastClients, System E) ----
+      // Owner-desk records for the Past-Client Club. The owner adds
+      // past clients manually here; the Deals workspace (System D)
+      // will create the same pclient: records from closed deals (the
+      // join contract is in hidden_files/system-past-clients/APPLY.md).
+      // Reading a record NEVER prepares a touch — preparation happens
+      // only inside runAutomations (runPastClientTouches) and only
+      // ever produces HELD drafts + owner tasks.
+      if (path === '/api/admin/past-clients' && request.method === 'GET') {
+        const today = todayVancouver();
+        const recs = await pcLoadAll(env);
+        const clients = recs.map(function (r) {
+          const t = r.touches || {};
+          return Object.assign({}, r, {
+            nextTouch: pcNextTouch(r, today),
+            equityState: (t.equity && t.equity.state) || null,
+            equityEstimate: (t.equity && t.equity.estimate) || null
+          });
+        });
+        clients.sort(function (a, b) {
+          const da = (a.nextTouch && a.nextTouch.date) || '9999-12-31';
+          const db = (b.nextTouch && b.nextTouch.date) || '9999-12-31';
+          return da.localeCompare(db) || String(a.name || '').localeCompare(String(b.name || ''));
+        });
+        return json({ ok: true, clients: clients, count: clients.length }, 200, origin);
+      }
+      if (path === '/api/admin/past-clients' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const em = normEmail(String(d.email || ''));
+        let name = cleanText(d.name, 120);
+        const closingDate = String(d.closingDate || '').slice(0, 10);
+        const closingPrice = Math.round(Number(d.closingPrice));
+        const side = d.side === 'sold' ? 'sold' : 'bought';
+        if (!em || em.indexOf('@') < 1 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em) || !name || !pcParseYmd(closingDate) || closingDate < '1990-01-01' || closingDate > addDaysYmd(todayVancouver(), 366) || !isFinite(closingPrice) || closingPrice < 1000 || closingPrice > 100000000) {
+          return json({ ok: false, error: 'validation' }, 400, origin);
+        }
+        const isTest = d.test === true;
+        if (isTest && name.indexOf('ZZ TEST') !== 0) name = 'ZZ TEST ' + name; // the platform's test-record label convention
+        const pin = (d.property && typeof d.property === 'object') ? d.property : {};
+        const num = function (v, max) { const n = Number(v); return isFinite(n) && n >= 0 && n <= max ? n : 0; };
+        const rec = {
+          id: 'pc_' + randHex(6),
+          name: name,
+          email: em,
+          phone: cleanText(d.phone, 24),
+          lang: validLang(d.lang),
+          side: side,
+          property: {
+            address: cleanText(pin.address, 200),
+            city: cleanText(pin.city, 80),
+            type: cleanText(pin.type, 40),
+            postal: cleanText(pin.postal, 10).toUpperCase(),
+            sqft: Math.round(num(pin.sqft, 200000)),
+            beds: Math.round(num(pin.beds, 40)),
+            baths: num(pin.baths, 40)
+          },
+          closingDate: closingDate,
+          closingPrice: closingPrice,
+          notes: cleanText(d.notes, 1000),
+          test: isTest,
+          paused: false,
+          source: 'owner-manual',
+          created_at: new Date().toISOString(),
+          touches: { lastPreparedAt: null, lastType: null, anniv: null, equity: null }
+        };
+        await siteKvPut(env, 'pclient:' + rec.id, JSON.stringify(rec));
+        await idxAdd(env, 'pclients', rec.id);
+        return json({ ok: true, client: rec }, 200, origin);
+      }
+      const pcm = path.match(/^\/api\/admin\/past-clients\/([A-Za-z0-9_-]{1,80})$/);
+      if (pcm && request.method === 'PATCH') {
+        const rec = await siteKvGet(env, 'pclient:' + pcm[1], { type: 'json' });
+        if (!rec) return json({ ok: false, error: 'not_found' }, 404, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        if (d.paused !== undefined) rec.paused = d.paused === true;
+        if (d.notes !== undefined) rec.notes = cleanText(d.notes, 1000);
+        if (d.name !== undefined) { const nm = cleanText(d.name, 120); if (!nm) return json({ ok: false, error: 'validation', field: 'name' }, 400, origin); rec.name = nm; }
+        if (d.phone !== undefined) rec.phone = cleanText(d.phone, 24);
+        if (d.lang !== undefined) rec.lang = validLang(d.lang);
+        if (d.closingPrice !== undefined) {
+          const cp2 = Math.round(Number(d.closingPrice));
+          if (!isFinite(cp2) || cp2 < 1000 || cp2 > 100000000) return json({ ok: false, error: 'validation', field: 'closingPrice' }, 400, origin);
+          rec.closingPrice = cp2;
+        }
+        if (d.closingDate !== undefined) {
+          const cd = String(d.closingDate || '').slice(0, 10);
+          if (!pcParseYmd(cd) || cd < '1990-01-01' || cd > addDaysYmd(todayVancouver(), 366)) return json({ ok: false, error: 'validation', field: 'closingDate' }, 400, origin);
+          if (cd !== rec.closingDate) {
+            // a corrected closing date invalidates the cycle
+            // bookkeeping: prepared-cycle markers are cleared (held
+            // drafts already queued are untouched — the owner reviews
+            // them in the outbox); lastPreparedAt is KEPT so the
+            // 60-day cadence guard still protects the client.
+            rec.closingDate = cd;
+            rec.touches = { lastPreparedAt: (rec.touches || {}).lastPreparedAt || null, lastType: null, anniv: null, equity: null };
+          }
+        }
+        if (d.property && typeof d.property === 'object') {
+          const pin2 = d.property, cur = rec.property || {};
+          const num2 = function (v, max) { const n = Number(v); return isFinite(n) && n >= 0 && n <= max ? n : 0; };
+          if (pin2.address !== undefined) cur.address = cleanText(pin2.address, 200);
+          if (pin2.city !== undefined) cur.city = cleanText(pin2.city, 80);
+          if (pin2.type !== undefined) cur.type = cleanText(pin2.type, 40);
+          if (pin2.postal !== undefined) cur.postal = cleanText(pin2.postal, 10).toUpperCase();
+          if (pin2.sqft !== undefined) cur.sqft = Math.round(num2(pin2.sqft, 200000));
+          if (pin2.beds !== undefined) cur.beds = Math.round(num2(pin2.beds, 40));
+          if (pin2.baths !== undefined) cur.baths = num2(pin2.baths, 40);
+          rec.property = cur;
+        }
+        rec.updated_at = new Date().toISOString();
+        await siteKvPut(env, 'pclient:' + rec.id, JSON.stringify(rec));
+        return json({ ok: true, client: rec }, 200, origin);
+      }
+
       // ---- admin: CRM ----
       if (path === '/api/admin/crm/merge' && request.method === 'POST') {
         let d = null; try { d = await request.json(); } catch (e) {}
@@ -19457,7 +19893,7 @@ async function handleRequest(request, env, ctx) {
           // from ground truth, so any out-of-band KV edit (dashboard fix or
           // restore) self-heals within a day instead of staying invisible.
           try {
-            const IDX_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:']]; // Pack PMV2 (PM P24): files + pushsubs join the rebuild — both are idx: indexes whose lost ids were previously invisible forever
+            const IDX_DEFS = [['leads', 'lead:'], ['users', 'user:'], ['tasks', 'task:'], ['bans', 'ban:'], ['mailq', 'mailq:'], ['nlsubs', 'nlsub:'], ['calls', 'call:'], ['sms', 'sms:'], ['files', 'file:'], ['pushsubs', 'pushsub:'], ['pclients', 'pclient:']]; // Pack PMV2 (PM P24): files + pushsubs join the rebuild; Pack SystemPastClients: pclients joins the rebuild too — both are idx: indexes whose lost ids were previously invisible forever
             for (const [nm, pfx] of IDX_DEFS) {
               const names = await listAll(pfx);
               if (!names.length) { const oldIdx = (await env.LEADS.get('idx:' + nm, { type: 'json' })) || []; if (oldIdx.length) { repairs.push('Reindex kept the old ' + nm + ' index — the ground-truth list came back empty'); continue; } } // a transient empty list must not wipe a good index (cycle 30, Claude M4)
