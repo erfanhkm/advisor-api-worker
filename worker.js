@@ -22,7 +22,15 @@
 //   GET  /api/admin/radar-coverage      -> {ok, cells[], debtCount, poolCount} (auth — portal Radar coverage block)
 //   POST /api/valuation   {home+contact} -> {ok, estimate|null} (public, rate-limited — seller lead magnet;
 //                                          estimate derived ONLY from catalog comparables; stores a
-//                                          CRM lead with source 'home-valuation')
+//                                          CRM lead with source 'home-valuation', magnet 'leadmagnet:valuation')
+//   POST /api/market/report-request {name, email|phone, city} -> {ok:true}
+//                                          (public, rate-limited — System A neighbourhood-report lead
+//                                          magnet; stores a CRM lead with source 'leadmagnet', magnet
+//                                          'leadmagnet:neighbourhood:<city slug>')
+//   POST /api/privacy/delete-valuation {email, address} -> {ok:true}
+//                                          (public, rate-limited — System A self-serve deletion of
+//                                          home-valuation PII, the PO-17 build-now PIPEDA route;
+//                                          the response is always the same generic success)
 //   GET  /api/market/stats              -> {ok, months:[..]}    (public — Market Pulse hub dataset from
 //                                          KV 'market:stats'; every figure carries source + date)
 //   GET  /api/market/rates              -> {ok, policy, prime, bond5, policySeries, stale} (public —
@@ -516,12 +524,12 @@ const PERF_LISTING_CAP = 500;  // distinct listing keys per isolate delta
 // Lead sources actually used by this worker's lead paths (contact form,
 // valuation, viewing, phone call, maintenance canary); anything else a
 // caller claims counts as 'other' (F-01 M1).
-const PERF_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary', 'manual', 'other']; // 'manual' added by Pack PortalAddLead (2026-11-12): owner-portal manual leads keep their own perf bucket instead of folding into 'other'
+const PERF_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary', 'manual', 'leadmagnet', 'other']; // 'manual' added by Pack PortalAddLead (2026-11-12): owner-portal manual leads keep their own perf bucket instead of folding into 'other'; 'leadmagnet' added by System A (2026-11-12): neighbourhood-report captures keep their own bucket
 // Lead sources the public /api/lead will store (Pack A, F-04 M8):
 // anything else a caller claims becomes 'site-form'. (The valuation
 // route sets its own 'home-valuation' server-side; PERF_SOURCES above
 // additionally folds unknown counter keys into 'other'.)
-const LEAD_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary'];
+const LEAD_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary', 'leadmagnet']; // 'leadmagnet' added by System A (2026-11-12): set server-side by /api/market/report-request only
 const PERF_KEY_RE = /^[A-Za-z0-9_-]{1,24}$/;
 let perfIsoId = null; // isolate id for this isolate's perf delta keys — generated
 // LAZILY by perfIso() on first flush, never at module scope: crypto.randomUUID()
@@ -14025,7 +14033,7 @@ async function handleRequest(request, env, ctx) {
         if (await valuationBanned(env, email, phone)) return json({ ok: true, estimate: est, manual: !est }, 200, origin);
         const money = function (n) { return '$' + Number(n).toLocaleString('en-CA'); };
         const estText = est
-          ? ('Estimated range ' + money(est.low) + ' – ' + money(est.high) + ' (from ' + est.comps + ' comparable active listings, ' + (est.basis === 'ppsf' ? 'price-per-sqft band' : 'listing-price band') + ')' + (estAlias ? ' (' + estAlias + ' comparables)' : '') + '.')
+          ? ('Asking-price range ' + money(est.low) + ' – ' + money(est.high) + ' (from ' + est.comps + ' comparable active listings, ' + (est.basis === 'ppsf' ? 'price-per-sqft band' : 'listing-price band') + ')' + (estAlias ? ' (' + estAlias + ' comparables)' : '') + '.')
           : (estReason === 'catalog_stale' ? 'Estimate skipped — the listing catalog could not be proven fresh; manual assessment needed.'
             : estReason === 'read_failed' ? 'Estimate unavailable — a comparables read failed; manual assessment needed.'
             : estReason === 'no_sqft_comps' ? 'No size-bearing comparable listings — manual assessment needed.'
@@ -14048,7 +14056,7 @@ async function handleRequest(request, env, ctx) {
             name: name, intent: 'seller', city: city, budget: '',
             email: email, phone: phone,
             message: 'Home valuation request: ' + address + ', ' + city + ' — ' + type + ', ' + (bd.value === null ? 'beds not given' : bd.value + ' bed') + ', ' + (bt.value === null ? 'baths not given' : bt.value + ' bath') + ', ' + (sqft ? sqft + ' sq ft. ' : 'size not given. ') + estText,
-            stage: 'new', notes: '', source: 'home-valuation', chatRef: chatRefOf(d),
+            stage: 'new', notes: '', source: 'home-valuation', magnet: 'leadmagnet:valuation', chatRef: chatRefOf(d),
             valuation: { address: address, city: city, type: type, beds: bd.value, baths: bt.value, sqft: sqft, rawSqft: (typeof d.sqft === 'string' ? d.sqft.slice(0, 40) : (typeof d.sqft === 'number' ? d.sqft : null)), compMls: compMls, estimate: est, reason: est ? null : estReason, at: new Date().toISOString() }
           };
           // The lead is stored FIRST (F-03 H3); every side effect
@@ -14067,6 +14075,94 @@ async function handleRequest(request, env, ctx) {
           try { ctx.waitUntil(brainTriageLead(env, id)); } catch (e) {}
         }
         return json({ ok: true, estimate: est, manual: !est }, 200, origin);
+      }
+
+      if (path === '/api/market/report-request' && request.method === 'POST') {
+        // System A (2026-11-12): the neighbourhood-report lead magnet.
+        // Sibling of /api/valuation — same rails in the same order:
+        // rate limit, honeypot, ALL cheap validation BEFORE the
+        // captcha (Turnstile tokens are single-use), 10-minute
+        // dedupe. The report itself is rendered client-side from the
+        // ALREADY-PUBLIC board statistics (GET /api/market/stats);
+        // this route only records the capture as a CRM lead through
+        // the standard lead path — source 'leadmagnet', magnet
+        // 'leadmagnet:neighbourhood:<slug>' — so the portal Lead
+        // Sources view can attribute it. No parallel store and no new
+        // PII class: name + email/phone + the chosen city only.
+        if (limited('nbr:' + ip, 5, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        // Honeypot: indistinguishable success, nothing stored.
+        if (String(d.hp || '') !== '') return json({ ok: true }, 200, origin);
+        const LE_CITIES = { vancouver: ['Vancouver', 'gvr'], burnaby: ['Burnaby', 'gvr'], 'new-westminster': ['New Westminster', 'gvr'], 'north-vancouver': ['North Vancouver', 'gvr'], 'west-vancouver': ['West Vancouver', 'gvr'], coquitlam: ['Coquitlam', 'gvr'], 'port-moody': ['Port Moody', 'gvr'], 'port-coquitlam': ['Port Coquitlam', 'gvr'], 'pitt-meadows': ['Pitt Meadows', 'gvr'], 'maple-ridge': ['Maple Ridge', 'gvr'], surrey: ['Surrey', 'fvreb'], langley: ['Langley', 'fvreb'], delta: ['Delta', 'fvreb'], 'white-rock': ['White Rock', 'fvreb'], abbotsford: ['Abbotsford', 'fvreb'], mission: ['Mission', 'fvreb'], chilliwack: ['Chilliwack', 'none'] };
+        if (/[\r\n<>]|https?:|www\./i.test(String(d.name || ''))) return json({ ok: false, error: 'validation' }, 400, origin);
+        const name = typeof d.name === 'string' ? cleanText(d.name, 120) : '';
+        const email = String(d.email || '').trim().toLowerCase().slice(0, 160);
+        const phone = String(d.phone || '').trim().slice(0, 40);
+        const slug = String(d.city || '').toLowerCase();
+        const cityEnt = Object.prototype.hasOwnProperty.call(LE_CITIES, slug) ? LE_CITIES[slug] : null;
+        if (!name || !cityEnt) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (email && !EMAIL_RE.test(email)) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (!email && !phone) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (phone && !/^[+\d][\d\s().-]{6,39}$/.test(phone)) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (!(await turnstileOk(env, d.turnstileToken, rawIp))) return json({ ok: false, error: 'captcha' }, 400, origin);
+        const lang = validLang(d.lang);
+        // Dedupe: the same contact asking for the same city inside 10
+        // minutes is one magnet event — the second submit still
+        // answers success (the report unlocks client-side) but stores
+        // no second lead.
+        const dupKey = 'nbdup:' + (await sha256hex((email || phone) + '|' + slug));
+        try { if (await env.LEADS.get(dupKey)) return json({ ok: true }, 200, origin); } catch (e) {}
+        const id = Date.now().toString(36) + '-' + randHex(6);
+        const lead = {
+          id: id, created_at: new Date().toISOString(), name: name, intent: 'buyer', city: cityEnt[0],
+          email: email, phone: phone,
+          message: 'Neighbourhood market report requested: ' + cityEnt[0] + ' (' + (cityEnt[1] === 'none' ? 'no board statistics published for this board yet' : cityEnt[1].toUpperCase() + ' board statistics') + ').',
+          stage: 'new', notes: '', source: 'leadmagnet', magnet: 'leadmagnet:neighbourhood:' + slug, chatRef: chatRefOf(d)
+        };
+        await siteKvPut(env, 'lead:' + id, JSON.stringify(lead));
+        await idxAdd(env, 'leads', id);
+        await perfBump(env, ctx, 'source', lead.source);
+        if (email) { try { await queueMail(env, { kind: 'followup', to: email, lang: lang, name: name, ref: 'lead:' + id }); } catch (e) {} }
+        try { await env.LEADS.put(dupKey, '1', { expirationTtl: 600 }); } catch (e) {}
+        if (ctx && ctx.waitUntil) ctx.waitUntil(brainTriageLead(env, id).catch(function () {}));
+        return json({ ok: true }, 200, origin);
+      }
+
+      if (path === '/api/privacy/delete-valuation' && request.method === 'POST') {
+        // System A (2026-11-12): the PO-17 build-now PIPEDA route.
+        // The hv_* flow stores PII (name, property address, phone,
+        // email, property details) as a CRM lead; until now NO
+        // retention/deletion route existed for it. A requester who
+        // supplies the SAME email and property address as a stored
+        // home-valuation lead deletes that lead (record + index
+        // entry). The response is ALWAYS the same generic success —
+        // whether nothing matched, the input was unusable, or the
+        // honeypot tripped — so the route can never be used as an
+        // oracle for whether an address is on file.
+        if (limited('pdel:' + ip, 5, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        if (String(d.hp || '') !== '') return json({ ok: true }, 200, origin);
+        const email = String(d.email || '').trim().toLowerCase().slice(0, 160);
+        const addrNorm = String(d.address || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        if (email && EMAIL_RE.test(email) && addrNorm.length >= 6) {
+          try {
+            const ids = await idxGet(env, 'leads', 'lead:', 2000);
+            for (const lid of ids) {
+              const l = await siteKvGet(env, 'lead:' + lid, { type: 'json' }).catch(function () { return null; });
+              if (!l || l.source !== 'home-valuation' || !l.valuation) continue;
+              if (String(l.email || '').trim().toLowerCase() !== email) continue;
+              const la = String(l.valuation.address || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+              if (la !== addrNorm) continue;
+              await siteKvDelete(env, 'lead:' + lid);
+              await idxRemove(env, 'leads', lid);
+            }
+          } catch (e) {}
+        }
+        return json({ ok: true }, 200, origin);
       }
 
       // ---- public: lightweight site-traffic beacon (aggregates only, no raw logs) ----
