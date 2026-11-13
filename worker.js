@@ -3125,7 +3125,7 @@ async function stampLastTouch(env, email) {
     await env.LEADS.put('cmeta:' + ne, JSON.stringify(cm));
   } catch (e) {}
 }
-async function storeCall(env, rec) {
+async function storeCall(env, rec, ctx) {
   const prov = String(rec.provider || 'generic').slice(0, 20);
   const pcid = String(rec.providerCallId || '').slice(0, 80);
   if (!pcid) return { ok: false, error: 'providerCallId' };
@@ -3141,6 +3141,7 @@ async function storeCall(env, rec) {
     status: ['completed', 'missed', 'voicemail', 'busy', 'failed', 'no-answer'].indexOf(rec.status) !== -1 ? rec.status : 'completed',
     recordingUrl: String(rec.recordingUrl || (existing && existing.recordingUrl) || '').slice(0, 600),
     transcript: String(rec.transcript || (existing && existing.transcript) || '').slice(0, 4000),
+    listing: String(rec.listing || (existing && existing.listing) || '').slice(0, 120), // Pack ScreenPop: an optional listing reference a provider attaches (generic ingest today); preserved across status upserts like recordingUrl, read by the screen-pop card
     created_at: (existing && existing.created_at) || now,
     updated_at: now
   });
@@ -3153,12 +3154,104 @@ async function storeCall(env, rec) {
   await env.LEADS.put('call:' + id, JSON.stringify(merged));
   if (isNew) {
     await idxAdd(env, 'calls', id);
+    // Pack ScreenPop (2026-11-12): a genuinely-new INBOUND call
+    // schedules the owner's screen pop. The previous-touch summary
+    // is captured BEFORE this call's own activity entry and
+    // last-touch stamp land below — the pop helper runs async
+    // (waitUntil) and must never race them for its "last touch"
+    // line. Best-effort by construction: callScreenPop never
+    // throws, and a waitUntil refusal degrades to a caught
+    // fire-and-forget, so the pop can never fail or delay the
+    // TwiML/ingest response.
+    if (merged.direction === 'in') {
+      let prevTouch = '';
+      if (merged.matchedEmail) {
+        try {
+          const ne2 = normEmail(merged.matchedEmail);
+          const arr = (await env.LEADS.get('uact:' + ne2, { type: 'json' })) || [];
+          if (arr.length && arr[0] && arr[0].label) prevTouch = String(arr[0].label).slice(0, 80);
+          if (!prevTouch) {
+            const cm = (await env.LEADS.get('cmeta:' + ne2, { type: 'json' })) || {};
+            if (cm.lastTouchAt) prevTouch = relAgeText(cm.lastTouchAt);
+          }
+        } catch (e) {}
+      }
+      const popPromise = callScreenPop(env, merged, prevTouch);
+      let scheduled = false;
+      if (ctx && typeof ctx.waitUntil === 'function') { try { ctx.waitUntil(popPromise); scheduled = true; } catch (e) {} }
+      if (!scheduled) popPromise.catch(function () {});
+    }
     if (merged.matchedEmail) {
       await pushActivity(env, merged.matchedEmail, 'call', (merged.direction === 'in' ? '📞 Incoming call' : '📞 Outgoing call') + ' · ' + merged.durationSec + 's · ' + merged.status);
       await stampLastTouch(env, merged.matchedEmail); // PM8b: a matched call IS a touch
     }
   }
   return { ok: true, id: id, created: isNew };
+}
+/* Pack ScreenPop (2026-11-12): relative-age text for a stored
+   ISO timestamp ("just now" / "5h ago" / "3d ago"), '' when the
+   value does not parse. */
+function relAgeText(iso) {
+  const t = Date.parse(iso || '');
+  if (!isFinite(t)) return '';
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 3600) return 'just now';
+  if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
+  const d = Math.floor(sec / 86400);
+  return d === 1 ? '1d ago' : d + 'd ago';
+}
+/* Pack ScreenPop (2026-11-12): ONE Web Push screen pop to the
+   owner's portal devices for a genuinely-new inbound call. The
+   trigger discipline lives in storeCall: this helper runs
+   exactly once per new record (storeCall's isNew), never on a
+   status-webhook upsert of an existing call. Skip rules: the
+   direction gate (storeCall only schedules inbound; re-checked
+   here), telephony unconfigured (no cfg:calls — fully inert
+   until the December number activation writes it), and the
+   caller's number being the owner's own cell (cfg:calls
+   .forwardTo — his test calls and DISA calls). Delivery rides
+   the portal Web Push sender verbatim (puNotifyPush, System 8 —
+   subscriptions are the owner's portal devices; zero
+   subscriptions is a quiet no-op), and the helper NEVER throws.
+   Payload convention follows the existing portal alerts (New
+   viewing booked / Hot lead): a generic category title carrying
+   no personal data, the caller card in the body. The payload
+   itself is RFC 8291-encrypted per subscription
+   (puPushEncrypt); the generic title is about lock-screen
+   display, not transport. Click target is the portal root —
+   the portal has no URL-addressable person-profile or
+   Calls-lens route (its go() navigation is in-memory only) and
+   every existing alert uses the same target. */
+async function callScreenPop(env, call, prevTouch) {
+  try {
+    if (!call || call.direction !== 'in') return;
+    const cfg = await getCallsCfg(env);
+    if (!cfg) return;
+    if (cfg.forwardTo && phoneLast10(call.from) === phoneLast10(cfg.forwardTo)) return;
+    let title = '📞 Incoming call';
+    if (call.status === 'missed') title = '📞 Missed call';
+    else if (call.status === 'voicemail') title = '📞 Voicemail';
+    const parts = [];
+    if (call.matchedEmail) {
+      parts.push(call.matchedName || call.from || 'Unknown caller');
+      try {
+        const sm = await puLeadScores(env);
+        const ne = normEmail(call.matchedEmail);
+        const lead = (sm.leads || []).find(function (l) { return normEmail(l.email || '') === ne; });
+        if (lead) {
+          if (lead.stage) parts.push('Stage: ' + lead.stage);
+          const s = sm.map[lead.id];
+          if (s && typeof s.score === 'number') parts.push((s.band ? s.band.charAt(0).toUpperCase() + s.band.slice(1) : 'Score') + ' · ' + s.score);
+        }
+      } catch (e) {}
+      parts.push(prevTouch ? 'Last touch: ' + prevTouch : 'First contact');
+    } else {
+      parts.push(call.from || 'Unknown caller');
+      parts.push('Unknown caller');
+    }
+    if (call.listing) parts.push('Re: ' + call.listing);
+    await puNotifyPush(env, { title: title, body: parts.join(' · ').slice(0, 300), url: '/portal-9f3k7x2q.html' });
+  } catch (e) {}
 }
 function escapeXml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 async function twilioSigOk(env, cfg, request, params) {
@@ -12174,7 +12267,7 @@ async function handleRequest(request, env, ctx) {
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || typeof d !== 'object') return json({ ok: false, error: 'validation' }, 400, origin);
-        const rr = await storeCall(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }));
+        const rr = await storeCall(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }), ctx);
         return json(rr, rr.ok ? 200 : 400, origin);
       }
       if (path === '/api/calls/twilio/voice' && request.method === 'POST') {
@@ -12213,7 +12306,7 @@ async function handleRequest(request, env, ctx) {
           status: statusMap[rawStatus] || 'completed',
           recordingUrl: (params.RecordingUrl && String(params.RecordingUrl).indexOf('https://api.twilio.com/') === 0) ? params.RecordingUrl + '.mp3' : '' // host-validated (cycle 27, Claude L17)
         };
-        if (rec.providerCallId) await storeCall(env, rec);
+        if (rec.providerCallId) await storeCall(env, rec, ctx);
         return new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
       }
 
