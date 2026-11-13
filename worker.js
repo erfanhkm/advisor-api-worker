@@ -6073,18 +6073,31 @@ async function tutorRetrieve2(env, lang, message, contextLessonId) {
   });
   const strong = [];
   const modCache = {};
+  // Pack TutorQ2Error (2026-11-12): cross-language de-duplication.
+  // A FA question searches BOTH the FA and the EN index, and the
+  // same lesson/concept chunk exists in each — without this guard
+  // the TOP_K slots fill with duplicates (the live Q2 set was the
+  // m5-l1 + m5-l2 lessons in FA and EN at the full 6,000 chars
+  // each: the battery's largest prompt, every concept chunk
+  // evicted, topConcept null). A chunk already represented (same
+  // kind + id + tag) is skipped and the scan continues to the next
+  // DISTINCT chunk; the first-ranked copy wins, so the content-only
+  // ranking order (Pack TutorFaRetrieval) is untouched.
+  const seenChunks = new Set();
   for (const c of cand) {
     if (strong.length >= TUTOR2_TOP_K || c.score < 3) break;
+    const chunkKey = c.kind + '|' + c.id + '|' + (c.tag || '');
+    if (seenChunks.has(chunkKey)) continue;
     const key = c.srcLang + ':' + c.module;
     if (!(key in modCache)) modCache[key] = await tutorCorpusV2Module(env, c.srcLang, c.module);
     const mod = modCache[key];
     if (!mod) continue;
     if (c.kind === 'lesson') {
       const rec = (Array.isArray(mod.lessons) ? mod.lessons : []).find(function (l) { return l && l.id === c.id; });
-      if (rec && typeof rec.text === 'string') strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'lesson' });
+      if (rec && typeof rec.text === 'string') { seenChunks.add(chunkKey); strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'lesson' }); }
     } else {
       const rec = (Array.isArray(mod.concepts) ? mod.concepts : []).find(function (x) { return x && x.tag === c.tag && x.lessonId === c.id; });
-      if (rec && typeof rec.text === 'string') strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'concept', concept: c.tag });
+      if (rec && typeof rec.text === 'string') { seenChunks.add(chunkKey); strong.push({ id: c.id, title: rec.title || c.title, text: rec.text.slice(0, 6000), kind: 'concept', concept: c.tag }); }
     }
   }
   // Pack TutorFaRetrieval (2026-11-12): the lesson the student is
@@ -6112,13 +6125,17 @@ async function tutorRetrieve2(env, lang, message, contextLessonId) {
         if (!(key in modCache)) modCache[key] = await tutorCorpusV2Module(env, lg, le.module);
         const mod = modCache[key];
         const rec = mod && Array.isArray(mod.lessons) ? mod.lessons.find(function (l) { return l && l.id === contextLessonId; }) : null;
-        if (rec && typeof rec.text === 'string') { strong.push({ id: contextLessonId, title: rec.title || le.title, text: rec.text.slice(0, 6000), kind: 'lesson' }); break; }
+        if (rec && typeof rec.text === 'string') { strong.push({ id: contextLessonId, title: rec.title || le.title, text: rec.text.slice(0, 6000), kind: 'lesson', contextOnly: true }); break; }
       }
     }
   }
   let nearest = null;
-  if (cand.length && cand[0].score > 0) nearest = { id: cand[0].id, title: cand[0].title };
-  else if (contextLessonId) { const hit = cand.find(function (c) { return c.id === contextLessonId; }); if (hit) nearest = { id: hit.id, title: hit.title }; }
+  // Pack TutorQ2Error: nearest also carries its genuine content
+  // score, so the not-covered path can tell a real nearest lesson
+  // (score >= 3, the strong threshold) from the zero-overlap
+  // context fallback before naming it in a reply or a citation.
+  if (cand.length && cand[0].score > 0) nearest = { id: cand[0].id, title: cand[0].title, score: cand[0].score };
+  else if (contextLessonId) { const hit = cand.find(function (c) { return c.id === contextLessonId; }); if (hit) nearest = { id: hit.id, title: hit.title, score: hit.score }; }
   const topC = strong.find(function (s) { return s.kind === 'concept'; });
   return { seeded: true, v2: true, strong: strong, nearest: nearest, topConcept: topC ? topC.concept : null };
 }
@@ -13510,12 +13527,21 @@ async function handleRequest(request, env, ctx) {
           // Pack Tutor2: the question is also logged to the gap
           // analytics (tutor:gaps:<day>) so content blind spots are
           // visible in the owner portal.
-          const reply = tutorNotCoveredReply(lang, ret.nearest);
+          // Pack TutorQ2Error: the lesson pointer + citation ride
+          // along ONLY when the nearest lesson genuinely matches
+          // the question (content score >= 3, the strong
+          // threshold). The zero-overlap context fallback — the
+          // open lesson named merely because it is open — is
+          // unrelated dressing on a refusal and is no longer
+          // named or cited. (Supersedes TFAR-10's preserved
+          // fallback pointer, per this pack's brief.)
+          const ncNearest = (ret.nearest && (typeof ret.nearest.score !== 'number' || ret.nearest.score >= 3)) ? ret.nearest : null;
+          const reply = tutorNotCoveredReply(lang, ncNearest);
           thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
-          thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: ret.nearest ? [ret.nearest.id] : [] });
+          thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: ncNearest ? [ncNearest.id] : [] });
           await tutorThreadPut(env, ne, thread, ent.enrolment);
           await tutorLogGap(env, { q: message, lang: lang, lessonId: lessonId || null, reason: 'not_covered' });
-          return json({ ok: true, reply: reply, citations: ret.nearest ? [ret.nearest.id] : [], notCovered: true, remainingToday: Math.max(0, caps.perStudent - usedStudent), voiceEnabled: tutorVoiceCfg(cfg).enabled }, 200, origin);
+          return json({ ok: true, reply: reply, citations: ncNearest ? [ncNearest.id] : [], notCovered: true, remainingToday: Math.max(0, caps.perStudent - usedStudent), voiceEnabled: tutorVoiceCfg(cfg).enabled }, 200, origin);
         }
         // Tier 1b: the student's OWN snapshot personalises the prompt.
         const snap = await tutorStudentSnapshot(env, ne);
@@ -13536,6 +13562,25 @@ async function handleRequest(request, env, ctx) {
         const spendUnit = async function (kind) { usedS = await tutorUsageBump(env, 'tutor:usage:' + day + ':' + ne); usedG = await tutorUsageBump(env, 'tutor:usage:' + day + ':_global'); if (kind) { try { await tutorUsageBump(env, 'tutor:usage:' + day + ':prov:' + kind); } catch (e) {} } };
         let out = null;
         try { out = await tutorCallChain(env, cfg, turns, attachment); } catch (e) { out = null; }
+        if (!out && !attachment && ret.strong.length > 2) {
+          // Pack TutorQ2Error: ONE degradation retry before the
+          // hard 502. The live Q2 failure was an all-provider
+          // rejection of the turn's uniquely largest prompt; a
+          // draft grounded on the top-2 excerpts beats an error,
+          // and every downstream step (verify, citations) then
+          // works from the SAME reduced set the answer was
+          // actually grounded on. The suffix slice reuses the
+          // already-built snapshot/practice suffixes verbatim
+          // (tutorSystemPrompt is deterministic, so the slice is
+          // exact). Failed calls never spend budget
+          // (spend-on-success), so a rescued turn still costs
+          // exactly one draft unit.
+          const reducedStrong = ret.strong.slice(0, 2);
+          const sysSuffix = sysText.slice(tutorSystemPrompt(lang, ret.strong, ret.nearest).length);
+          const turnsR = [{ role: 'system', text: tutorSystemPrompt(lang, reducedStrong, ret.nearest) + sysSuffix }].concat(turns.slice(1));
+          try { out = await tutorCallChain(env, cfg, turnsR, attachment); } catch (e) { out = null; }
+          if (out) ret.strong = reducedStrong;
+        }
         if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
         await spendUnit(out.kind);
         // Pack Line1FixA (F6): deterministic draft-language guard.
@@ -13618,8 +13663,22 @@ async function handleRequest(request, env, ctx) {
             }
           }
         }
-        let citations = Array.from(new Set(ret.strong.map(function (e) { return e.id; }))); // v2 can return a concept chunk + the lesson chunk for one lesson — cite it once
-        if (verifyOutcome === 'trimmed') {
+        // Pack TutorQ2Error: a provider draft that refuses (the
+        // point is not covered) is a not-covered OUTCOME, whoever
+        // drafted it — serve the canonical worker refusal (no
+        // lesson pointer), with no citation chips and no practice
+        // append: dressing on a refusal misleads the student
+        // toward a lesson that does not answer them. The markers
+        // are the canonical refusal phrases themselves (the FA
+        // static text / prompt rule 3's English wording), so a
+        // genuine taught answer cannot trip them.
+        const refusalOutcome = reply.indexOf('پوشش داده نشده است') !== -1 || reply.toLowerCase().indexOf('not covered in the course material') !== -1;
+        if (refusalOutcome) {
+          reply = tutorNotCoveredReply(lang, null);
+          await tutorLogGap(env, { q: message, lang: lang, lessonId: lessonId || null, reason: 'not_covered' });
+        }
+        let citations = refusalOutcome ? [] : Array.from(new Set(ret.strong.filter(function (e) { return !e.contextOnly; }).map(function (e) { return e.id; }))); // v2 can return a concept chunk + the lesson chunk for one lesson — cite it once; Pack TutorQ2Error: the appended context excerpt (contextOnly) is model context, never a citation source
+        if (verifyOutcome === 'trimmed' && !refusalOutcome) {
           // Scan L1-L3 closure (QC Round 3, Build A2): (a) citations follow
           // the claims that SURVIVED the trim — a strong excerpt is cited
           // only if it supports at least one surviving claim (claims and
@@ -13633,7 +13692,7 @@ async function handleRequest(request, env, ctx) {
           // may be fabricated).
           const wordsOfT = function (t) { return new Set(String(t || '').toLowerCase().split(/[^a-z0-9\u0600-\u06FF]+/).filter(function (w) { return w.length >= 4; })); };
           const keepT = new Set();
-          for (const eT of ret.strong) {
+          for (const eT of ret.strong.filter(function (xT) { return !xT.contextOnly; })) {
             const ewT = wordsOfT((eT.title || '') + ' ' + (eT.text || ''));
             for (const cT of (trimmedSupported || [])) { let hitT = 0; for (const wT of wordsOfT(cT)) if (ewT.has(wT)) hitT++; if (hitT >= 2) { keepT.add(eT.id); break; } }
           }
@@ -13645,7 +13704,7 @@ async function handleRequest(request, env, ctx) {
               const pcT = String(ret.topConcept || concept || '').trim().toLowerCase();
               if (pcT) poolT = await tutorBankByConcept(env, lang, pcT);
               if (!poolT.length && citations.length) poolT = Object.keys(bixT.qmeta).filter(function (x) { return bixT.qmeta[x].l === citations[0]; }).sort();
-              if (poolT.length) {
+              if (poolT.length && trimmedSupported && trimmedSupported.length) {
                 if (!thread.state || typeof thread.state !== 'object') thread.state = {};
                 const exT = new Set(thread.state.practice && thread.state.practice.qid ? [thread.state.practice.qid] : []);
                 const qidT = tutorPickDeterministic(poolT, ne + ':' + (thread.state.practiceCount || 0), exT) || poolT[0];
@@ -13663,9 +13722,10 @@ async function handleRequest(request, env, ctx) {
         thread.messages.push({ role: 'user', text: message, at: new Date().toISOString() });
         thread.messages.push({ role: 'assistant', text: reply, at: new Date().toISOString(), citations: citations });
         await tutorThreadPut(env, ne, thread, ent.enrolment);
-        if (concept) await tutorRecordMisconception(env, ne, concept, lessonId || citations[0] || null);
+        if (concept && !refusalOutcome) await tutorRecordMisconception(env, ne, concept, lessonId || citations[0] || null);
         const chatResp = { ok: true, reply: reply, citations: citations, remainingToday: Math.max(0, caps.perStudent - usedS), voiceEnabled: tutorVoiceCfg(cfg).enabled, verify: verifyOutcome };
-        if (practiceConcept) chatResp.practiceOffer = { concept: practiceConcept };
+        if (refusalOutcome) chatResp.notCovered = true;
+        if (practiceConcept && !refusalOutcome) chatResp.practiceOffer = { concept: practiceConcept };
         return json(chatResp, 200, origin);
       }
       if (path === '/api/academy/tutor/history' && request.method === 'GET') {
