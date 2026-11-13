@@ -3833,9 +3833,21 @@ async function academyVideoVerifyToken(secret, token, nowMs) {
   if (typeof claims.lesson !== 'string' || typeof claims.lang !== 'string' || typeof claims.sub !== 'string') return null;
   return claims;
 }
-function academyVideoMediaHeaders(contentType) {
+function academyVideoMediaHeaders(contentType, origin) {
   // Spec §3: segments/playlists must not land in shared caches.
-  return { 'Content-Type': contentType, 'Cache-Control': 'private, no-store' };
+  const h = { 'Content-Type': contentType, 'Cache-Control': 'private, no-store', 'Vary': 'Origin' };
+  // Pack Line1FixA (F1, 2026-11-12 — pack-B contract): the portal
+  // player fetches playlists, captions and segments CROSS-ORIGIN
+  // (hls.js XHR from academy.ehrealtybc.com to this worker), and
+  // without Access-Control-Allow-Origin every media response is
+  // CORS-blocked in Chromium — the player never plays. Echo the
+  // request Origin under the exact rule cors() implements: the
+  // origin when it is allow-listed, '*' when the request carries
+  // no Origin at all, nothing otherwise. (Precedent: the
+  // tutor-voice audio response already returns ACAO + Vary.)
+  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) h['Access-Control-Allow-Origin'] = origin;
+  else if (!origin) h['Access-Control-Allow-Origin'] = '*';
+  return h;
 }
 
 /* ---- Academy media store = Backblaze B2 (Pack AcademyB2Video,
@@ -4189,6 +4201,13 @@ async function acadKvPut(env, key, value, ttlSeconds) {
 async function acadKvGet(env, key, opts) {
   const bucket = spillBucket(env);
   if (bucket) {
+    // Pack Line1FixA (F5, 2026-11-12): the KV read starts
+    // CONCURRENTLY with the R2 overflow probe — on the Academy
+    // deployment the probe used to be paid SERIALLY before every
+    // KV get on the student hot path (studentAuthed, profile,
+    // mistakes…), doubling the storage round-trips per call.
+    // Semantics unchanged: a live overflow envelope still wins.
+    const kvP = env.LEADS.get(key, opts); kvP.catch(function () {});
     let ent = null;
     try {
       const obj = await bucket.get(await spillObjKey(key));
@@ -4198,8 +4217,10 @@ async function acadKvGet(env, key, opts) {
       if (opts && opts.type === 'json') { try { return JSON.parse(ent.value); } catch (e) { return null; } }
       return ent.value;
     }
-    // miss / expired / unreadable envelope -> KV decides (an
-    // expired overflow object is cleaned up by the drain).
+    // miss / expired / unreadable envelope -> the KV read that has
+    // been running concurrently decides (an expired overflow
+    // object is cleaned up by the drain).
+    return await kvP;
   }
   return await env.LEADS.get(key, opts);
 }
@@ -5702,6 +5723,20 @@ async function tutorRetrieve(env, lang, message, contextLessonId) {
   return { seeded: true, strong: excerpts, nearest: nearest && nearest.score > 0 ? nearest : (contextLessonId ? (scored.find(function (s) { return s.id === contextLessonId; }) || null) : null) };
 }
 function tutorLessonLabel(id) { return String(id || '').toUpperCase(); }
+function tutorDetectLang(text) {
+  // Pack Line1FixA (F6, 2026-11-12): reply language follows the
+  // student's CURRENT message, detected from its script — Persian
+  // is written in the Arabic script, English in Latin letters.
+  // Exam terms stay English inside Persian messages, so Persian
+  // wins once Arabic-script letters are at least a quarter of all
+  // letters (and at least 3, so a stray borrowed word never flips
+  // an English message).
+  const s = String(text || '');
+  const ar = (s.match(/[\u0600-\u06FF]/g) || []).length;
+  if (ar < 3) return 'en';
+  const la = (s.match(/[A-Za-z]/g) || []).length;
+  return ar * 4 >= ar + la ? 'fa' : 'en';
+}
 function tutorSystemPrompt(lang, excerpts, nearest) {
   const langName = lang === 'fa' ? 'Persian (Farsi)' : 'English';
   const blocks = excerpts.map(function (e) { return '[' + tutorLessonLabel(e.id) + '] ' + e.title + '\n' + e.text; }).join('\n\n');
@@ -5931,7 +5966,15 @@ const TUTOR_VOICE_DEFAULTS = { enVoice: 'CwhRBWXzGAHq8TQ4Fs17', faVoice: 'Mn0jJ3
 // Before this fix the tutor routes accepted only the owner
 // session, so a real signed-in student was 401'd on every call.
 async function tutorAdmit(request, env, email) {
-  try { if (await authed(request, env)) return true; return await studentAuthed(request, env, email); } catch (e) { return false; }
+  // Pack Line1FixA (F5, 2026-11-12): the STUDENT session is checked
+  // FIRST. Every tutorAdmit caller is an /api/academy/* student
+  // route; checking the owner session first sent every student
+  // token through authed()'s owner-miss path — a tok: KV miss, the
+  // SessFix retry ladder (200+500+1000 ms of sleeps + re-reads) and
+  // a cross-deployment bridge fetch — before the student check was
+  // even tried, on EVERY cold call. Owner tokens still admit; they
+  // now pay one fast stok: miss first.
+  try { if (await studentAuthed(request, env, email)) return true; return await authed(request, env); } catch (e) { return false; }
 }
 
 async function tutorGate(env, rawEmail, readOnly, origin) {
@@ -13174,12 +13217,12 @@ async function handleRequest(request, env, ctx) {
             }
             return t + '?t=' + tok;
           }).join('\n');
-          return new Response(text, { status: 200, headers: academyVideoMediaHeaders('application/vnd.apple.mpegurl') });
+          return new Response(text, { status: 200, headers: academyVideoMediaHeaders('application/vnd.apple.mpegurl', origin) });
         }
         if (file === 'captions.vtt') {
           const cap = await academyVideoGet(env, objKey);
           if (!cap) return json({ ok: false, error: 'not_found' }, 404, origin);
-          return new Response(cap.body, { status: 200, headers: academyVideoMediaHeaders('text/vtt; charset=utf-8') });
+          return new Response(cap.body, { status: 200, headers: academyVideoMediaHeaders('text/vtt; charset=utf-8', origin) });
         }
         // Segment: full-object stream, or a single Range slice when the
         // player asks (the B2 range read keeps the 206 semantics local,
@@ -13190,11 +13233,11 @@ async function handleRequest(request, env, ctx) {
           const head = await academyVideoHead(env, objKey);
           if (!head) return json({ ok: false, error: 'not_found' }, 404, origin);
           const start = parseInt(rm[1], 10);
-          if (start >= head.size) return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */' + head.size, 'Cache-Control': 'private, no-store' } });
+          if (start >= head.size) { const h416 = { 'Content-Range': 'bytes */' + head.size, 'Cache-Control': 'private, no-store', 'Vary': 'Origin' }; if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) h416['Access-Control-Allow-Origin'] = origin; else if (!origin) h416['Access-Control-Allow-Origin'] = '*'; return new Response(null, { status: 416, headers: h416 }); } // Pack Line1FixA (F1): the inline 416 is a media response too — same CORS rule, or the player sees a network error instead of the range verdict
           const end = rm[2] ? Math.min(parseInt(rm[2], 10), head.size - 1) : head.size - 1;
           const part = await academyVideoGet(env, objKey, { offset: start, length: end - start + 1 });
           if (!part) return json({ ok: false, error: 'not_found' }, 404, origin);
-          const h = academyVideoMediaHeaders('video/mp2t');
+          const h = academyVideoMediaHeaders('video/mp2t', origin);
           h['Content-Range'] = 'bytes ' + start + '-' + end + '/' + head.size;
           h['Accept-Ranges'] = 'bytes';
           h['Content-Length'] = String(end - start + 1);
@@ -13202,7 +13245,7 @@ async function handleRequest(request, env, ctx) {
         }
         const seg = await academyVideoGet(env, objKey);
         if (!seg) return json({ ok: false, error: 'not_found' }, 404, origin);
-        const sh = academyVideoMediaHeaders('video/mp2t');
+        const sh = academyVideoMediaHeaders('video/mp2t', origin);
         sh['Accept-Ranges'] = 'bytes';
         if (typeof seg.size === 'number') sh['Content-Length'] = String(seg.size);
         return new Response(seg.body, { status: 200, headers: sh });
@@ -13229,8 +13272,17 @@ async function handleRequest(request, env, ctx) {
         if (!(await tutorAdmit(request, env, email))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
         const message = String(d.message || '').trim();
         if (!message || message.length > 4000) return json({ ok: false, error: 'invalid_message' }, 400, origin);
-        const lang = String(d.lang || 'en').trim().toLowerCase();
+        let lang = String(d.lang || 'en').trim().toLowerCase();
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'invalid_lang' }, 400, origin);
+        // Pack Line1FixA (F6): the reply language is the language
+        // of the student's CURRENT message, not the client-sent UI
+        // language. In one thread an English first answer anchored
+        // the follow-up: the same question asked in Persian was
+        // answered in English, because the prompt was built for the
+        // UI language and the history reinforced it. Retrieval, the
+        // system prompt, the fallbacks and the verification pass
+        // all key off this turn language from here on.
+        lang = tutorDetectLang(message);
         const lessonId = d.lessonId ? String(d.lessonId).trim().toLowerCase() : '';
         if (lessonId && (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40)) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
         let attachment = null;
@@ -13304,8 +13356,23 @@ async function handleRequest(request, env, ctx) {
         try { out = await tutorCallChain(env, cfg, turns, attachment); } catch (e) { out = null; }
         if (!out) return json({ ok: false, error: 'provider_unavailable' }, 502, origin);
         await spendUnit(out.kind);
+        // Pack Line1FixA (F6): deterministic draft-language guard.
+        // If the draft's script does not match the student's
+        // current-message language, regenerate ONCE with a strict
+        // language instruction; a draft that STILL mismatches is
+        // blanked, so the localized static fallback below serves
+        // instead of a wrong-language answer (and the verification
+        // pass is skipped for it, exactly like an empty draft).
+        if (tutorDetectLang(out.text) !== lang && budgetLeft()) {
+          const strictLangTurns = [{ role: 'system', text: sysText + '\n\nSTRICT LANGUAGE RULE: your previous draft was written in the wrong language. The student\'s current message is in ' + (lang === 'fa' ? 'Persian (Farsi)' : 'English') + '. Write the ENTIRE answer in ' + (lang === 'fa' ? 'Persian (Farsi)' : 'English') + ' (exam terms stay in English).' }].concat(turns.slice(1));
+          let outLang = null;
+          try { outLang = await tutorCallChain(env, cfg, strictLangTurns, attachment); } catch (e) { outLang = null; }
+          if (outLang) { await spendUnit(outLang.kind); out = outLang; }
+        }
+        const langOkDraft = tutorDetectLang(out.text) === lang;
         let stripped = tutorStripMisconception(out.text);
         let concept = stripped.concept;
+        if (!langOkDraft) stripped = { text: '', concept: concept };
         // SCAN fix (2026-11-11): a draft that is ONLY the hidden
         // concept line strips to empty — never fall back to the raw
         // model text (it would leak the hidden line to the student).
@@ -13724,12 +13791,61 @@ async function handleRequest(request, env, ctx) {
         const lessonId = String(d.lessonId || '').trim().toLowerCase();
         if (!ACADEMY_VIDEO_LESSON_RE.test(lessonId) || lessonId.length > 40) return json({ ok: false, error: 'invalid_lesson' }, 400, origin);
         const lang = TUTOR_LANGS.indexOf(String(d.lang || 'en').toLowerCase()) !== -1 ? String(d.lang).toLowerCase() : 'en';
+        // Pack Line1FixA (F3, 2026-11-12): full mock exams. The
+        // stated unlock rules (catalog copy, assets/data.js) are
+        // enforced HERE, in the serving path: Mock 1 after Module 8
+        // Lesson 6 is complete; Mock 2 after M8 L7 AND a finished
+        // Mock 1 attempt on record; Mock 3 after M8 L7 ("in the
+        // final week" is guidance copy, not a checkable state).
+        // NOTE (owner decision 2026-11-12 17:46): text + quiz
+        // serving has NO video-readiness gate anywhere in this
+        // worker — academyVideoReady is consulted ONLY by the
+        // video-token route — so video-less lessons/modules serve
+        // text and quizzes exactly as before.
+        const isMock = /^mock-[123]$/.test(lessonId);
+        if (isMock) {
+          const progM = (await acadKvGet(env, 'acprogress:' + g.ne, { type: 'json' }).catch(() => null)) || {};
+          const lsM = progM.lessons || {};
+          const doneM = function (id) { return !!(lsM[id] && lsM[id].completedAt); };
+          let unlockedM = false;
+          if (lessonId === 'mock-1') unlockedM = doneM('m8-l6');
+          else if (lessonId === 'mock-3') unlockedM = doneM('m8-l7');
+          else if (doneM('m8-l7')) {
+            const hM = await acadKvGet(env, 'acattempt:' + g.ne + ':mock-1', { type: 'json' }).catch(() => null);
+            unlockedM = !!(hM && Array.isArray(hM.history) && hM.history.length);
+          }
+          if (!unlockedM) return json({ ok: false, error: 'mock_locked', lessonId: lessonId }, 403, origin);
+        }
         const bix = await tutorBankIndex(env, lang);
         if (!bix || !bix.qmeta || !Object.keys(bix.qmeta).length) return json({ ok: false, error: 'bank_not_seeded' }, 503, origin);
-        const pool = Object.keys(bix.qmeta).filter(function (x) { return bix.qmeta[x].l === lessonId; }).sort();
+        let pool = Object.keys(bix.qmeta).filter(function (x) { return bix.qmeta[x].l === lessonId; }).sort();
+        if (isMock && pool.length < 100) {
+          // Pack Line1FixA (F3) + owner scope ruling 2026-11-12
+          // 18:04: the dedicated mock bank (300 items in the
+          // assessment map's design) was NEVER authored — the seed
+          // corpus carries zero mock-* items (1,350 EN + 320 FA
+          // lesson questions only), and the checkpoint pools do
+          // not exist either. This pack authors NO questions and
+          // does NOT substitute lesson-bank items into mocks.
+          // Until the production line authors the bank and seeds
+          // it at the location below, an unlocked mock answers
+          // with the HONEST not-ready state (the portal renders
+          // "the mock bank is in production" — pack B, F8 honesty
+          // pattern). MOCK-BANK DATA LOCATION (drop-in, no code
+          // change): items in the canonical lesson-bank schema,
+          // compiled into the same bank keys this route already
+          // reads — tutor:bank:<lang>:index qmeta entries with
+          // l = 'mock-1'|'mock-2'|'mock-3' and the items
+          // themselves (lessonId = the mock id) in the
+          // tutor:bank:<lang>:<moduleId> chunks. The moment >= 100
+          // are seeded under a mock id, this path serves them
+          // verbatim with the timed, no-feedback semantics.
+          return json({ ok: false, error: 'mock_bank_not_ready', lessonId: lessonId, available: pool.length, required: 100 }, 503, origin);
+        }
         if (!pool.length) return json({ ok: false, error: 'no_bank_for_lesson' }, 404, origin);
         let count = Number.isInteger(d.count) ? d.count : 10;
         count = Math.min(20, Math.max(1, Math.min(count, pool.length)));
+        if (isMock) count = 100;
         const attemptId = 'att-' + Date.now().toString(36) + '-' + randHex(6);
         const served = pool.slice().sort(function (a, b) { return (tutorHashStr(g.ne + '|' + lessonId + '|' + attemptId + ':' + a) - tutorHashStr(g.ne + '|' + lessonId + '|' + attemptId + ':' + b)) || (a < b ? -1 : 1); }).slice(0, count);
         const questions = [];
@@ -13738,9 +13854,12 @@ async function handleRequest(request, env, ctx) {
           if (!qq) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
           questions.push({ qid: qq.id, lessonId: qq.lessonId, moduleId: qq.moduleId, concept: qq.concept, difficulty: qq.difficulty || null, trap: qq.trap || null, stem: qq.stem, options: acadServedOptions(qq, attemptId + ':' + qid) });
         }
-        await env.LEADS.put('acquiz:' + g.ne + ':' + attemptId, JSON.stringify({ lessonId: lessonId, lang: lang, servedIds: served, answers: {}, answerAt: {}, startedAt: Date.now() }), { expirationTtl: 86400 });
+        const startedAtS = Date.now();
+        await env.LEADS.put('acquiz:' + g.ne + ':' + attemptId, JSON.stringify(Object.assign({ lessonId: lessonId, lang: lang, servedIds: served, answers: {}, answerAt: {}, startedAt: startedAtS }, isMock ? { mock: true, deadlineAt: startedAtS + 3 * 3600 * 1000 } : {})), { expirationTtl: 86400 });
         await acsecEvent(env, g.ne, 'quiz'); // Pack AcademyProtect: harvest counter (awaited; acsecEvent swallows its own errors, so counting never blocks or breaks a serve)
-        return json({ ok: true, attemptId: attemptId, lessonId: lessonId, total: served.length, questions: questions }, 200, origin);
+        const serveResp = { ok: true, attemptId: attemptId, lessonId: lessonId, total: served.length, questions: questions };
+        if (isMock) { serveResp.mock = true; serveResp.deadlineAt = startedAtS + 3 * 3600 * 1000; serveResp.durationSecs = 10800; }
+        return json(serveResp, 200, origin);
       }
       if (path === '/api/academy/quiz/answer' && request.method === 'POST') {
         if (limited('acquiz:' + ip, 240, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -13761,6 +13880,25 @@ async function handleRequest(request, env, ctx) {
         if (att.servedIds.indexOf(qid) === -1) return json({ ok: false, error: 'not_served' }, 400, origin);
         const qq = await tutorBankQuestion(env, att.lang || 'en', qid);
         if (!qq) return json({ ok: false, error: 'bank_incomplete' }, 503, origin);
+        if (att.mock) {
+          // Pack Line1FixA (F3): mock semantics — the answer is
+          // RECORDED but never graded here (no correct key, no
+          // explanation, no feedback until the exam is finished),
+          // the mistake-bank harvest happens at finish, and
+          // answers close at the 3-hour deadline (+5 min grace;
+          // finishing after the deadline still grades). A
+          // re-answer replays the recorded state and records
+          // nothing twice, like the lesson path.
+          if (att.deadlineAt && Date.now() > att.deadlineAt + 5 * 60000) return json({ ok: false, error: 'mock_time_expired' }, 409, origin);
+          const alreadyM = !!(att.answers && att.answers[qid] !== undefined);
+          if (!alreadyM) {
+            att.answers = att.answers || {}; att.answerAt = att.answerAt || {};
+            att.answers[qid] = chosen; att.answerAt[qid] = Date.now();
+            await env.LEADS.put(akey, JSON.stringify(att), { expirationTtl: 86400 });
+          }
+          const answeredCountM = Object.keys(att.answers || {}).length;
+          return json({ ok: true, qid: qid, mock: true, recorded: !alreadyM, answeredCount: answeredCountM, total: att.servedIds.length, allAnswered: answeredCountM === att.servedIds.length }, 200, origin);
+        }
         let grade;
         if (att.answers && att.answers[qid] !== undefined) {
           grade = acadGradePayload(qq, att.answers[qid]); // re-answer: replay the recorded feedback, record nothing twice (engine parity)
@@ -13799,6 +13937,7 @@ async function handleRequest(request, env, ctx) {
           const grade = acadGradePayload(qq, chosen);
           if (chosen === null) { acadQuizMistakeWrite(mk, qq, null, nowF); mkDirty = true; }
           else if (grade.correct) correctCount++;
+          else if (att.mock) { acadQuizMistakeWrite(mk, qq, chosen, nowF); mkDirty = true; } // Pack Line1FixA (F3): mock answers were recorded ungraded — wrong answers join the mistake bank HERE, at finish (lesson answers were already harvested at answer time).
           feedback.push(Object.assign({ qid: qid, concept: qq.concept, trap: qq.trap || null, chosen: chosen }, grade));
         }
         if (mkDirty) await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk));
@@ -13833,8 +13972,14 @@ async function handleRequest(request, env, ctx) {
         prog.lessons[att.lessonId] = lp;
         await acadKvPut(env, 'acprogress:' + g.ne, JSON.stringify(prog));
         await env.LEADS.delete(akey);
-        const ready = await acadSnapshotAppend(env, g.ne);
-        return json({ ok: true, attemptId: attemptId, lessonId: att.lessonId, score: score, correctCount: correctCount, total: total, route: route, feedback: feedback, timing: timing, answers: att.answers || {}, servedIds: att.servedIds, readiness: { score: ready.score, components: ready.components, history: ready.history, gate: ready.gate } }, 200, origin);
+        // Pack Line1FixA (F2): the readiness snapshot is
+        // bookkeeping AFTER every state write has landed — a
+        // transient KV failure inside it (its attempt scan lists
+        // keys uncaught) must never 500 a completed grade. On
+        // failure the response simply omits readiness; the next
+        // successful snapshot recomputes it from the same records.
+        const ready = await acadSnapshotAppend(env, g.ne).catch(function () { return null; });
+        return json({ ok: true, attemptId: attemptId, lessonId: att.lessonId, score: score, correctCount: correctCount, total: total, route: route, feedback: feedback, timing: timing, answers: att.answers || {}, servedIds: att.servedIds, readiness: ready ? { score: ready.score, components: ready.components, history: ready.history, gate: ready.gate } : null }, 200, origin);
       }
       if (path === '/api/academy/review/answer' && request.method === 'POST') {
         if (limited('acreview:' + ip, 240, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -13852,7 +13997,33 @@ async function handleRequest(request, env, ctx) {
         const qq = await tutorBankQuestion(env, lang, qid);
         if (!qq) return json({ ok: false, error: 'question_not_found' }, 404, origin);
         const mk = await tutorLoadMistakes(env, g.ne);
-        const item = mk.items.find(function (i) { return i && i.qid === qid && !i.resolved; });
+        let item = mk.items.find(function (i) { return i && i.qid === qid && !i.resolved; });
+        if (!item && d.item && typeof d.item === 'object') {
+          // Pack Line1FixA (F2, 2026-11-12): adopt-on-first-contact.
+          // The review queue is served from the portal's LOCAL
+          // engine state; its items reach the server only through
+          // the best-effort first-sign-in progress-sync. When that
+          // sync never landed (the sample account's seed queue met
+          // the 2026-11-12 KV-cap window), the server held no open
+          // mistake and EVERY review answer failed 409
+          // no_open_mistake behind the client's generic "Something
+          // went wrong". A client-presented item is adopted ONLY
+          // when it validates against the BANK record for the same
+          // qid (lesson/module/concept must match the bank exactly;
+          // unresolved; stage inside the ladder; already due) —
+          // the bank, never the client, stays the authority on
+          // what the question is. The portal change that sends the
+          // item is pack B's; without it this branch never fires
+          // and the 409 stands, exactly as before.
+          const ci = d.item;
+          const stageOkA = Number.isInteger(ci.stage) && ci.stage >= 0 && ci.stage < TUTOR_SPACING_DAYS.length;
+          const dueOkA = typeof ci.dueAt === 'number' && isFinite(ci.dueAt) && ci.dueAt <= Date.now() + 60000;
+          if (ci.qid === qid && ci.lessonId === qq.lessonId && ci.moduleId === qq.moduleId && ci.concept === qq.concept && ci.resolved !== true && stageOkA && dueOkA) {
+            item = { qid: qid, lessonId: qq.lessonId, moduleId: qq.moduleId, concept: qq.concept, trap: qq.trap || null, chosen: null, at: Date.now(), stage: ci.stage, dueAt: ci.dueAt, streak: Math.min(1, Math.max(0, Number.isInteger(ci.streak) ? ci.streak : 0)), resolved: false, resolvedAt: null, reviews: Math.max(0, Number.isInteger(ci.reviews) ? ci.reviews : 0) };
+            mk.items.push(item);
+            if ((mk.totalEver || 0) < mk.items.length) mk.totalEver = mk.items.length;
+          }
+        }
         if (!item) return json({ ok: false, error: 'no_open_mistake' }, 409, origin);
         // engine.js submitReview, verbatim semantics.
         const nowR = Date.now();
@@ -13864,8 +14035,12 @@ async function handleRequest(request, env, ctx) {
           else { item.stage = Math.min((item.stage || 0) + 1, TUTOR_SPACING_DAYS.length - 1); item.dueAt = nowR + TUTOR_SPACING_DAYS[item.stage] * TUTOR_DAY_MS; }
         } else { item.streak = 0; item.stage = 0; item.chosen = chosen; item.dueAt = nowR + TUTOR_DAY_MS; }
         await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk));
-        const ready = await acadSnapshotAppend(env, g.ne);
-        return json({ ok: true, qid: qid, correct: correct, resolved: item.resolved, streak: item.streak, stage: item.stage, nextDueAt: item.resolved ? null : item.dueAt, correctKey: qq.correct, explain: qq.explain || '', options: (qq.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === qq.correct }; }), readiness: { score: ready.score, history: ready.history, gate: ready.gate } }, 200, origin);
+        // Pack Line1FixA (F2): same snapshot resilience as
+        // quiz/finish — the grade above has already been written;
+        // a snapshot failure degrades to readiness:null, never a
+        // 500 the student reads as "your answer was lost".
+        const ready = await acadSnapshotAppend(env, g.ne).catch(function () { return null; });
+        return json({ ok: true, qid: qid, correct: correct, resolved: item.resolved, streak: item.streak, stage: item.stage, nextDueAt: item.resolved ? null : item.dueAt, correctKey: qq.correct, explain: qq.explain || '', options: (qq.options || []).map(function (o) { return { key: o.key, text: o.text, why: o.why || '', isCorrect: o.key === qq.correct }; }), readiness: ready ? { score: ready.score, history: ready.history, gate: ready.gate } : null }, 200, origin);
       }
 
 
