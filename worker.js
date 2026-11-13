@@ -3860,6 +3860,231 @@ async function buildTimeline(env, q) {
   const limit = Math.max(1, q.limit || 200);
   return out.length > limit ? out.slice(out.length - limit) : out;
 }
+/* ================= Pack TelephonySmarter (2026-11-12) =================
+   Four additions to the calls plumbing, all on the existing
+   cfg:calls + brain postures, all best-effort (nothing here may
+   fail or delay a webhook/ingest response):
+   1. CALL TRANSCRIPTION + SUMMARY. When a call record GAINS a
+      recording (on the Twilio path recordings land on the /status
+      callback — ENDPOINT-AUDIT OBS-2), a pipeline transcribes the
+      recording through the SITE's own provider pool: the ai-chat
+      worker's /internal/brain-audio (Groq Whisper), reached with
+      aiFetch + the brain secret, exactly like the portal voice
+      route (/api/admin/brain/voice) — then summarises the
+      transcript with brainJsonCall (site brain, its own daily
+      cap). Three-pools law: the Academy tutor chain (cfg:tutor)
+      and the EH Receptionist's providers are never touched.
+      Gated on cfg:calls.transcribe === true (the owner's opt-in
+      tick on the Calls setup card); while off, while the brain is
+      unconfigured, or when a provider leg fails, the record's
+      transcriptStatus honestly reads 'unavailable' / 'failed'
+      instead of pretending. Lifecycle: pending -> done | failed |
+      unavailable.
+   2. COMPACT LIST (with the /api/admin/calls shaping below): the
+      list payload carries only the summary's one-line preview;
+      the transcript + full summary are served per call by
+      /api/admin/calls/:id/detail, fetched by the portal ONLY when
+      the owner expands that call's section (owner ruling
+      2026-11-12: no long texts in the list).
+   3. MISSED-CALL RECOVERY. A genuinely-new INBOUND call ending
+      no-answer / missed / busy creates ONE follow-up task in the
+      CRM task system (dedupe: one per caller number per 4 h via
+      callrec:<last10>) carrying a ready-to-send recovery message
+      as an OWNER-APPROVAL DRAFT. No code path in this pack sends
+      anything — the draft rides the task; sending stays the
+      owner's own click in the SMS workspace.
+   4. CALLBACK-TIME EXTRACTION. A deterministic parser over the
+      transcript (no model in this path): when the caller states
+      a callback time ("call me back tomorrow at 3 pm"), a CRM
+      task is created at that America/Vancouver time, labelled
+      auto-extracted, with the caller's verbatim sentence in the
+      task's quote field. Ambiguous or absent -> nothing created.
+   Explicitly NOT in this pack (owner ruling 2026-11-12): no
+   AI-proposed call outcome and no AI-proposed CRM stage anywhere
+   — outcomes stay the owner's (the push outcome buttons) and
+   stages stay with the existing rules. */
+/* [TSMART-PARSE-BEGIN] Callback-time parser — pure functions of
+   (text, nowMs); the pack's pins slice this block out and run it
+   against fixed clocks. Vancouver wall-clock throughout; digits
+   only (spelled-out numbers are out of scope by design). */
+function vanParts(ms) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).formatToParts(new Date(ms));
+  const p = {};
+  for (const x of parts) p[x.type] = x.value;
+  return { y: parseInt(p.year, 10), mo: parseInt(p.month, 10), d: parseInt(p.day, 10), h: parseInt(p.hour, 10) % 24, mi: parseInt(p.minute, 10) };
+}
+function vanYmdOf(ms) { const p = vanParts(ms); return p.y + '-' + String(p.mo).padStart(2, '0') + '-' + String(p.d).padStart(2, '0'); }
+function vanAddDays(y, mo, d, n) { const t = new Date(Date.UTC(y, mo - 1, d + n)); return { y: t.getUTCFullYear(), mo: t.getUTCMonth() + 1, d: t.getUTCDate() }; }
+function vanWallToUtcMs(y, mo, d, h, mi) {
+  const target = Date.UTC(y, mo - 1, d, h, mi, 0);
+  let guess = target;
+  for (let i = 0; i < 3; i++) {
+    const p = vanParts(guess);
+    const shown = Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, 0);
+    const diff = target - shown;
+    if (!diff) break;
+    guess += diff;
+  }
+  return guess;
+}
+const TSMART_WD = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+function parseCallbackWhen(s, nowMs) {
+  const now = vanParts(nowMs);
+  const todayDow = new Date(Date.UTC(now.y, now.mo - 1, now.d)).getUTCDay();
+  const at = function (dayOff, h, mi) { const dd = vanAddDays(now.y, now.mo, now.d, dayOff); return vanWallToUtcMs(dd.y, dd.mo, dd.d, h, mi || 0); };
+  const future = function (ms) { return (ms && ms > nowMs + 10 * 60000) ? ms : null; };
+  let m = s.match(/\bin (\d{1,2}) hours?\b/);
+  if (m) { const n = parseInt(m[1], 10); if (n >= 1 && n <= 72) return future(nowMs + n * 3600000); return null; }
+  let hh = null, mm = 0, ampm = '';
+  m = s.match(/\b(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?)?\b/);
+  if (m) { const h0 = parseInt(m[1], 10), m0 = parseInt(m[2], 10); if (h0 <= 23 && m0 <= 59) { hh = h0; mm = m0; ampm = m[3] || ''; } }
+  if (hh === null) { m = s.match(/\b(\d{1,2})\s*(a\.?m\.?|p\.?m\.?)\b/); if (m) { const h0 = parseInt(m[1], 10); if (h0 >= 1 && h0 <= 12) { hh = h0; ampm = m[2]; } } }
+  if (hh === null) { m = s.match(/\b(?:at|after|around|by)\s+(\d{1,2})\b/); if (m) { const h0 = parseInt(m[1], 10); if (h0 >= 1 && h0 <= 12) hh = h0; } }
+  let hourOpts = null;
+  if (hh !== null) {
+    if (ampm) { let h24 = hh % 12; if (ampm.charAt(0) === 'p') h24 += 12; hourOpts = [h24]; }
+    else if (mm || hh > 12 || hh === 0) hourOpts = [hh];
+    else hourOpts = [hh, hh + 12];
+  }
+  const daypartH = /\bmorning\b/.test(s) ? 9 : (/\bafternoon\b/.test(s) ? 13 : (/\bevening\b|\btonight\b/.test(s) ? 18 : null));
+  let dayOff = null;
+  if (/\btomorrow\b/.test(s)) dayOff = 1;
+  else if (/\b(today|tonight)\b/.test(s) || /\bthis (evening|afternoon|morning)\b/.test(s)) dayOff = 0;
+  else { const wm = s.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/); if (wm) dayOff = (TSMART_WD[wm[1]] - todayDow + 7) % 7; }
+  if (hourOpts) {
+    if (dayOff === null) {
+      for (const h24 of hourOpts) { const t = future(at(0, h24, mm)); if (t) return t; }
+      for (const h24 of hourOpts) { const t = future(at(1, h24, mm)); if (t) return t; }
+      return null;
+    }
+    for (const h24 of hourOpts) { const t = future(at(dayOff, h24, mm)); if (t) return t; }
+    return null;
+  }
+  if (/\bnoon\b/.test(s)) {
+    if (dayOff === null) return future(at(0, 12, 0)) || future(at(1, 12, 0));
+    return future(at(dayOff, 12, 0));
+  }
+  if (daypartH !== null) {
+    if (dayOff === null) dayOff = 1;
+    return future(at(dayOff, daypartH, 0));
+  }
+  return null;
+}
+function extractCallbackTime(transcript, nowMs) {
+  const text = String(transcript || '');
+  if (!text.trim()) return null;
+  let chunks = text.split(/(?<=[.!?])\s+|\n+/);
+  if (chunks.length === 1 && text.indexOf(',') !== -1) chunks = text.split(/,\s*/);
+  for (const raw0 of chunks) {
+    const raw = String(raw0 || '').trim();
+    if (!raw) continue;
+    const s = ' ' + raw.toLowerCase().replace(/\s+/g, ' ') + ' ';
+    if (!/(call|phone|ring|reach|get back|try me|contact)/.test(s)) continue;
+    const atMs = parseCallbackWhen(s, nowMs);
+    if (atMs) return { at: new Date(atMs).toISOString(), quote: raw.slice(0, 200) };
+  }
+  return null;
+}
+/* [TSMART-PARSE-END] */
+const CALL_SUMMARY_SYS = 'You summarise a recorded real-estate business phone call from its transcript. ' + 'Use ONLY the facts in the data provided. Never invent prices, dates, addresses, listings, statistics or names. ' + 'Reply with ONLY a JSON object {"oneLine":"...","intent":"...","budget":"...","areas":"...","timeline":"...","nextStep":"..."}. oneLine = one plain sentence (at most ~140 characters) saying what the call was about. intent / budget / areas / timeline = ONLY what the caller actually stated, with figures verbatim where given; use "" when the transcript does not state it — never guess, never round, never convert. nextStep = the concrete next step the transcript itself establishes (for example a callback the caller asked for, or a viewing to arrange), else "". Do NOT propose a CRM stage or a call outcome — that is not your job.';
+async function callTranscribeFinish(env, callId, fields) {
+  try {
+    const rec = await siteKvGet(env, 'call:' + callId, { type: 'json' });
+    if (!rec) return;
+    Object.assign(rec, fields);
+    rec.updated_at = new Date().toISOString();
+    await siteKvPut(env, 'call:' + callId, JSON.stringify(rec));
+  } catch (e) {}
+}
+async function callCallbackTask(env, rec, cb) {
+  try {
+    if (rec.callbackTaskId) return rec.callbackTaskId;
+    const whenMs = Date.parse(cb.at);
+    if (!isFinite(whenMs)) return '';
+    const timeTxt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hourCycle: 'h12' }).format(new Date(whenMs));
+    const who = rec.matchedName || (rec.direction === 'in' ? rec.from : rec.to) || 'caller';
+    const task = { id: 'tk_' + randHex(6), email: normEmail(rec.matchedEmail || ''), text: '📞 Call back ' + who + ' — ' + timeTxt + ' (auto-extracted from the call)', due: vanYmdOf(whenMs), dueAt: new Date(whenMs).toISOString(), done: false, created_at: new Date().toISOString(), source: 'call-callback', callId: rec.id, autoExtracted: true, quote: String(cb.quote || '').slice(0, 200) };
+    await env.LEADS.put('task:' + task.id, JSON.stringify(task));
+    await idxAdd(env, 'tasks', task.id);
+    return task.id;
+  } catch (e) { return ''; }
+}
+async function callTranscribeRun(env, callId) {
+  try {
+    let rec = await siteKvGet(env, 'call:' + callId, { type: 'json' });
+    if (!rec || !rec.recordingUrl) return;
+    if (rec.kind === 'voicemail') return; // Voicemail §6: voicemail records are transcribed by the voicemail path exactly once — never by this scheduler
+    if (rec.transcript) return;
+    const st = String(rec.transcriptStatus || '');
+    if (st === 'done') return;
+    if (st === 'pending' && rec.transcriptClaimAt && (Date.now() - Date.parse(rec.transcriptClaimAt)) < 600000) return;
+    const cfg = await getCallsCfg(env);
+    const bcfg = await brainCfg(env);
+    if (!cfg || cfg.transcribe !== true || !bcfg.secret) {
+      if (st !== 'unavailable') await callTranscribeFinish(env, callId, { transcriptStatus: 'unavailable' });
+      return;
+    }
+    rec.transcriptStatus = 'pending';
+    rec.transcriptClaimAt = new Date().toISOString();
+    rec.updated_at = rec.transcriptClaimAt;
+    await siteKvPut(env, 'call:' + callId, JSON.stringify(rec));
+    let audioBuf = null, ferr = '';
+    try {
+      const cu = new URL(rec.recordingUrl);
+      if (cu.protocol !== 'https:') throw new Error('bad_url');
+      const rheaders = {};
+      if (cfg.provider === 'twilio' && cfg.twilioAccountSid && cfg.twilioAuthToken && /(^|\.)twilio\.com$/.test(cu.hostname)) rheaders.Authorization = 'Basic ' + btoa(cfg.twilioAccountSid + ':' + cfg.twilioAuthToken);
+      const up = await fetch(rec.recordingUrl, { headers: rheaders });
+      if (!up.ok) ferr = 'recording_fetch_' + up.status;
+      else {
+        audioBuf = await up.arrayBuffer();
+        if (!audioBuf.byteLength) ferr = 'recording_empty';
+        else if (audioBuf.byteLength > 8500000) ferr = 'recording_too_large';
+      }
+    } catch (e) { ferr = 'recording_fetch_error'; }
+    if (ferr) { await callTranscribeFinish(env, callId, { transcriptStatus: 'failed', transcriptError: ferr }); return; }
+    let b64 = '';
+    { const bytes = new Uint8Array(audioBuf); const CH = 32768; for (let i = 0; i < bytes.length; i += CH) b64 += String.fromCharCode.apply(null, bytes.subarray(i, i + CH)); b64 = btoa(b64); }
+    const res = await aiFetch(env, '/internal/brain-audio', { audioBase64: b64, mime: 'audio/mpeg', lang: cfg.transcribeLang === 'en' ? 'en' : 'fa' }, bcfg.secret);
+    const j = res.j || null;
+    if (!j || !j.ok || !String(j.text || '').trim()) { await callTranscribeFinish(env, callId, { transcriptStatus: 'failed', transcriptError: 'transcribe_' + ((j && j.error) || 'failed') }); return; }
+    const transcript = String(j.text).slice(0, 4000);
+    let summary = null, summaryStatus = 'unavailable';
+    const sr = await brainJsonCall(env, { task: 'extract', system: CALL_SUMMARY_SYS, prompt: 'Call transcript:\n' + brainRedactPii(transcript).slice(0, 3500), maxTokens: 700 }, { oneLine: 'str', intent: 'str', budget: 'str', areas: 'str', timeline: 'str', nextStep: 'str' });
+    if (sr.ok && sr.json) {
+      summary = { oneLine: brainStr(sr.json.oneLine, 220), intent: brainStr(sr.json.intent, 300), budget: brainStr(sr.json.budget, 200), areas: brainStr(sr.json.areas, 200), timeline: brainStr(sr.json.timeline, 200), nextStep: brainStr(sr.json.nextStep, 300), at: new Date().toISOString(), via: sr.via || '' };
+      summaryStatus = 'done';
+    } else summaryStatus = (sr && (sr.error === 'brain_cap' || sr.error === 'ai_not_configured')) ? 'unavailable' : 'failed';
+    let cbTaskId = rec.callbackTaskId || '';
+    const cb = extractCallbackTime(transcript, Date.now());
+    if (cb) cbTaskId = await callCallbackTask(env, rec, cb);
+    await callTranscribeFinish(env, callId, { transcriptStatus: 'done', transcript: transcript, transcriptAt: new Date().toISOString(), callSummary: summary, summaryStatus: summaryStatus, callbackTaskId: cbTaskId });
+  } catch (e) {
+    try { await callTranscribeFinish(env, callId, { transcriptStatus: 'failed', transcriptError: 'pipeline_error' }); } catch (e2) {}
+  }
+}
+const CALL_MISSED_STATUSES = ['no-answer', 'missed', 'busy'];
+async function callRecoverySchedule(env, call) {
+  try {
+    if (!call || call.direction !== 'in') return;
+    if (CALL_MISSED_STATUSES.indexOf(call.status) === -1) return;
+    const cfg = await getCallsCfg(env);
+    if (!cfg) return;
+    const other = call.from || '';
+    const last10 = phoneLast10(other);
+    if (last10.length !== 10) return;
+    if (cfg.forwardTo && phoneLast10(cfg.forwardTo) === last10) return;
+    const dKey = 'callrec:' + last10;
+    const prev = await env.LEADS.get(dKey, { type: 'json' });
+    if (prev && prev.at && (Date.now() - Date.parse(prev.at)) < 4 * 3600000) return;
+    await env.LEADS.put(dKey, JSON.stringify({ callId: call.id, at: new Date().toISOString() }), { expirationTtl: 14400 });
+    const who = call.matchedName || other;
+    const draftBody = 'Hi' + (call.matchedName ? ' ' + String(call.matchedName).slice(0, 60) : '') + ', this is EH REALTY — sorry we missed your call. When is a good time for us to reach you?';
+    const task = { id: 'tk_' + randHex(6), email: normEmail(call.matchedEmail || ''), text: '📞 Missed call from ' + who + ' (' + other + ') — call back', due: todayVancouver(), done: false, created_at: new Date().toISOString(), source: 'call-recovery', callId: call.id, recoveryDraft: { channel: 'sms', body: draftBody, status: 'draft' } };
+    await env.LEADS.put('task:' + task.id, JSON.stringify(task));
+    await idxAdd(env, 'tasks', task.id);
+  } catch (e) {}
+}
 async function storeCall(env, rec, ctx) {
   const prov = String(rec.provider || 'generic').slice(0, 20);
   const pcid = String(rec.providerCallId || '').slice(0, 80);
@@ -3893,6 +4118,7 @@ async function storeCall(env, rec, ctx) {
     merged.screened = true;
     merged.screenReason = String(rec.screenReason || (existing && existing.screenReason) || '').slice(0, 40);
   }
+  const gainedRecording = !!(merged.recordingUrl && !(existing && existing.recordingUrl));
   const isNew = !existing;
   if (isNew) {
     const other = merged.direction === 'in' ? merged.from : merged.to;
@@ -3927,6 +4153,16 @@ async function storeCall(env, rec, ctx) {
     } catch (e) {}
   }
   await siteKvPut(env, 'call:' + id, JSON.stringify(merged));
+  // Pack TelephonySmarter (2026-11-12): a record that GAINS a
+  // recording schedules the transcription + summary pipeline.
+  // Same waitUntil discipline as the screen pop below:
+  // best-effort, never throws, never delays the response.
+  if (gainedRecording) {
+    const tpromise = callTranscribeRun(env, id);
+    let tsched = false;
+    if (ctx && typeof ctx.waitUntil === 'function') { try { ctx.waitUntil(tpromise); tsched = true; } catch (e) {} }
+    if (!tsched) tpromise.catch(function () {});
+  }
   if (isNew) {
     await idxAdd(env, 'calls', id);
     scheduleLookupEnrich(env, 'call', id, merged.direction === 'in' ? merged.from : merged.to, ctx); // Pack TelephonyPreciser: flag-gated Twilio Lookup (cfg:calls.lookup), inert by default
@@ -3960,6 +4196,16 @@ async function storeCall(env, rec, ctx) {
     if (merged.matchedEmail) {
       await pushActivity(env, merged.matchedEmail, 'call', (merged.direction === 'in' ? '📞 Incoming call' : '📞 Outgoing call') + ' · ' + merged.durationSec + 's · ' + merged.status + (merged.listing ? ' · Re: ' + String(merged.listing).replace(/[<>"'&\u0000-\u001F\u007F]/g, '').slice(0, 120) : ''));
       await stampLastTouch(env, merged.matchedEmail); // PM8b: a matched call IS a touch
+    }
+    // Pack TelephonySmarter (2026-11-12): a genuinely-new INBOUND
+    // call that ended no-answer / missed / busy schedules ONE
+    // recovery task carrying an owner-approval draft message.
+    // The helper never sends anything (see its header).
+    if (merged.direction === 'in' && CALL_MISSED_STATUSES.indexOf(merged.status) !== -1) {
+      const rpromise = callRecoverySchedule(env, merged);
+      let rsched = false;
+      if (ctx && typeof ctx.waitUntil === 'function') { try { ctx.waitUntil(rpromise); rsched = true; } catch (e) {} }
+      if (!rsched) rpromise.catch(function () {});
     }
   }
   return { ok: true, id: id, created: isNew };
@@ -20731,7 +20977,31 @@ async function handleRequest(request, env, ctx) {
         if (emailF) calls = calls.filter(function (c) { return c.matchedEmail && normEmail(c.matchedEmail) === emailF; });
         if (phoneF) calls = calls.filter(function (c) { return phoneLast10(c.from) === phoneF || phoneLast10(c.to) === phoneF; });
         const gAlertsTS = tsGuardianAlerts(await tsGuardianRead(env)); // TelephonyStronger: unacknowledged guardian incidents for the banner
-        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', calls: calls.slice(0, limit), guardian: { day: vancouverDay(), alerts: gAlertsTS } }, 200, origin);
+        // Pack TelephonySmarter (2026-11-12): the LIST payload
+        // stays compact — transcripts and full summaries never
+        // ride it (owner ruling: no long texts in the list). Each
+        // item carries the one-line summary preview + availability
+        // flags only; the full text is served on demand by
+        // /api/admin/calls/:id/detail when the owner expands a
+        // call's section.
+        const listCalls = calls.slice(0, limit).map(function (c) {
+          const o = Object.assign({}, c);
+          const t = String(c.transcript || '');
+          delete o.transcript;
+          o.hasTranscript = !!t;
+          o.transcriptStatus = String(c.transcriptStatus || (t ? 'done' : ''));
+          if (c.callSummary && typeof c.callSummary === 'object') { o.summaryOneLine = String(c.callSummary.oneLine || '').slice(0, 220); o.hasSummary = true; }
+          else { o.summaryOneLine = ''; o.hasSummary = false; }
+          delete o.callSummary;
+          return o;
+        });
+        // D1 fix (2026-11-13; QC qc-telephony-smarter-2026-11-12):
+        // a lone 'transcribe' boolean rides the response ROOT so
+        // the portal's Calls setup card can initialise its
+        // Transcribe tick from the stored flag (portal edit P4).
+        // The config object itself is still never returned — the
+        // same posture as the 'configured' boolean beside it.
+        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', transcribe: !!(ccfg && ccfg.transcribe === true), calls: listCalls, guardian: { day: vancouverDay(), alerts: gAlertsTS } }, 200, origin);
       }
       // ---- admin: webhook health guardian (Pack TelephonyStronger) ----
       if (path === '/api/admin/calls/guardian' && request.method === 'GET') {
@@ -20779,6 +21049,18 @@ async function handleRequest(request, env, ctx) {
         const upCt = up.headers.get('Content-Type') || '';
         const safeCt = /^audio\//i.test(upCt) ? upCt : 'audio/mpeg'; // only audio types are ever served from this origin, whatever the upstream claims
         return new Response(up.body, { status: 200, headers: Object.assign({ 'Content-Type': safeCt, 'Cache-Control': 'private, max-age=300', 'X-Content-Type-Options': 'nosniff' }, cors(origin)) });
+      }
+
+      // ---- admin: one call's transcript + full summary ----
+      // Pack TelephonySmarter (2026-11-12): owner session (the
+      // admin gate above), fetched by the portal ONLY when the
+      // owner expands a call's Summary & transcript section, so
+      // long texts never ride the list payload.
+      const callDetailM = path.match(/^\/api\/admin\/calls\/([A-Za-z0-9_-]+)\/detail$/);
+      if (callDetailM && request.method === 'GET') {
+        const call = await siteKvGet(env, 'call:' + callDetailM[1], { type: 'json' });
+        if (!call) return json({ ok: false, error: 'not_found' }, 404, origin);
+        return json({ ok: true, call: { id: call.id, transcript: String(call.transcript || ''), transcriptStatus: String(call.transcriptStatus || (call.transcript ? 'done' : '')), transcriptError: String(call.transcriptError || ''), summaryStatus: String(call.summaryStatus || ''), callSummary: (call.callSummary && typeof call.callSummary === 'object') ? call.callSummary : null } }, 200, origin);
       }
 
       // ---- admin: site maintenance (checks + safe repairs, portal Maintenance tab) ----
