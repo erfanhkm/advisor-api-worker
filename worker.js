@@ -3151,6 +3151,33 @@ async function storeCall(env, rec, ctx) {
     const who = await matchPhoneEmail(env, other);
     if (who) { merged.matchedEmail = who.email; merged.matchedName = who.name || ''; }
   }
+  // Pack CallTagOutcome ADD-1 (2026-11-12): a call that
+  // originated from the site carries its listing tag; any other
+  // call carries none. When a signed-in visitor taps a call
+  // (tel:) link on a listing surface, the site registers a
+  // short-lived intent (callintent:<last10>, written by
+  // POST /api/calls/intent — the phone comes from the account on
+  // file, never from the request). On a genuinely-new INBOUND
+  // record that carries no provider listing, a live intent
+  // attaches its listing to the record — flowing to the pop's
+  // Re: line and the CRM timeline — and is CONSUMED (deleted),
+  // so a later unrelated call inside the window is never
+  // mistagged. An expired intent (in-value exp, checked here
+  // because KV TTL alone is not portable) tags nothing. No
+  // audit record is written on this path. Placement matters
+  // (QC correction, ScreenPop verdict): this resolution runs
+  // BEFORE the record put below, so the stored record carries
+  // the tag in the same single write — no re-put.
+  if (isNew && merged.direction === 'in' && !merged.listing) {
+    try {
+      const iKey = 'callintent:' + phoneLast10(merged.from);
+      const intent = await env.LEADS.get(iKey, { type: 'json' });
+      if (intent && intent.listing && Number(intent.exp) > Date.now()) {
+        merged.listing = String(intent.listing).slice(0, 120);
+        try { await env.LEADS.delete(iKey); } catch (e) {}
+      }
+    } catch (e) {}
+  }
   await env.LEADS.put('call:' + id, JSON.stringify(merged));
   if (isNew) {
     await idxAdd(env, 'calls', id);
@@ -3182,7 +3209,7 @@ async function storeCall(env, rec, ctx) {
       if (!scheduled) popPromise.catch(function () {});
     }
     if (merged.matchedEmail) {
-      await pushActivity(env, merged.matchedEmail, 'call', (merged.direction === 'in' ? '📞 Incoming call' : '📞 Outgoing call') + ' · ' + merged.durationSec + 's · ' + merged.status);
+      await pushActivity(env, merged.matchedEmail, 'call', (merged.direction === 'in' ? '📞 Incoming call' : '📞 Outgoing call') + ' · ' + merged.durationSec + 's · ' + merged.status + (merged.listing ? ' · Re: ' + String(merged.listing).replace(/[<>"'&\u0000-\u001F\u007F]/g, '').slice(0, 120) : ''));
       await stampLastTouch(env, merged.matchedEmail); // PM8b: a matched call IS a touch
     }
   }
@@ -3250,7 +3277,22 @@ async function callScreenPop(env, call, prevTouch) {
       parts.push('Unknown caller');
     }
     if (call.listing) parts.push('Re: ' + call.listing);
-    await puNotifyPush(env, { title: title, body: parts.join(' · ').slice(0, 300), url: '/portal-9f3k7x2q.html' });
+    // Pack CallTagOutcome ADD-2 (2026-11-12): the one-tap
+    // outcome actions ride the ORIGINAL pop — a second,
+    // upsert-triggered push would break this pack's fire-once
+    // discipline. The portal service worker forwards actions[]
+    // and data.callId to showNotification and routes action
+    // clicks to POST /api/calls/outcome. Platforms without
+    // notification actions (iOS web push) simply show the
+    // plain pop; the outcome endpoint is first-write-wins.
+    await puNotifyPush(env, { title: title, body: parts.join(' · ').slice(0, 300), url: '/portal-9f3k7x2q.html',
+      actions: [
+        { action: 'interested', title: 'Interested' },
+        { action: 'followup', title: 'Follow up' },
+        { action: 'notalead', title: 'Not a lead' }
+      ],
+      data: { callId: call.id || '' }
+    });
   } catch (e) {}
 }
 function escapeXml(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
@@ -12256,6 +12298,90 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, token: token }, 200, origin);
       }
 
+
+      // ---- Pack CallTagOutcome ADD-1: site call-intent (visitor-session auth) ----
+      if (path === '/api/calls/intent' && request.method === 'POST') {
+        if (limited('cint:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        // The visitor session decides WHOSE phone this is; the
+        // request body can only name the listing. No session —
+        // or no phone on the account — binds NOTHING and writes
+        // nothing: an anonymous click is never bound
+        // speculatively, so a call that did not originate from
+        // a signed-in site click carries no tag.
+        const iEmail = await userAuth(request, env);
+        if (!iEmail) return json({ ok: true, bound: false }, 200, origin);
+        let idata = null;
+        try { idata = await request.json(); } catch (e) {}
+        const iListing = String((idata || {}).listing || '').slice(0, 120);
+        if (!iListing) return json({ ok: true, bound: false }, 200, origin);
+        // QC advisory (ScreenPop verdict, 2026-11-12): the tag
+        // is hostile text everywhere it is displayed. The site
+        // only ever sends an MLS id, so the intent binds ONLY a
+        // listing that exists in the catalog — arbitrary text
+        // can never be injected into the owner's pop or CRM
+        // timeline through this route.
+        if (!catalogByMls(iListing)) return json({ ok: true, bound: false }, 200, origin);
+        let iUser = (await env.LEADS.get('user:' + iEmail, { type: 'json' })) || null;
+        if (!iUser && normEmail(iEmail) !== iEmail) iUser = (await env.LEADS.get('user:' + normEmail(iEmail), { type: 'json' })) || null;
+        const iLast = phoneLast10(iUser && iUser.profile && iUser.profile.phone);
+        if (iLast.length < 10) return json({ ok: true, bound: false }, 200, origin);
+        // Exactly ONE KV write per bound click: a single-key put
+        // with a 600 s TTL (plus the in-value exp storeCall
+        // checks). Latest click wins (overwrite). No audit.
+        await env.LEADS.put('callintent:' + iLast, JSON.stringify({ listing: iListing, email: normEmail(iEmail), exp: Date.now() + 600000 }), { expirationTtl: 600 });
+        return json({ ok: true, bound: true }, 200, origin);
+      }
+      // ---- Pack CallTagOutcome ADD-2: pop outcome buttons (push-subscription identity auth) ----
+      if (path === '/api/calls/outcome' && request.method === 'POST') {
+        if (limited('cout:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        let odata = null;
+        try { odata = await request.json(); } catch (e) {}
+        odata = odata || {};
+        const oKind = String(odata.outcome || '');
+        if (['interested', 'followup', 'notalead'].indexOf(oKind) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Authentication IS the push-subscription identity: the
+        // portal service worker presents the id of its own live
+        // subscription (sid = sha256(endpoint)[..24], the
+        // derivation /api/admin/push/subscribe mints). Anything
+        // that does not resolve to a stored pushsub: record
+        // fails closed — 401 and zero writes.
+        const oSub = String(odata.subId || '');
+        if (!/^[0-9a-f]{24}$/.test(oSub)) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const oSubRec = await env.LEADS.get('pushsub:' + oSub, { type: 'json' });
+        if (!oSubRec || !oSubRec.endpoint) return json({ ok: false, error: 'unauthorized' }, 401, origin);
+        const oCallId = String(odata.callId || '');
+        if (!/^call_[0-9a-f]{20}$/.test(oCallId)) return json({ ok: false, error: 'validation' }, 400, origin);
+        const oRec = await env.LEADS.get('call:' + oCallId, { type: 'json' });
+        if (!oRec) return json({ ok: false, error: 'not_found' }, 404, origin);
+        // First-write-wins: a double-tap, an OS redelivery, or
+        // a second (different) action returns the stored
+        // outcome and writes nothing more.
+        if (oRec.outcome && oRec.outcome.kind) return json({ ok: true, applied: false, outcome: oRec.outcome }, 200, origin);
+        oRec.outcome = { kind: oKind, at: new Date().toISOString() };
+        await env.LEADS.put('call:' + oCallId, JSON.stringify(oRec));
+        // Effects land only on a MATCHED person; on an
+        // unmatched call every outcome is record-only.
+        // 'interested' never moves a stage — stage changes stay
+        // with the existing rules; 'notalead' is record-only
+        // even when matched.
+        if (oRec.matchedEmail && oKind !== 'notalead') {
+          const oLabel = oKind === 'interested' ? 'Interested' : 'Follow up';
+          // The listing is composed into display strings as
+          // plain text (markup/control characters stripped);
+          // the portal also renders labels and task text
+          // through esc().
+          const oRef = oRec.listing ? ' · Re: ' + String(oRec.listing).replace(/[<>"'&\u0000-\u001F\u007F]/g, '').slice(0, 120) : '';
+          await pushActivity(env, oRec.matchedEmail, 'call-outcome', '📞 Call outcome: ' + oLabel + oRef);
+          if (oKind === 'followup') {
+            // The portal's own task shape (POST /api/admin/tasks):
+            // tk_ id, email, text, due, done, created_at.
+            const oTask = { id: 'tk_' + randHex(6), email: normEmail(oRec.matchedEmail), text: 'Follow up on call from ' + (oRec.matchedName || oRec.from || 'caller') + oRef, due: addDaysYmd(todayVancouver(), 1), done: false, created_at: new Date().toISOString(), source: 'call-outcome', callId: oRec.id };
+            await env.LEADS.put('task:' + oTask.id, JSON.stringify(oTask));
+            await idxAdd(env, 'tasks', oTask.id);
+          }
+        }
+        return json({ ok: true, applied: true, outcome: oRec.outcome }, 200, origin);
+      }
 
       // ---- business calls: provider webhooks + generic ingest (own auth) ----
       if (path === '/api/calls/ingest' && request.method === 'POST') {
