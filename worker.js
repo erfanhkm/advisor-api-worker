@@ -75,6 +75,33 @@ const ALLOWED_ORIGINS = [
 ];
 const INTENTS = ['buyer', 'seller', 'investor', 'renter'];
 const STAGES = ['new', 'contacted', 'viewing', 'offer', 'closed', 'dropped'];
+/* Pack PortalAddLead (2026-11-12): ONE lead-field sanitiser shared by
+   the public POST /api/lead handler and the owner-session
+   POST /api/admin/leads route, so a lead record is built from exactly
+   the same cleaned fields no matter which door it came through (the
+   public handler used to carry this logic inline; it now calls this
+   helper, and the suite's public-lead pins pin the equivalence).
+   Returns { error: 'validation' } or the cleaned fields.
+   opts.requireEmail: the manual form always carries an email (the
+   duplicate guard keys on it); the public form allows phone-only. */
+function leadCsVL(v, max) { return String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, ' ').trim().slice(0, max); }
+function leadSanitize(d, opts) {
+  opts = opts || {};
+  const name = String(d.name || '').trim().slice(0, 120);
+  if (/[\r\n<>]|https?:|www\./i.test(name)) return { error: 'validation' };
+  const intent = String(d.intent || '').trim().toLowerCase();
+  const city = leadCsVL(d.city, 80);
+  const budget = leadCsVL(d.budget, 40);
+  const email = String(d.email || '').trim().toLowerCase().slice(0, 160);
+  const phone = String(d.phone || '').trim().slice(0, 40);
+  const message = leadCsVL(d.message, 2000);
+  if (!name || !INTENTS.includes(intent)) return { error: 'validation' };
+  if (email && !EMAIL_RE.test(email)) return { error: 'validation' };
+  if (opts.requireEmail && !email) return { error: 'validation' };
+  if (!opts.requireEmail && !email && !phone) return { error: 'validation' };
+  if (phone && !/^[+\d][\d\s().-]{6,39}$/.test(phone)) return { error: 'validation' };
+  return { name: name, intent: intent, city: city, budget: budget, email: email, phone: phone, message: message };
+}
 const MKINDS = ['buyer', 'seller', 'pair'];
 const MSTATUSES = ['new', 'contacted', 'dismissed'];
 // Pack A (F-03 M3): the charset excludes <, >, quotes and backtick —
@@ -479,7 +506,7 @@ const PERF_LISTING_CAP = 500;  // distinct listing keys per isolate delta
 // Lead sources actually used by this worker's lead paths (contact form,
 // valuation, viewing, phone call, maintenance canary); anything else a
 // caller claims counts as 'other' (F-01 M1).
-const PERF_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary', 'other'];
+const PERF_SOURCES = ['site-form', 'home-valuation', 'viewing', 'call', 'canary', 'manual', 'other']; // 'manual' added by Pack PortalAddLead (2026-11-12): owner-portal manual leads keep their own perf bucket instead of folding into 'other'
 // Lead sources the public /api/lead will store (Pack A, F-04 M8):
 // anything else a caller claims becomes 'site-form'. (The valuation
 // route sets its own 'home-valuation' server-side; PERF_SOURCES above
@@ -10764,26 +10791,20 @@ async function handleRequest(request, env, ctx) {
         d = d || {};
         if (String(d.hp || '') !== '') return json({ ok: true }, 200, origin); // honeypot: silently drop bots
         if (!(await turnstileOk(env, d.turnstileToken, rawIp))) return json({ ok: false, error: 'captcha' }, 400, origin);
-        const name = String(d.name || '').trim().slice(0, 120);
-        if (/[\r\n<>]|https?:|www\./i.test(name)) return json({ ok: false, error: 'validation' }, 400, origin);
-        const intent = String(d.intent || '').trim().toLowerCase();
-        // Pack A (F-04 M8): the free-text fields are csV-sanitised
-        // before storage (they used to be stored verbatim), and
-        // `source` passes an allowlist — it was taken straight from
-        // the request body, so any string a visitor typed became a
-        // "lead source" in the portal and the perf counters.
-        const csVL = function (v, max) { return String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, ' ').trim().slice(0, max); };
-        const city = csVL(d.city, 80);
-        const budget = csVL(d.budget, 40);
-        const email = String(d.email || '').trim().toLowerCase().slice(0, 160);
-        const phone = String(d.phone || '').trim().slice(0, 40);
-        const message = csVL(d.message, 2000);
+        // Pack PortalAddLead (2026-11-12): field cleaning + validation
+        // now lives in leadSanitize() (shared with the owner-portal
+        // manual-create route). Pack A (F-04 M8) behaviour is unchanged:
+        // free-text fields are csV-sanitised before storage, and
+        // `source` still passes the LEAD_SOURCES allowlist below — it
+        // was once taken straight from the request body, so any string
+        // a visitor typed became a "lead source" in the portal and the
+        // perf counters.
+        const sLead = leadSanitize(d, {});
+        if (sLead.error) return json({ ok: false, error: 'validation' }, 400, origin);
+        const name = sLead.name, intent = sLead.intent, city = sLead.city, budget = sLead.budget,
+          email = sLead.email, phone = sLead.phone, message = sLead.message;
         const rawSource = String(d.source || 'site-form').trim().slice(0, 40);
         const source = LEAD_SOURCES.indexOf(rawSource) !== -1 ? rawSource : 'site-form';
-        if (!name || !INTENTS.includes(intent)) return json({ ok: false, error: 'validation' }, 400, origin);
-        if (email && !EMAIL_RE.test(email)) return json({ ok: false, error: 'validation' }, 400, origin);
-        if (!email && !phone) return json({ ok: false, error: 'validation' }, 400, origin);
-        if (phone && !/^[+\d][\d\s().-]{6,39}$/.test(phone)) return json({ ok: false, error: 'validation' }, 400, origin);
         if (email && (await isBanned(env, email))) return json({ ok: true }, 200, origin); // banned: silently drop
         const id = Date.now().toString(36) + '-' + randHex(6);
         // Optional listing attribution: the site passes listingId when the
@@ -13371,6 +13392,61 @@ async function handleRequest(request, env, ctx) {
           return out;
         });
         return json({ ok: true, leads: leads }, 200, origin);
+      }
+
+      /* Pack PortalAddLead (2026-11-12): manual lead creation from the
+         owner portal (the portal had NO lead-creation control — leads
+         only ever arrived via the public form). Owner-session only:
+         this route sits behind the admin gate above and is NOT in the
+         scopedAuthed allowlist, so scoped machine tokens cannot use
+         it. Fields are cleaned by the SAME leadSanitize() the public
+         POST /api/lead handler uses; the record shape is the public
+         shape with source 'manual', a createdBy 'portal' marker and
+         the owner's chosen stage. NO follow-up mail is queued and NO
+         brain triage runs — the owner created this lead by hand and
+         works it himself. Duplicate rule: a normalized-email match
+         against an existing lead OR a registered user refuses the
+         create with 409 already_exists + the existing identity, so
+         the portal can offer to open that profile instead. */
+      if (path === '/api/admin/leads' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const s = leadSanitize(d, { requireEmail: true });
+        if (s.error) return json({ ok: false, error: 'validation' }, 400, origin);
+        const stage = String(d.stage || 'new').trim().toLowerCase();
+        if (!STAGES.includes(stage)) return json({ ok: false, error: 'validation' }, 400, origin);
+        if (await isBanned(env, s.email)) return json({ ok: false, error: 'banned' }, 403, origin);
+        const ne = normEmail(s.email);
+        const dupLeadIds = await idxGet(env, 'leads', 'lead:');
+        for (const lid of dupLeadIds) {
+          const ex = await env.LEADS.get('lead:' + lid, { type: 'json' });
+          if (ex && ex.email && normEmail(ex.email) === ne) return json({ ok: false, error: 'already_exists', existing: { type: 'lead', id: ex.id, email: ex.email, name: ex.name || '' } }, 409, origin);
+        }
+        const dupUserIds = await idxGet(env, 'users', 'user:');
+        for (const uid of dupUserIds) {
+          if (normEmail(uid) === ne) {
+            const uu = await env.LEADS.get('user:' + uid, { type: 'json' });
+            return json({ ok: false, error: 'already_exists', existing: { type: 'user', id: uid, email: uid, name: (uu && uu.name) || '' } }, 409, origin);
+          }
+        }
+        const directUser = await env.LEADS.get('user:' + s.email, { type: 'json' });
+        if (directUser) return json({ ok: false, error: 'already_exists', existing: { type: 'user', id: s.email, email: s.email, name: directUser.name || '' } }, 409, origin);
+        const id = Date.now().toString(36) + '-' + randHex(6);
+        const nowIso = new Date().toISOString();
+        const lead = {
+          id: id, created_at: nowIso,
+          name: s.name, intent: s.intent, city: s.city, areas: s.city, budget: s.budget,
+          email: s.email, phone: s.phone, message: '',
+          stage: stage, notes: leadCsVL(d.note, 2000), source: 'manual',
+          listingId: '', chatRef: '', createdBy: 'portal'
+        };
+        if (stage !== 'new') lead.stageAt = nowIso;
+        await env.LEADS.put('lead:' + id, JSON.stringify(lead));
+        await idxAdd(env, 'leads', id);
+        await perfBump(env, ctx, 'source', 'manual');
+        await academyAudit(env, 'lead.create', id, ip, { source: 'manual', email: s.email, stage: stage });
+        return json({ ok: true, lead: lead }, 200, origin);
       }
 
       const m = path.match(/^\/api\/leads\/([A-Za-z0-9-]+)$/);
