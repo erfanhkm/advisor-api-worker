@@ -1290,6 +1290,14 @@ async function authed(request, env) {
      gate's per-IP failure limit still bounds spray cost. A hit at any
      rung proceeds exactly as before; an expired VALUE is non-null and
      never enters the ladder. */
+  if (!rawExp && scopeOf(env) === 'academy') {
+    /* Pack PortalAcademyTilesInviteFix (2026-11-13): on the academy
+       deployment the session record always lives on the SITE
+       deployment, so consult the bridge BEFORE the miss ladder — the
+       ladder below exists for just-minted SITE sessions and buys
+       nothing here. A bridge negative falls through unchanged. */
+    if (await bridgeAuthed(request, env)) return true;
+  }
   if (!rawExp) {
     const waits = [200, 500, 1000];
     for (const w of waits) {
@@ -6079,13 +6087,23 @@ async function academyAudit(env, action, target, ip, detail) {
   // {action, target, actor, ip, at, detail}, TTL 730 days.
   try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: action, target: target, actor: 'admin', ip: ip, at: new Date().toISOString(), detail: detail || {} }), { expirationTtl: 730 * 86400 }); } catch (e) {}
 }
-async function academyAuditScan(env, pred, cap) {
+async function academyAuditScan(env, pred, cap, limit) {
   // §6.3: bounded newest-first scan of the audit: prefix (newest 1,000).
+  // Pack PortalAcademyTilesInviteFix (2026-11-13): each get is guarded
+  // — one unparseable audit: value must not 500 the whole overview /
+  // student-detail route (the STULIST hazard class) — and callers may
+  // pass a match LIMIT: iteration is newest-first, so the scan stops
+  // as soon as enough matches are collected instead of reading the
+  // entire prefix (the mig-era backlog made the overview read 400+
+  // records to use the newest 10, which is what left the portal's
+  // Academy count tiles stuck on "–").
   const keys = await listAllKeys(env, 'audit:', typeof cap === 'number' ? cap : 1000);
   const out = [];
+  const max = typeof limit === 'number' && limit > 0 ? limit : Infinity;
   for (let i = keys.length - 1; i >= 0; i--) {
-    const v = await env.LEADS.get(keys[i].name, { type: 'json' });
-    if (v && pred(v)) out.push(v);
+    let v = null;
+    try { v = await env.LEADS.get(keys[i].name, { type: 'json' }); } catch (e) { v = null; }
+    if (v && pred(v)) { out.push(v); if (out.length >= max) break; }
   }
   return out;
 }
@@ -18596,7 +18614,7 @@ async function handleRequest(request, env, ctx) {
           }
         }
         expiring.sort(function (a, b) { return String(a.expiresAt).localeCompare(String(b.expiresAt)); });
-        const recentActions = (await academyAuditScan(env, function (v) { return String(v.action || '').indexOf('academy.') === 0; })).slice(0, 10);
+        const recentActions = (await academyAuditScan(env, function (v) { return String(v.action || '').indexOf('academy.') === 0; }, undefined, 10)).slice(0, 10);
         return json({ counts: counts, expiring: expiring, recentActions: recentActions }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'GET') {
@@ -19045,7 +19063,7 @@ async function handleRequest(request, env, ctx) {
           const conceptCounts = {};
           if (mist && Array.isArray(mist.items)) for (const m of mist.items) { if (m && m.concept) conceptCounts[m.concept] = (conceptCounts[m.concept] || 0) + 1; }
           const topConcepts = Object.keys(conceptCounts).map(function (c) { return { concept: c, count: conceptCounts[c] }; }).sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
-          const auditTrail = (await academyAuditScan(env, function (v) { return v.target === ne; })).slice(0, 25);
+          const auditTrail = (await academyAuditScan(env, function (v) { return v.target === ne; }, undefined, 25)).slice(0, 25);
           return json({ student: student, progress: { perModule: perModule, quizHistory: quizHistory.slice(0, 50) }, mistakes: { count: mist && Array.isArray(mist.items) ? mist.items.length : 0, topConcepts: topConcepts }, mocks: mocks, auditTrail: auditTrail }, 200, origin);
         }
         if (!action && request.method === 'DELETE') {
