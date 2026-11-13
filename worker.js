@@ -3758,6 +3758,32 @@ async function bumpAcademyContent(env) {
 async function academyContentUpdatedAt(env) {
   try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
 }
+/* Pack KvWriteDiscipline (2026-11-12): seed write budget.
+   Incident #3 (2026-11-12) burned the ACADEMY KV daily put
+   cap (1,000) through per-object audit puts on the internal
+   bulk routes plus unbudgeted bulk seed routes. The seed
+   family (tutor-seed / booklet-seed — direct, internal and
+   proxy routes) now counts its own writes: every invocation
+   projects its puts (data + ONE summary audit + content
+   stamp) and REFUSES, before writing anything, when the
+   projection would push its run past SEED_PUT_BUDGET. A run
+   is identified by the caller's optional runId; its
+   accumulated puts live at 'seedrun:<runId>' (7-day TTL,
+   written once per invocation by seedRunCommit). 400 leaves
+   600 of the daily cap for student traffic, the spillway
+   and admin work, and a full re-seed splits naturally
+   across runs: batched booklets ≈ 227 data + ~10 overhead;
+   tutor corpus+bank ≈ 41 parts × 3. Without a runId the
+   guard still caps any single invocation at the ceiling.
+   The counter is an operator guard, not a ledger: parallel
+   invocations can race it, and a swallowed stamp failure
+   can skew it by a put or two — the 600-put headroom
+   absorbs both. */
+const SEED_PUT_BUDGET = 400;
+function seedRunIdOf(d) { const r = (d && typeof d.runId === 'string') ? d.runId : ''; return /^[A-Za-z0-9._-]{1,64}$/.test(r) ? r : ''; }
+async function seedRunUsed(env, runId) { if (!runId) return 0; try { const c = await env.LEADS.get('seedrun:' + runId, { type: 'json' }); return (c && typeof c.puts === 'number' && isFinite(c.puts) && c.puts > 0) ? Math.floor(c.puts) : 0; } catch (e) { return 0; } }
+async function seedRunGuard(env, runId, projected) { const used = await seedRunUsed(env, runId); return (used + projected > SEED_PUT_BUDGET) ? { ok: false, used: used } : { ok: true, used: used }; }
+async function seedRunCommit(env, runId, used, puts) { if (!runId) return; try { await env.LEADS.put('seedrun:' + runId, JSON.stringify({ puts: used + puts, updatedAt: new Date().toISOString() }), { expirationTtl: 7 * 86400 }); } catch (e) {} }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
 function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; if (path === '/api/internal/academy/kv-drain') return sc === 'academy'; if (path === '/api/internal/site/kv-spill') return sc === 'academy'; if (path === '/api/internal/site/kv-drain') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
@@ -11179,6 +11205,59 @@ async function handleRequest(request, env, ctx) {
       if (!bsec || !timingSafeEqual(bsec, String(icfgB.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
       let bd = null;
       try { bd = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+      const bkRunId = seedRunIdOf(bd);
+      if (Array.isArray(bd.items)) {
+        // Pack KvWriteDiscipline (2026-11-12): batch seeding —
+        // up to 500 booklets in ONE invocation. Every item is
+        // validated (shape, %PDF magic, byte count, SHA-256)
+        // BEFORE anything is stored; the projected puts (items
+        // + ONE summary audit + content stamp) are checked
+        // against the seed budget BEFORE the first write; the
+        // batch writes exactly ONE summary audit, never one per
+        // booklet (the per-object audits were incident #3).
+        // Re-seeding stays idempotent: the stored value is the
+        // verified base64, byte-identical to the single path.
+        const bitems = bd.items;
+        if (!bitems.length || bitems.length > 500) return json({ ok: false, error: 'validation' }, 400, origin);
+        const bprep = [];
+        for (let bii = 0; bii < bitems.length; bii++) {
+          const bit = bitems[bii] || {};
+          const bkind = String(bit.kind || '');
+          const bbid = String(bit.id || '').toLowerCase();
+          const blang = String(bit.lang || '').toLowerCase();
+          const bidOk = (bkind === 'module' && /^m[0-8]$/.test(bbid)) || (bkind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bbid) && bbid.length <= 40);
+          if (!bidOk || BOOKLET_LANGS.indexOf(blang) === -1) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+          const bb64 = String(bit.b64 || '').replace(/\s/g, '');
+          if (!bb64 || bb64.length > 14000000 || !/^[A-Za-z0-9+/=]+$/.test(bb64)) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+          const bbytes = bookletB64Decode(bb64);
+          if (!bbytes) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+          if (bbytes.length < 5 || bbytes[0] !== 0x25 || bbytes[1] !== 0x50 || bbytes[2] !== 0x44 || bbytes[3] !== 0x46) return json({ ok: false, error: 'not_pdf', itemIndex: bii }, 400, origin);
+          if (typeof bit.bytes === 'number' && bit.bytes !== bbytes.length) return json({ ok: false, error: 'size_mismatch', itemIndex: bii }, 400, origin);
+          if (bit.sha256) { const bhh = await bookletBytesSha256(bbytes); if (bhh !== String(bit.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch', itemIndex: bii }, 400, origin); }
+          bprep.push({ kind: bkind, id: bbid, lang: blang, b64: bb64, bytes: bbytes.length, key: 'booklet:' + bkind + ':' + bbid + ':' + blang });
+        }
+        const bprojected = bprep.length + 2;
+        const bGuard = await seedRunGuard(env, bkRunId, bprojected);
+        if (!bGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: bprojected, runUsed: bGuard.used, runId: bkRunId }, 429, origin);
+        let bstored = 0, btotal = 0;
+        const bresults = [];
+        for (let bij = 0; bij < bprep.length; bij++) {
+          try { await env.LEADS.put(bprep[bij].key, bprep[bij].b64); } catch (e) {
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            if (bstored > 0) await bumpAcademyContent(env);
+            await seedRunCommit(env, bkRunId, bGuard.used, bstored + 1 + (bstored > 0 ? 1 : 0));
+            return json({ ok: false, error: 'seed_store_failed', stored: bstored }, 502, origin);
+          }
+          const bback = bookletB64Decode((await env.LEADS.get(bprep[bij].key)) || '');
+          const bsha = bback ? await bookletBytesSha256(bback) : null;
+          bstored++; btotal += bprep[bij].bytes;
+          bresults.push({ kind: bprep[bij].kind, id: bprep[bij].id, lang: bprep[bij].lang, bytes: bprep[bij].bytes, storedSha256: bsha });
+        }
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        await bumpAcademyContent(env);
+        await seedRunCommit(env, bkRunId, bGuard.used, bprojected);
+        return json({ ok: true, items: bstored, bytes: btotal, failed: 0, results: bresults }, 200, origin);
+      }
       const kind = String(bd.kind || '');
       const bid = String(bd.id || '').toLowerCase();
       const lang = String(bd.lang || '').toLowerCase();
@@ -11192,11 +11271,18 @@ async function handleRequest(request, env, ctx) {
       if (typeof bd.bytes === 'number' && bd.bytes !== bytes.length) return json({ ok: false, error: 'size_mismatch' }, 400, origin);
       if (bd.sha256) { const hh = await bookletBytesSha256(bytes); if (hh !== String(bd.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch' }, 400, origin); }
       const bkey = 'booklet:' + kind + ':' + bid + ':' + lang;
+      // Pack KvWriteDiscipline (2026-11-12): seed put guard —
+      // this call performs exactly 3 puts (data + summary audit
+      // + content stamp); refuse BEFORE writing when the run
+      // projection exceeds the budget (zero writes on refusal).
+      const bkGuard = await seedRunGuard(env, bkRunId, 3);
+      if (!bkGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: bkGuard.used, runId: bkRunId }, 429, origin);
       await env.LEADS.put(bkey, b64);
       const backBytes = bookletB64Decode((await env.LEADS.get(bkey)) || '');
       const storedSha256 = backBytes ? await bookletBytesSha256(backBytes) : null;
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
       await bumpAcademyContent(env);
+      await seedRunCommit(env, bkRunId, bkGuard.used, 3);
       return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
     }
     /* Pack AcademyTutorSeedProxy (2026-11-11): tutor corpus seed,
@@ -11239,6 +11325,14 @@ async function handleRequest(request, env, ctx) {
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
         const lang = String(d.lang || '');
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Pack KvWriteDiscipline (2026-11-12): seed put guard —
+        // one part call performs exactly 3 KV puts (data + ONE
+        // summary audit + content stamp); the projection is
+        // checked against the run budget BEFORE the first write
+        // and a refused call writes nothing.
+        const tsRunId = seedRunIdOf(d);
+        const tsGuard = await seedRunGuard(env, tsRunId, 3);
+        if (!tsGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: tsGuard.used, runId: tsRunId }, 429, origin);
         // Pack Tutor2 parts: corpus v2 (concept chunks + glossary)
         // and the graded question bank. Each part validates its own
         // payload shape; the v1 lessons validation below does not
@@ -11247,56 +11341,70 @@ async function handleRequest(request, env, ctx) {
           if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
           if (d.part === 'glossary') {
             if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:glossary', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { part: 'glossary', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadG = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map });
+            await env.LEADS.put('tutor:corpus:v2:glossary', tsPayloadG);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
           }
           if (d.part === 'v2-index') {
             if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadVI = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'v2-module') {
             const mod2 = String(d.module || '');
             if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
             if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-module', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadVM = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'bank-index') {
             if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:bank:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-index', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadBI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta });
+            await env.LEADS.put('tutor:bank:' + lang + ':index', tsPayloadBI);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
           }
           const modB = String(d.module || '');
           if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
           if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-module', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadBM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions });
+          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, tsPayloadBM);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
         }
         if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
         if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
         if (d.part === 'index') {
-          await env.LEADS.put('tutor:corpus:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'index', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
+          await env.LEADS.put('tutor:corpus:' + lang + ':index', tsPayloadI);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
         }
         if (d.part === 'module') {
           const mod = String(d.module || '');
           if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'module', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
+          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, tsPayloadM);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
@@ -11329,8 +11437,14 @@ async function handleRequest(request, env, ctx) {
                 binding's list under the prefix at limit 1000,
                 the page cursor passed through.
        A missing binding is a clean 503 r2_not_configured. Every
-       executed op audits once (action 'r2_mig'; the detail
-       carries op + key/prefix only — never body content). */
+       executed op used to audit once — incident #3's burn.
+       Pack KvWriteDiscipline (2026-11-12): put and list now
+       write ONE summary audit per invocation (detail carries
+       route / items / bytes / outcome, plus the legacy fields;
+       never body content), head is NOT audited at all, and the
+       batch form {op:'put-batch', items:[{key, bodyB64}]}
+       stores up to 50 objects under ONE summary audit — the
+       kv-drain aggregate discipline. */
     if (path === '/api/internal/academy/r2-mig' && request.method === 'POST') {
       const icfgM = await env.LEADS.get('cfg:internal', { type: 'json' }).catch(() => null);
       if (!icfgM || !icfgM.secret) return json({ ok: false, error: 'not_configured' }, 503, origin);
@@ -11339,7 +11453,7 @@ async function handleRequest(request, env, ctx) {
       let md = null;
       try { md = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
       const mop = String(md.op || '');
-      if (mop !== 'put' && mop !== 'head' && mop !== 'list') return json({ ok: false, error: 'validation' }, 400, origin);
+      if (mop !== 'put' && mop !== 'head' && mop !== 'list' && mop !== 'put-batch') return json({ ok: false, error: 'validation' }, 400, origin);
       const mbucket = env.ACADEMY_VIDEO;
       const mip = ipKey(request.headers.get('CF-Connecting-IP') || 'unknown');
       if (mop === 'put') {
@@ -11358,7 +11472,7 @@ async function handleRequest(request, env, ctx) {
         if (!mbytes.length) return json({ ok: false, error: 'empty_body' }, 400, origin);
         const mct = mkey.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (mkey.endsWith('.ts') ? 'video/MP2T' : (mkey.endsWith('.vtt') ? 'text/vtt' : 'application/octet-stream'));
         try { await mbucket.put(mkey, mbytes, { httpMetadata: { contentType: mct } }); } catch (e) { return json({ ok: false, error: 'r2_put_failed' }, 502, origin); }
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'put', key: mkey, size: mbytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put', items: 1, bytes: mbytes.length, outcome: 'ok', key: mkey, size: mbytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         return json({ ok: true, size: mbytes.length }, 200, origin);
       }
       if (mop === 'head') {
@@ -11367,10 +11481,49 @@ async function handleRequest(request, env, ctx) {
         if (!mbucket || typeof mbucket.head !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
         let mhead = null;
         try { mhead = await mbucket.head(mkey); } catch (e) { return json({ ok: false, error: 'r2_head_failed' }, 502, origin); }
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'head', key: mkey, exists: !!mhead } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        // Pack KvWriteDiscipline (2026-11-12): head is deliberately UNAUDITED — a probe must never burn a KV put per object (incident #3).
         if (!mhead) return json({ ok: true, exists: false, size: null }, 200, origin);
         return json({ ok: true, exists: true, size: mhead.size }, 200, origin);
       }
+        if (mop === 'put-batch') {
+          // Pack KvWriteDiscipline (2026-11-12): the batch form of
+          // put — up to 50 objects in ONE invocation, mirroring the
+          // kv-drain page discipline: EVERY item is validated BEFORE
+          // anything is stored (one invalid item refuses the whole
+          // batch with zero writes), and the invocation writes
+          // exactly ONE summary audit (route / items / bytes /
+          // outcome), never one per object.
+          if (!mbucket || typeof mbucket.put !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
+          const mitems = md.items;
+          if (!Array.isArray(mitems) || !mitems.length || mitems.length > 50) return json({ ok: false, error: 'validation' }, 400, origin);
+          const mprep = [];
+          for (let mii = 0; mii < mitems.length; mii++) {
+            const mit = mitems[mii] || {};
+            const mk2 = String(mit.key || '');
+            if (!ACADEMY_B2_KEY_RE.test(mk2)) return json({ ok: false, error: 'invalid_key', itemIndex: mii }, 400, origin);
+            const mb2 = String(mit.bodyB64 || '').replace(/\s/g, '');
+            if (!mb2 || !/^[A-Za-z0-9+/=]+$/.test(mb2)) return json({ ok: false, error: 'validation', itemIndex: mii }, 400, origin);
+            if (mb2.length > 5592408) return json({ ok: false, error: 'too_large', itemIndex: mii }, 413, origin);
+            const mby2 = bookletB64Decode(mb2);
+            if (!mby2) return json({ ok: false, error: 'validation', itemIndex: mii }, 400, origin);
+            if (mby2.length > 4194304) return json({ ok: false, error: 'too_large', itemIndex: mii }, 413, origin);
+            if (!mby2.length) return json({ ok: false, error: 'empty_body', itemIndex: mii }, 400, origin);
+            const mct2 = mk2.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (mk2.endsWith('.ts') ? 'video/MP2T' : (mk2.endsWith('.vtt') ? 'text/vtt' : 'application/octet-stream'));
+            mprep.push({ key: mk2, bytes: mby2, ct: mct2 });
+          }
+          let mstored = 0, mtotal = 0;
+          const mresults = [];
+          for (let mij = 0; mij < mprep.length; mij++) {
+            try { await mbucket.put(mprep[mij].key, mprep[mij].bytes, { httpMetadata: { contentType: mprep[mij].ct } }); }
+            catch (e) {
+              try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored + '/' + mprep.length, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'partial', failedKey: mprep[mij].key } }), { expirationTtl: 730 * 86400 }); } catch (e2) {}
+              return json({ ok: false, error: 'r2_put_failed', stored: mstored }, 502, origin);
+            }
+            mstored++; mtotal += mprep[mij].bytes.length; mresults.push({ key: mprep[mij].key, size: mprep[mij].bytes.length });
+          }
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          return json({ ok: true, items: mstored, bytes: mtotal, results: mresults }, 200, origin);
+        }
       const mprefix = String(md.prefix || 'media/');
       if (mprefix.indexOf('media/') !== 0 || mprefix.indexOf('..') !== -1) return json({ ok: false, error: 'invalid_prefix' }, 400, origin);
       if (!mbucket || typeof mbucket.list !== 'function') return json({ ok: false, error: 'r2_not_configured' }, 503, origin);
@@ -11380,7 +11533,7 @@ async function handleRequest(request, env, ctx) {
       const mobjs = (mres && mres.objects) || [];
       const mkeys = mobjs.map(function (o) { return { key: o.key, size: o.size }; });
       const mtrunc = !!(mres && mres.truncated);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', op: 'list', prefix: mprefix, keys: mkeys.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'list', items: mkeys.length, bytes: mkeys.reduce(function (a, o) { return a + (o.size || 0); }, 0), outcome: 'ok', prefix: mprefix, keys: mkeys.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
       return json({ ok: true, keys: mkeys, cursor: (mtrunc && mres.cursor) ? String(mres.cursor) : null, truncated: mtrunc }, 200, origin);
     }
 
@@ -16202,11 +16355,18 @@ async function handleRequest(request, env, ctx) {
         let up = null;
         let upBody = null;
         try {
+          // Pack KvWriteDiscipline (2026-11-12): the proxy counts
+          // this invocation's FULL projected puts (upstream data +
+          // summary audit + content stamp, plus its own summary
+          // audit + stamp) and refuses over-budget work BEFORE the
+          // upstream hop — a refused call writes nothing anywhere.
+          const qProjected = (Array.isArray(qbd.items) ? qbd.items.length + 2 : 3) + 2;
+          if (qProjected > SEED_PUT_BUDGET) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: qProjected }, 429, origin);
           up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/booklet-seed', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgQ.secret) }, body: JSON.stringify(qbd), signal: AbortSignal.timeout(60000) });
           upBody = await up.json().catch(() => null);
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', bytes: upBody.bytes || null } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'booklet-seed-proxy', items: Array.isArray(qbd.items) ? qbd.items.length : 1, bytes: upBody.bytes || null, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
@@ -16226,11 +16386,19 @@ async function handleRequest(request, env, ctx) {
         let up = null;
         let upBody = null;
         try {
+          // Pack KvWriteDiscipline (2026-11-12): full projected
+          // puts for this invocation = the upstream part (3: data
+          // + summary audit + stamp) + this proxy's own 2
+          // (summary audit + stamp). Parts are single-put today;
+          // the check keeps any future multi-put part behind the
+          // same budget, refused BEFORE the upstream hop.
+          const tProjected = 3 + 2;
+          if (tProjected > SEED_PUT_BUDGET) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: tProjected }, 429, origin);
           up = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/tutor-seed', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgTs.secret) }, body: JSON.stringify(tsd), signal: AbortSignal.timeout(60000) });
           upBody = await up.json().catch(() => null);
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', lang: String(tsd.lang || ''), part: String(tsd.part || '') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'tutor-seed-proxy', items: (tsd.part === 'glossary' && tsd.map) ? Object.keys(tsd.map).length : (Array.isArray(tsd.questions) ? tsd.questions.length : (Array.isArray(tsd.lessons) ? tsd.lessons.length : (tsd.qmeta ? Object.keys(tsd.qmeta).length : 1))), bytes: JSON.stringify(tsd).length, outcome: 'ok', lang: String(tsd.lang || ''), part: String(tsd.part || '') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
@@ -16248,8 +16416,8 @@ async function handleRequest(request, env, ctx) {
         // 413 too_large / 503 r2_not_configured); only a dead
         // upstream hop maps to 502 upstream_failed
         // (upstreamStatus 0), the family shape. No site-side
-        // audit: the internal route audits each executed op
-        // (action 'r2_mig') in the ACADEMY namespace, where the
+        // audit: the internal route writes ONE summary audit
+        // (action 'r2_mig') per invocation in the ACADEMY namespace, where the
         // objects land — a proxy audit would double the KV write
         // cost of a 9,316-call migration for no new evidence
         // (the direct r2-object transfer route is unaudited for
@@ -16974,6 +17142,14 @@ async function handleRequest(request, env, ctx) {
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
         const lang = String(d.lang || '');
         if (TUTOR_LANGS.indexOf(lang) === -1) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Pack KvWriteDiscipline (2026-11-12): seed put guard —
+        // one part call performs exactly 3 KV puts (data + ONE
+        // summary audit + content stamp); the projection is
+        // checked against the run budget BEFORE the first write
+        // and a refused call writes nothing.
+        const tsRunId = seedRunIdOf(d);
+        const tsGuard = await seedRunGuard(env, tsRunId, 3);
+        if (!tsGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: tsGuard.used, runId: tsRunId }, 429, origin);
         // Pack Tutor2 parts: corpus v2 (concept chunks + glossary)
         // and the graded question bank. Each part validates its own
         // payload shape; the v1 lessons validation below does not
@@ -16982,56 +17158,70 @@ async function handleRequest(request, env, ctx) {
           if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
           if (d.part === 'glossary') {
             if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:glossary', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { part: 'glossary', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadG = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map });
+            await env.LEADS.put('tutor:corpus:v2:glossary', tsPayloadG);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
           }
           if (d.part === 'v2-index') {
             if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadVI = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'v2-module') {
             const mod2 = String(d.module || '');
             if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
             if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'v2-module', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadVM = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
+            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
           }
           if (d.part === 'bank-index') {
             if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
-            await env.LEADS.put('tutor:bank:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta }));
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-index', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            const tsPayloadBI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta });
+            await env.LEADS.put('tutor:bank:' + lang + ':index', tsPayloadBI);
+            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
             await bumpAcademyContent(env);
+            await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
           }
           const modB = String(d.module || '');
           if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
           if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'bank-module', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadBM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions });
+          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, tsPayloadBM);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
         }
         if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200) return json({ ok: false, error: 'validation' }, 400, origin);
         if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
         if (d.part === 'index') {
-          await env.LEADS.put('tutor:corpus:' + lang + ':index', JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'index', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
+          await env.LEADS.put('tutor:corpus:' + lang + ':index', tsPayloadI);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
         }
         if (d.part === 'module') {
           const mod = String(d.module || '');
           if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
-          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons }));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { lang: lang, part: 'module', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          const tsPayloadM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
+          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, tsPayloadM);
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
           await bumpAcademyContent(env);
+          await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
@@ -17048,6 +17238,59 @@ async function handleRequest(request, env, ctx) {
         // re-seeding overwrites with the same verified bytes.
         let d = null;
         try { d = (await request.json()) || {}; } catch (e) { return json({ ok: false, error: 'bad_json' }, 400, origin); }
+        const bkRunId = seedRunIdOf(d);
+        if (Array.isArray(d.items)) {
+          // Pack KvWriteDiscipline (2026-11-12): batch seeding —
+          // up to 500 booklets in ONE invocation. Every item is
+          // validated (shape, %PDF magic, byte count, SHA-256)
+          // BEFORE anything is stored; the projected puts (items
+          // + ONE summary audit + content stamp) are checked
+          // against the seed budget BEFORE the first write; the
+          // batch writes exactly ONE summary audit, never one per
+          // booklet (the per-object audits were incident #3).
+          // Re-seeding stays idempotent: the stored value is the
+          // verified base64, byte-identical to the single path.
+          const bitems = d.items;
+          if (!bitems.length || bitems.length > 500) return json({ ok: false, error: 'validation' }, 400, origin);
+          const bprep = [];
+          for (let bii = 0; bii < bitems.length; bii++) {
+            const bit = bitems[bii] || {};
+            const bkind = String(bit.kind || '');
+            const bbid = String(bit.id || '').toLowerCase();
+            const blang = String(bit.lang || '').toLowerCase();
+            const bidOk = (bkind === 'module' && /^m[0-8]$/.test(bbid)) || (bkind === 'lesson' && ACADEMY_VIDEO_LESSON_RE.test(bbid) && bbid.length <= 40);
+            if (!bidOk || BOOKLET_LANGS.indexOf(blang) === -1) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+            const bb64 = String(bit.b64 || '').replace(/\s/g, '');
+            if (!bb64 || bb64.length > 14000000 || !/^[A-Za-z0-9+/=]+$/.test(bb64)) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+            const bbytes = bookletB64Decode(bb64);
+            if (!bbytes) return json({ ok: false, error: 'validation', itemIndex: bii }, 400, origin);
+            if (bbytes.length < 5 || bbytes[0] !== 0x25 || bbytes[1] !== 0x50 || bbytes[2] !== 0x44 || bbytes[3] !== 0x46) return json({ ok: false, error: 'not_pdf', itemIndex: bii }, 400, origin);
+            if (typeof bit.bytes === 'number' && bit.bytes !== bbytes.length) return json({ ok: false, error: 'size_mismatch', itemIndex: bii }, 400, origin);
+            if (bit.sha256) { const bhh = await bookletBytesSha256(bbytes); if (bhh !== String(bit.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch', itemIndex: bii }, 400, origin); }
+            bprep.push({ kind: bkind, id: bbid, lang: blang, b64: bb64, bytes: bbytes.length, key: 'booklet:' + bkind + ':' + bbid + ':' + blang });
+          }
+          const bprojected = bprep.length + 2;
+          const bGuard = await seedRunGuard(env, bkRunId, bprojected);
+          if (!bGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: bprojected, runUsed: bGuard.used, runId: bkRunId }, 429, origin);
+          let bstored = 0, btotal = 0;
+          const bresults = [];
+          for (let bij = 0; bij < bprep.length; bij++) {
+            try { await env.LEADS.put(bprep[bij].key, bprep[bij].b64); } catch (e) {
+              try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+              if (bstored > 0) await bumpAcademyContent(env);
+              await seedRunCommit(env, bkRunId, bGuard.used, bstored + 1 + (bstored > 0 ? 1 : 0));
+              return json({ ok: false, error: 'seed_store_failed', stored: bstored }, 502, origin);
+            }
+            const bback = bookletB64Decode((await env.LEADS.get(bprep[bij].key)) || '');
+            const bsha = bback ? await bookletBytesSha256(bback) : null;
+            bstored++; btotal += bprep[bij].bytes;
+            bresults.push({ kind: bprep[bij].kind, id: bprep[bij].id, lang: bprep[bij].lang, bytes: bprep[bij].bytes, storedSha256: bsha });
+          }
+          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await bumpAcademyContent(env);
+          await seedRunCommit(env, bkRunId, bGuard.used, bprojected);
+          return json({ ok: true, items: bstored, bytes: btotal, failed: 0, results: bresults }, 200, origin);
+        }
         const kind = String(d.kind || '');
         const bid = String(d.id || '').toLowerCase();
         const lang = String(d.lang || '').toLowerCase();
@@ -17060,11 +17303,18 @@ async function handleRequest(request, env, ctx) {
         if (bytes.length < 5 || bytes[0] !== 0x25 || bytes[1] !== 0x50 || bytes[2] !== 0x44 || bytes[3] !== 0x46) return json({ ok: false, error: 'not_pdf' }, 400, origin);
         if (typeof d.bytes === 'number' && d.bytes !== bytes.length) return json({ ok: false, error: 'size_mismatch' }, 400, origin);
         if (d.sha256) { const hh = await bookletBytesSha256(bytes); if (hh !== String(d.sha256).toLowerCase()) return json({ ok: false, error: 'hash_mismatch' }, 400, origin); }
+        // Pack KvWriteDiscipline (2026-11-12): seed put guard —
+        // this call performs exactly 3 puts (data + summary audit
+        // + content stamp); refuse BEFORE writing when the run
+        // projection exceeds the budget (zero writes on refusal).
+        const bkGuard = await seedRunGuard(env, bkRunId, 3);
+        if (!bkGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: bkGuard.used, runId: bkRunId }, 429, origin);
         await env.LEADS.put('booklet:' + kind + ':' + bid + ':' + lang, b64);
         const backBytes2 = bookletB64Decode((await env.LEADS.get('booklet:' + kind + ':' + bid + ':' + lang)) || '');
         const storedSha256 = backBytes2 ? await bookletBytesSha256(backBytes2) : null;
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { kind: kind, id: bid, lang: lang, bytes: bytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
         await bumpAcademyContent(env);
+        await seedRunCommit(env, bkRunId, bkGuard.used, 3);
         return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
       }
       // ---- admin: Academy × Backblaze B2 (Pack AcademyB2Video) ----
