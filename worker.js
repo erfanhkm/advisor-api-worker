@@ -3364,7 +3364,7 @@ async function storeCall(env, rec, ctx) {
     from: normPhone(rec.from), to: normPhone(rec.to),
     startedAt: String(rec.startedAt || (existing && existing.startedAt) || now).slice(0, 40),
     durationSec: Math.max(0, Math.min(86400, parseInt(rec.durationSec, 10) || 0)),
-    status: ['completed', 'missed', 'voicemail', 'busy', 'failed', 'no-answer'].indexOf(rec.status) !== -1 ? rec.status : 'completed',
+    status: ['completed', 'missed', 'voicemail', 'busy', 'failed', 'no-answer', 'screened'].indexOf(rec.status) !== -1 ? rec.status : 'completed', // Pack TelephonyStronger: 'screened' (spam-screened capture, no recording)
     recordingUrl: String(rec.recordingUrl || (existing && existing.recordingUrl) || '').slice(0, 600),
     transcript: String(rec.transcript || (existing && existing.transcript) || '').slice(0, 4000),
     listing: String(rec.listing || (existing && existing.listing) || '').slice(0, 120), // Pack ScreenPop: an optional listing reference a provider attaches (generic ingest today); preserved across status upserts like recordingUrl, read by the screen-pop card
@@ -3375,6 +3375,15 @@ async function storeCall(env, rec, ctx) {
   // counterparty, written once (a status upsert that already
   // carries numInfo never rewrites it).
   if (!merged.numInfo) { try { merged.numInfo = parseNumLocal(merged.direction === 'in' ? merged.from : merged.to); } catch (e) {} }
+  // Pack TelephonyStronger (2026-11-12): a spam-screened call
+  // carries its flag + reason on the record (decided by the
+  // voice route, delivered by the capture-path status post);
+  // preserved across upserts so a later event can never
+  // silently un-flag it.
+  if (rec.screened || (existing && existing.screened)) {
+    merged.screened = true;
+    merged.screenReason = String(rec.screenReason || (existing && existing.screenReason) || '').slice(0, 40);
+  }
   const isNew = !existing;
   if (isNew) {
     const other = merged.direction === 'in' ? merged.from : merged.to;
@@ -3421,7 +3430,7 @@ async function storeCall(env, rec, ctx) {
     // throws, and a waitUntil refusal degrades to a caught
     // fire-and-forget, so the pop can never fail or delay the
     // TwiML/ingest response.
-    if (merged.direction === 'in') {
+    if (merged.direction === 'in' && !merged.screened) { // TelephonyStronger: screened junk never pops
       let prevTouch = '';
       if (merged.matchedEmail) {
         try {
@@ -3591,7 +3600,7 @@ async function storeSms(env, rec, ctx) {
   }
   return { ok: true, id: id, created: true, msg: msg };
 }
-async function sendSms(env, cfg, to, body) {
+async function sendSms(env, cfg, to, body, opts) {
   // Sends FROM the business number via the configured provider. Returns true
   // only when the provider accepted the message.
   try {
@@ -3599,6 +3608,7 @@ async function sendSms(env, cfg, to, body) {
     if (cfg.provider === 'twilio') {
       if (!cfg.twilioAccountSid || !cfg.twilioAuthToken) return false;
       const form = new URLSearchParams({ From: cfg.number, To: to, Body: String(body || '').slice(0, 1600) });
+      if (opts && opts.statusCallback) form.set('StatusCallback', String(opts.statusCallback).slice(0, 300)); // Pack TelephonyStronger: delivery receipts (portal sends only)
       const r = await fetch('https://api.twilio.com/2010-04-01/Accounts/' + encodeURIComponent(cfg.twilioAccountSid) + '/Messages.json', {
         method: 'POST', signal: AbortSignal.timeout(8000),
         headers: { Authorization: 'Basic ' + btoa(cfg.twilioAccountSid + ':' + cfg.twilioAuthToken), 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -3630,6 +3640,160 @@ async function forwardSmsToOwner(env, cfg, msg) {
     try { await env.LEADS.put('smsrelay', JSON.stringify({ client: msg.from, at: Date.now() }), { expirationTtl: 24 * 3600 }); } catch (e) {}
   }
 }
+
+// ---- Pack TelephonyStronger (2026-11-12): screening lists,
+// repeat-junk history, the webhook health guardian, and the
+// delivery-receipt state machine. Everything here is
+// best-effort by construction: a guardian or screening-store
+// failure must never change a webhook's response, so every
+// helper swallows its own errors and returns a safe default.
+/// cfg:calls allowlist/blocklist matching by last-10 digits.
+function tsListHas(list, last10) {
+  if (!Array.isArray(list) || !last10 || last10.length < 10) return false;
+  for (const n of list) if (phoneLast10(n) === last10) return true;
+  return false;
+}
+/// Repeat-junk history: the status route notes every ordinary
+// inbound call that ended in under 10 seconds ('spamhist:<last10>'
+// = epoch-ms array, 24h window, capped at 20, 48h TTL). Three
+// or more inside 24h is the robocall pattern the voice route
+// screens on. Screened calls never feed it (they are already
+// handled), and neither do outbound/DISA legs.
+async function tsSpamNote(env, fromPhone) {
+  try {
+    const last = phoneLast10(fromPhone);
+    if (last.length < 10) return;
+    const key = 'spamhist:' + last;
+    let arr = [];
+    try { arr = (await env.LEADS.get(key, { type: 'json' })) || []; } catch (e) { arr = []; }
+    if (!Array.isArray(arr)) arr = [];
+    const now = Date.now();
+    arr = arr.filter(function (t) { return typeof t === 'number' && now - t < 24 * 3600 * 1000; });
+    arr.push(now);
+    if (arr.length > 20) arr = arr.slice(arr.length - 20);
+    await env.LEADS.put(key, JSON.stringify(arr), { expirationTtl: 48 * 3600 });
+  } catch (e) {}
+}
+async function tsJunkHit(env, fromPhone) {
+  try {
+    const last = phoneLast10(fromPhone);
+    if (last.length < 10) return false;
+    const arr = (await env.LEADS.get('spamhist:' + last, { type: 'json' })) || [];
+    if (!Array.isArray(arr)) return false;
+    const now = Date.now();
+    let n = 0;
+    for (const t of arr) if (typeof t === 'number' && now - t < 24 * 3600 * 1000) n++;
+    return n >= 3;
+  } catch (e) { return false; }
+}
+/// Guardian thresholds: optional cfg:calls overrides
+// (guardianSigMax / guardianErrMax), sane defaults.
+function tsGuardianThresholds(cfg) {
+  function clamp(v, dflt) { const n = parseInt(v, 10); return (isFinite(n) && n >= 1 && n <= 1000) ? n : dflt; }
+  return { sigfail: clamp(cfg && cfg.guardianSigMax, 10), err: clamp(cfg && cfg.guardianErrMax, 5) };
+}
+async function tsGuardianRead(env) {
+  const day = vancouverDay();
+  let g = null;
+  try { g = await env.LEADS.get('guardian:' + day, { type: 'json' }); } catch (e) {}
+  if (!g || typeof g !== 'object') g = { day: day, counts: { sigfail: {}, err: {} }, incidents: {} };
+  if (!g.counts) g.counts = { sigfail: {}, err: {} };
+  if (!g.incidents) g.incidents = {};
+  g.day = day;
+  return g;
+}
+/// The unacknowledged tripped incidents — the shape the portal
+// banner and the guardian read share.
+function tsGuardianAlerts(g) {
+  const out = [];
+  for (const k of Object.keys(g.incidents || {})) {
+    const inc = g.incidents[k];
+    if (inc && !inc.acked) out.push({ key: k, kind: inc.kind, family: inc.family, count: inc.count || 0, trippedAt: inc.trippedAt || '' });
+  }
+  out.sort(function (a, b) { return String(a.trippedAt).localeCompare(String(b.trippedAt)); });
+  return out;
+}
+/// Count one guardian event (kind 'sigfail' | 'err', family
+// 'voice' | 'status' | 'sms' | 'msgstatus' | 'whatsapp') on
+// today's
+// Vancouver-day doc. At the threshold a fresh incident trips
+// and fires exactly ONE portal Web Push (the ScreenPop
+// channel, puNotifyPush) — deduped by the incident's pushed
+// flag until the owner acknowledges (ack clears the incident,
+// so a genuinely new trip after an ack pushes again) or the
+// day rolls over. Never throws.
+async function tsGuardianBump(env, ctx, kind, family) {
+  try {
+    const day = vancouverDay();
+    const key = 'guardian:' + day;
+    const g = await tsGuardianRead(env);
+    if (!g.counts[kind]) g.counts[kind] = {};
+    g.counts[kind][family] = (g.counts[kind][family] || 0) + 1;
+    const cfg = await getCallsCfg(env);
+    const th = tsGuardianThresholds(cfg);
+    const limit = kind === 'sigfail' ? th.sigfail : th.err;
+    const count = g.counts[kind][family];
+    const ikey = kind + ':' + family;
+    let payload = null;
+    if (count >= limit) {
+      let inc = g.incidents[ikey];
+      if (!inc || inc.acked) { inc = { kind: kind, family: family, count: count, trippedAt: new Date().toISOString(), pushed: false, acked: false }; g.incidents[ikey] = inc; }
+      if (inc && !inc.pushed && !inc.acked) {
+        inc.pushed = true; inc.count = count;
+        payload = { title: '⚠️ Calls plumbing alert', body: (kind === 'sigfail' ? 'Twilio signature failures' : 'Twilio webhook errors') + ' on the ' + family + ' line: ' + count + ' today. Open the portal Calls tab for details.', url: '/portal-9f3k7x2q.html' };
+      }
+    }
+    await env.LEADS.put(key, JSON.stringify(g), { expirationTtl: 8 * 86400 });
+    if (payload) { try { await puNotifyPush(env, payload); } catch (e) {} }
+  } catch (e) {}
+}
+/// Owner acknowledgement: clears the incident flag (the
+// counters stay on today's doc). Returns false for an
+// unknown/malformed incident key.
+async function tsGuardianAck(env, ikey) {
+  if (!/^(sigfail|err):(voice|status|sms|msgstatus|whatsapp)$/.test(String(ikey || ''))) return false;
+  try {
+    const day = vancouverDay();
+    const g = await tsGuardianRead(env);
+    if (!g.incidents[ikey]) return false;
+    g.incidents[ikey].acked = true;
+    await env.LEADS.put('guardian:' + day, JSON.stringify(g), { expirationTtl: 8 * 86400 });
+    return true;
+  } catch (e) { return false; }
+}
+function tsTwilioFamily(p) {
+  if (p === '/api/calls/twilio/voice' || p === '/api/calls/twilio/voice/outbound') return 'voice';
+  if (p === '/api/calls/twilio/status') return 'status';
+  if (p === '/api/calls/twilio/sms') return 'sms';
+  if (p === '/api/calls/twilio/whatsapp') return 'whatsapp';
+  if (p === '/api/calls/twilio/msgstatus') return 'msgstatus';
+  return '';
+}
+/// Delivery receipts: outbound message records are found by
+// the Twilio MessageSid through the SAME id derivation
+// storeSms uses (sha256(provider:providerMsgId)[..20]) — the
+// 'sms:' family (provider twilio/generic) today, and the
+// 'wa:' family (provider twilio/whatsapp) when the WhatsApp
+// pack stores its outbound records in that shape and points
+// its sends' StatusCallback at the shared route.
+async function tsMsgFind(env, sid) {
+  if (!sid) return null;
+  const fams = [['sms', 'sms_', ['twilio', 'generic']], ['wa', 'wa_', ['twilio', 'whatsapp']]];
+  for (const f of fams) {
+    for (const prov of f[2]) {
+      const id = f[1] + (await sha256hex(prov + ':' + sid)).slice(0, 20);
+      const rec = await siteKvGet(env, f[0] + ':' + id, { type: 'json' });
+      if (rec) return { key: f[0] + ':' + id, rec: rec };
+    }
+  }
+  return null;
+}
+/// Monotonic delivery ranks: a status callback can only move
+// a record FORWARD. A failure (failed/undelivered) applies
+// only before delivered/read — a late failure can never
+// regress a delivered message — and keeps the record's rank
+// so a later genuine delivered still lands.
+const TS_MSG_RANK = { accepted: 0, queued: 1, sending: 2, sent: 3, delivered: 4, read: 5 };
 
 // ---- business WhatsApp (Pack PortalWhatsApp, 2026-11-12) ------------------
 // Same plug-in pattern as SMS, on the same cfg:calls credentials, with
@@ -13640,11 +13804,43 @@ async function handleRequest(request, env, ctx) {
         const params = await readFormParams(request);
         // Twilio routes verify UNCONDITIONALLY (cycle 27, Claude H1): gating on
         // ccfg.provider left the route open whenever provider was unset/mistyped.
-        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'voice'); return new Response(unavailable, { status: 200, headers: xmlHead }); } // TelephonyStronger: a verification failure against a live token is a guardian event
         const base = 'https://' + new URL(request.url).host;
         if (normPhone(params.From) === normPhone(ccfg.forwardTo)) {
           const gather = '<?xml version="1.0" encoding="UTF-8"?><Response><Gather action="' + base + '/api/calls/twilio/voice/outbound" method="POST" finishOnKey="#" timeout="30"><Say voice="alice">Enter the number you want to call, then press pound.</Say></Gather></Response>';
           return new Response(gather, { status: 200, headers: xmlHead });
+        }
+        // Pack TelephonyStronger (2026-11-12): spam / robocall
+        // screening for verified inbound callers (the DISA
+        // branch above is the owner's own cell — never
+        // screened). Decision order: (1) cfg:calls blocklist
+        // screens immediately; (2) cfg:calls allowlist is
+        // never screened; (3) a FAILED STIR/SHAKEN attestation
+        // — the StirVerstat webhook parameter Twilio delivers
+        // ('TN-Validation-Passed-A/B/C' on a pass,
+        // 'TN-Validation-Failed' on a failed validation) —
+        // screens; (4) the repeat-junk pattern (>=3 sub-10s
+        // calls from this number in 24h) screens. A screened
+        // call never rings the owner's cell and is never
+        // dropped silently: it takes the capture path — the
+        // same disclosure, then <Record> — and its record
+        // lands in the log flagged with the reason via the
+        // /status?screen=1 post. Clean calls fall through to
+        // the exact forward TwiML below, byte-identical.
+        const fromLastTS = phoneLast10(params.From || '');
+        let screenReasonTS = '';
+        if (tsListHas(ccfg.blocklist, fromLastTS)) screenReasonTS = 'blocklist';
+        else if (!tsListHas(ccfg.allowlist, fromLastTS)) {
+          const stirTS = String(params.StirVerstat || '');
+          if (stirTS && /-Failed$/.test(stirTS)) screenReasonTS = 'stir-failed';
+          else if (await tsJunkHit(env, fromLastTS)) screenReasonTS = 'repeat-junk';
+        }
+        if (screenReasonTS) {
+          const capXml = '<?xml version="1.0" encoding="UTF-8"?><Response>' +
+            '<Say voice="alice">Please hold while we connect you. This call may be recorded.</Say>' +
+            '<Record action="' + base + '/api/calls/twilio/status?screen=1&amp;reason=' + screenReasonTS + '" method="POST" maxLength="120" playBeep="true"/>' +
+            '<Say voice="alice">Thank you for your message. Goodbye.</Say><Hangup/></Response>';
+          return new Response(capXml, { status: 200, headers: xmlHead });
         }
         const xml = '<?xml version="1.0" encoding="UTF-8"?><Response>' +
           '<Say voice="alice">Please hold while we connect you. This call may be recorded.</Say>' +
@@ -13656,7 +13852,7 @@ async function handleRequest(request, env, ctx) {
         const ccfg = await getCallsCfg(env);
         if (!ccfg) return new Response('not configured', { status: 503 });
         const params = await readFormParams(request);
-        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response('forbidden', { status: 403 });
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'status'); return new Response('forbidden', { status: 403 }); } // TelephonyStronger: guardian event
         if (limited('callst:' + String(params.From || ''), 60, 3600000)) return new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
         const rawStatus = String(params.DialCallStatus || params.CallStatus || '').toLowerCase();
         const statusMap = { completed: 'completed', busy: 'busy', 'no-answer': 'no-answer', failed: 'failed', canceled: 'missed' };
@@ -13668,7 +13864,27 @@ async function handleRequest(request, env, ctx) {
           status: statusMap[rawStatus] || 'completed',
           recordingUrl: (params.RecordingUrl && String(params.RecordingUrl).indexOf('https://api.twilio.com/') === 0) ? params.RecordingUrl + '.mp3' : '' // host-validated (cycle 27, Claude L17)
         };
-        if (rec.providerCallId) await storeCall(env, rec, ctx);
+        // Pack TelephonyStronger (2026-11-12): a capture-path
+        // post (?screen=1 — the action URL the voice route's
+        // screening branch emits) stores the call flagged with
+        // its screening reason: 'voicemail' when a recording
+        // landed, 'screened' otherwise. Screened posts never
+        // feed the junk history; ordinary inbound calls that
+        // ended in under 10 seconds DO (that is the signal the
+        // repeat-junk screen reads).
+        const screenPostTS = url.searchParams.get('screen') === '1';
+        if (screenPostTS) {
+          const reasonTS = String(url.searchParams.get('reason') || '');
+          rec.screened = true;
+          rec.screenReason = ['blocklist', 'stir-failed', 'repeat-junk'].indexOf(reasonTS) !== -1 ? reasonTS : 'screened';
+          rec.status = rec.recordingUrl ? 'voicemail' : 'screened';
+          if (!rec.durationSec) rec.durationSec = parseInt(params.RecordingDuration || '0', 10) || 0;
+        }
+        if (rec.providerCallId) {
+          await storeCall(env, rec, ctx);
+          const durRawTS = params.DialCallDuration !== undefined ? params.DialCallDuration : params.CallDuration;
+          if (!screenPostTS && rec.direction === 'in' && durRawTS !== undefined && (parseInt(durRawTS, 10) || 0) < 10) { try { await tsSpamNote(env, params.From || ''); } catch (e) {} }
+        }
         return new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
       }
 
@@ -13679,7 +13895,7 @@ async function handleRequest(request, env, ctx) {
         const unavailable = '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Sorry, this number is not in service yet.</Say><Hangup/></Response>';
         if (!ccfg || !ccfg.number || !ccfg.forwardTo) return new Response(unavailable, { status: 200, headers: xmlHead });
         const params = await readFormParams(request);
-        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'voice'); return new Response(unavailable, { status: 200, headers: xmlHead }); } // TelephonyStronger: guardian event
         if (normPhone(params.From) !== normPhone(ccfg.forwardTo)) return new Response(unavailable, { status: 200, headers: xmlHead });
         const rawDigits = String(params.Digits || '').replace(/[^0-9]/g, '');
         if (!/^1?[2-9]\d{9}$/.test(rawDigits)) return new Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">That number looks incomplete. Please call back and try again.</Say><Hangup/></Response>', { status: 200, headers: xmlHead }); // NANP only (cycle 27, Claude H2): no premium/international destinations
@@ -13692,7 +13908,7 @@ async function handleRequest(request, env, ctx) {
         const ccfg = await getCallsCfg(env);
         if (!ccfg || !ccfg.number) return new Response('not configured', { status: 503 });
         const params = await readFormParams(request);
-        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response('forbidden', { status: 403 });
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'sms'); return new Response('forbidden', { status: 403 }); } // TelephonyStronger: guardian event
         const empty = new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
         const fromN = normPhone(params.From || '');
         if (ccfg.forwardTo && fromN === normPhone(ccfg.forwardTo)) {
@@ -13721,7 +13937,7 @@ async function handleRequest(request, env, ctx) {
         const ccfg = await getCallsCfg(env);
         if (!ccfg || !ccfg.number) return new Response('not configured', { status: 503 });
         const params = await readFormParams(request);
-        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response('forbidden', { status: 403 });
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'whatsapp'); return new Response('forbidden', { status: 403 }); } // TelephonyStronger: guardian event
         const empty = new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
         const fromN = normPhone(waStripPrefix(params.From || ''));
         const body = String(params.Body || '');
@@ -13742,6 +13958,36 @@ async function handleRequest(request, env, ctx) {
         // the portal with unread counts; smsrelay semantics do not
         // translate to WhatsApp. The owner replies from the portal.
         return empty;
+      }
+      // Pack TelephonyStronger (2026-11-12): the SHARED
+      // message-delivery status route. Twilio posts here for
+      // every outbound message whose send carried this
+      // StatusCallback — portal SMS sends today (W11), and
+      // WhatsApp sends when that pack stores its outbound
+      // records in the tsMsgFind shape and passes the same
+      // callback. One handler, both channels: the record gains
+      // a monotonic delivery state and the portal thread
+      // renders it per message.
+      if (path === '/api/calls/twilio/msgstatus' && request.method === 'POST') {
+        const ccfg = await getCallsCfg(env);
+        if (!ccfg) return new Response('not configured', { status: 503 });
+        const params = await readFormParams(request);
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) { if (ccfg.twilioAuthToken) await tsGuardianBump(env, ctx, 'sigfail', 'msgstatus'); return new Response('forbidden', { status: 403 }); }
+        const sidTS = String(params.MessageSid || params.SmsSid || '').slice(0, 80);
+        const rawTS = String(params.MessageStatus || params.SmsStatus || '').toLowerCase();
+        const hitTS = await tsMsgFind(env, sidTS);
+        if (hitTS) {
+          const recTS = hitTS.rec;
+          const curTS = recTS.delivery && typeof recTS.delivery.rank === 'number' ? recTS.delivery.rank : -1;
+          let nextTS = null;
+          if (rawTS === 'failed' || rawTS === 'undelivered') {
+            if (curTS < 4) nextTS = { state: 'failed', raw: rawTS, rank: curTS, at: new Date().toISOString(), code: String(params.ErrorCode || '').slice(0, 16) };
+          } else if (Object.prototype.hasOwnProperty.call(TS_MSG_RANK, rawTS) && TS_MSG_RANK[rawTS] > curTS) {
+            nextTS = { state: rawTS, raw: rawTS, rank: TS_MSG_RANK[rawTS], at: new Date().toISOString(), code: '' };
+          }
+          if (nextTS) { recTS.delivery = nextTS; await siteKvPut(env, hitTS.key, JSON.stringify(recTS)); }
+        }
+        return new Response('ok', { status: 200 });
       }
       if (path === '/api/sms/ingest' && request.method === 'POST') {
         if (limited('ingest:' + ip, 600, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -18952,7 +19198,7 @@ async function handleRequest(request, env, ctx) {
         const to = normPhone(d.to || '');
         const body = String(d.body || '').trim().slice(0, 1600);
         if (phoneLast10(to).length < 10 || !body) return json({ ok: false, error: 'validation' }, 400, origin);
-        const sid = await sendSms(env, ccfg, to, body);
+        const sid = await sendSms(env, ccfg, to, body, { statusCallback: 'https://' + new URL(request.url).host + '/api/calls/twilio/msgstatus' }); // Pack TelephonyStronger: delivery receipts land on the shared status route
         if (!sid) return json({ ok: false, error: 'send_failed' }, 502, origin);
         let storedId = '', storeWarn = false;
         try { const stored = await storeSms(env, { provider: ccfg.provider || 'generic', providerMsgId: typeof sid === 'string' ? sid : 'portal-' + randHex(8), direction: 'out', from: ccfg.number, to: to, body: body }, ctx); storedId = stored.id; } catch (e) { storeWarn = true; } // the text is already sent: a store failure must not read as a send failure (a portal retry would double-text) — cycle 30, Claude Low
@@ -19111,7 +19357,20 @@ async function handleRequest(request, env, ctx) {
         calls.sort(function (a, b) { return String(b.startedAt).localeCompare(String(a.startedAt)); });
         if (emailF) calls = calls.filter(function (c) { return c.matchedEmail && normEmail(c.matchedEmail) === emailF; });
         if (phoneF) calls = calls.filter(function (c) { return phoneLast10(c.from) === phoneF || phoneLast10(c.to) === phoneF; });
-        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', calls: calls.slice(0, limit) }, 200, origin);
+        const gAlertsTS = tsGuardianAlerts(await tsGuardianRead(env)); // TelephonyStronger: unacknowledged guardian incidents for the banner
+        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', calls: calls.slice(0, limit), guardian: { day: vancouverDay(), alerts: gAlertsTS } }, 200, origin);
+      }
+      // ---- admin: webhook health guardian (Pack TelephonyStronger) ----
+      if (path === '/api/admin/calls/guardian' && request.method === 'GET') {
+        const gTS = await tsGuardianRead(env);
+        const ccfgG = await getCallsCfg(env);
+        return json({ ok: true, day: gTS.day, counts: gTS.counts, thresholds: tsGuardianThresholds(ccfgG), incidents: tsGuardianAlerts(gTS), incidentsAll: Object.keys(gTS.incidents || {}).map(function (k) { const i2 = gTS.incidents[k]; return { key: k, kind: i2.kind, family: i2.family, count: i2.count || 0, trippedAt: i2.trippedAt || '', acked: !!i2.acked }; }) }, 200, origin);
+      }
+      if (path === '/api/admin/calls/guardian' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        const acked = await tsGuardianAck(env, String((d && d.ack) || ''));
+        return json({ ok: acked }, acked ? 200 : 400, origin);
       }
       const callLeadM = path.match(/^\/api\/admin\/calls\/([A-Za-z0-9_-]+)\/lead$/);
       if (callLeadM && request.method === 'POST') {
@@ -19576,6 +19835,11 @@ async function handleRequest(request, env, ctx) {
       return json({ ok: false, error: 'not_found' }, 404, origin);
     } catch (e) {
       console.error(e);
+      // Pack TelephonyStronger (2026-11-12): count the throw
+      // as a webhook error for its route family, once the
+      // plumbing is configured (a live Twilio token). Fully
+      // guarded — the bump can never mask the 500 below.
+      try { const famTS = tsTwilioFamily(new URL(request.url).pathname); if (famTS) { const ccfgTS = await getCallsCfg(env); if (ccfgTS && ccfgTS.twilioAuthToken) await tsGuardianBump(env, ctx, 'err', famTS); } } catch (e2) {}
       return json({ ok: false, error: 'server' }, 500, origin);
     }
 }
