@@ -3387,6 +3387,208 @@ async function forwardSmsToOwner(env, cfg, msg) {
   }
 }
 
+// ---- business WhatsApp (Pack PortalWhatsApp, 2026-11-12) ------------------
+// Same plug-in pattern as SMS, on the same cfg:calls credentials, with
+// two WhatsApp-specific laws enforced in code (not copy):
+//  (1) THE 24H WINDOW: a free-form message may only be sent within 24h
+//      of the thread's last INBOUND message. Outside the window (or
+//      when the contact has never written) the send route refuses
+//      free-form text; only an approved template from the
+//      cfg:calls.whatsapp registry may go out. wathread:<last10> is
+//      the authoritative window source.
+//  (2) DRAFTS NEVER SEND: the AI draft path contains no provider call
+//      at all. A draft becomes a message only when the owner presses
+//      Send in the portal, through the same send route as (1).
+// Media is stored as references (URL + content type) only — nothing is
+// proxied or downloaded in this pass. Message records (wa:) have no
+// delete route, exactly like call:/sms: records; only AI draft records
+// (wadraft:) are deletable, via the draft discard route.
+const WA_WINDOW_MS = 24 * 3600 * 1000;
+const WA_STARTER_TEMPLATES = [
+  { name: 'reconnect', lang: 'en', body: 'Hi {{1}}, this is EH REALTY — we spoke a while ago and I wanted to check in. Is there anything I can help you with on your home search?' },
+  { name: 'reconnect', lang: 'fa', body: 'سلام {{1}}، از EH REALTY پیام می‌دم — قبلاً صحبت کرده بودیم و خواستم احوالت رو بپرسم. برای جستجوی خونه‌ت کمکی از دستم برمیاد؟' }
+];
+function waTemplates(ccfg) {
+  const t = ccfg && ccfg.whatsapp && Array.isArray(ccfg.whatsapp.templates) ? ccfg.whatsapp.templates : null;
+  const out = [];
+  if (t) for (const x of t) {
+    if (!x || typeof x !== 'object') continue;
+    const name = String(x.name || '').slice(0, 60), lang = String(x.lang || '').slice(0, 8), body = String(x.body || '').slice(0, 1024);
+    if (!name || !body) continue;
+    const e = { name: name, lang: lang || 'en', body: body };
+    if (x.sid) e.sid = String(x.sid).slice(0, 60);
+    out.push(e);
+  }
+  return out.length ? out : WA_STARTER_TEMPLATES.slice();
+}
+function waStripPrefix(v) { return String(v || '').replace(/^whatsapp:/i, ''); }
+async function storeWa(env, rec) {
+  const pmid = String(rec.providerMsgId || '').slice(0, 80);
+  if (!pmid) return { ok: false, error: 'providerMsgId' };
+  const id = 'wa_' + (await sha256hex('twilio-wa:' + pmid)).slice(0, 20);
+  const existing = await siteKvGet(env, 'wa:' + id, { type: 'json' });
+  if (existing) return { ok: true, id: id, created: false, msg: existing };
+  const now = new Date().toISOString();
+  const atParsed = Date.parse(rec.at || '');
+  const kind = rec.kind === 'system' ? 'system' : 'msg';
+  const msg = {
+    id: id, provider: 'twilio', providerMsgId: pmid,
+    direction: rec.direction === 'out' ? 'out' : 'in',
+    from: normPhone(rec.from), to: normPhone(rec.to),
+    body: String(rec.body || '').slice(0, 3200),
+    media: (Array.isArray(rec.media) ? rec.media : []).slice(0, 10).map(function (m) { return { url: String((m && m.url) || '').slice(0, 600), type: String((m && m.type) || '').slice(0, 80) }; }).filter(function (m) { return m.url; }),
+    at: isNaN(atParsed) ? now : new Date(atParsed).toISOString(),
+    read: rec.direction === 'out' ? true : false,
+    kind: kind, created_at: now
+  };
+  if (rec.event) msg.event = String(rec.event).slice(0, 40);
+  if (kind === 'msg') {
+    const other = msg.direction === 'in' ? msg.from : msg.to;
+    const who = await matchPhoneEmail(env, other);
+    if (who) { msg.matchedEmail = who.email; msg.matchedName = who.name || ''; }
+  }
+  await siteKvPut(env, 'wa:' + id, JSON.stringify(msg));
+  await idxAdd(env, 'wa', id);
+  if (kind === 'msg' && msg.matchedEmail) {
+    await pushActivity(env, msg.matchedEmail, 'whatsapp', (msg.direction === 'in' ? '💬 WhatsApp from client: ' : '💬 WhatsApp to client: ') + msg.body.slice(0, 120));
+    await stampLastTouch(env, msg.matchedEmail);
+  }
+  return { ok: true, id: id, created: true, msg: msg };
+}
+async function waThreadTouch(env, msg) {
+  // One small derived record per thread: the 24h window source + thread
+  // metadata. Derived data — if it is ever lost, the window reads
+  // closed (fail-safe: templates only) until the next message lands.
+  try {
+    const other = msg.direction === 'in' ? msg.from : msg.to;
+    const last = phoneLast10(other);
+    if (last.length < 10) return;
+    const key = 'wathread:' + last;
+    const cur = (await siteKvGet(env, key, { type: 'json' })) || {};
+    const atMs = Date.parse(msg.at || '') || Date.now();
+    if (msg.direction === 'in') { if (!cur.lastInAt || atMs >= cur.lastInAt) cur.lastInAt = atMs; }
+    else { if (!cur.lastOutAt || atMs >= cur.lastOutAt) cur.lastOutAt = atMs; }
+    cur.phone = other; cur.updatedAt = Date.now();
+    if (msg.matchedEmail) cur.matchedEmail = msg.matchedEmail;
+    if (msg.matchedName) cur.matchedName = msg.matchedName;
+    await siteKvPut(env, key, JSON.stringify(cur));
+  } catch (e) {}
+}
+async function waWindow(env, last10) {
+  const th = (await siteKvGet(env, 'wathread:' + last10, { type: 'json' })) || null;
+  const lastInAt = th && typeof th.lastInAt === 'number' ? th.lastInAt : 0;
+  const open = !!lastInAt && (Date.now() - lastInAt) < WA_WINDOW_MS;
+  return { lastInAt: lastInAt, open: open, closesAt: lastInAt ? lastInAt + WA_WINDOW_MS : 0 };
+}
+async function sendWhatsApp(env, cfg, to, opts) {
+  // Sends FROM the business number's WhatsApp identity via Twilio.
+  // Returns the provider sid (or true) only when Twilio accepted.
+  // Credentials are used for the Basic header only — never logged,
+  // never returned.
+  try {
+    if (!cfg || !cfg.number || cfg.provider !== 'twilio') return false;
+    if (!cfg.twilioAccountSid || !cfg.twilioAuthToken) return false;
+    opts = opts || {};
+    const form = new URLSearchParams({ From: 'whatsapp:' + normPhone(cfg.number), To: 'whatsapp:' + normPhone(to) });
+    if (opts.contentSid) {
+      form.set('ContentSid', String(opts.contentSid).slice(0, 60));
+      const vars = {};
+      (opts.variables || []).forEach(function (v, i) { vars[String(i + 1)] = String(v == null ? '' : v).slice(0, 300); });
+      form.set('ContentVariables', JSON.stringify(vars));
+    } else {
+      form.set('Body', String(opts.body || '').slice(0, 1600));
+    }
+    const r = await fetch('https://api.twilio.com/2010-04-01/Accounts/' + encodeURIComponent(cfg.twilioAccountSid) + '/Messages.json', {
+      method: 'POST', signal: AbortSignal.timeout(8000),
+      headers: { Authorization: 'Basic ' + btoa(cfg.twilioAccountSid + ':' + cfg.twilioAuthToken), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString()
+    });
+    if (!r.ok) return false;
+    const j = await r.json().catch(function () { return null; });
+    return (j && j.sid) ? j.sid : true;
+  } catch (e) {}
+  return false;
+}
+function waRenderTemplate(body, variables) {
+  return String(body || '').replace(/\{\{(\d+)\}\}/g, function (m, n) {
+    const v = (variables || [])[parseInt(n, 10) - 1];
+    return v == null ? '' : String(v).slice(0, 300);
+  });
+}
+function waDetectLang(text) {
+  const s = String(text || '');
+  if (/[\u0600-\u06FF]/.test(s)) return 'fa';
+  if (/[\u4E00-\u9FFF]/.test(s)) return 'zh';
+  if (/[\u0900-\u097F]/.test(s)) return 'hi';
+  if (/[¿¡ñáéíóúü]/i.test(s) || /\b(gracias|hola|quiero|busco|vivienda|casa|precio)\b/i.test(s)) return 'es';
+  return 'en';
+}
+const WA_CONFIRM_FIRST = {
+  en: 'Thanks for your message — let me confirm the current details for you and get right back to you.',
+  fa: 'ممنون از پیام‌تون — بذارید جزئیات فعلی رو بررسی کنم و خیلی زود بهتون خبر بدم.',
+  hi: 'आपके संदेश के लिए धन्यवाद — मैं मौजूदा जानकारी की पुष्टि करके जल्द ही आपको बताता हूँ।',
+  zh: '谢谢您的留言 — 我先确认一下最新详情，马上回复您。',
+  es: 'Gracias por su mensaje — déjeme confirmar los datos actuales y le respondo enseguida.'
+};
+async function waDraftFor(env, phone) {
+  // Draft-only AI assistance. NEVER sends anything: this function makes
+  // no provider call; its only writes are the wadraft: record the route
+  // stores afterwards. Grounding: the brain receives ONLY facts resolved
+  // from the platform's own catalog + the matched CRM profile, under
+  // BRAIN_GROUND; an MLS reference that does not resolve short-circuits
+  // to a confirm-first draft BEFORE the brain is called, and any number
+  // in the brain's reply that is not in the facts block replaces the
+  // draft with the same confirm-first fallback.
+  const last = phoneLast10(phone);
+  if (last.length < 10) return { ok: false, error: 'validation' };
+  const ids = await idxGetMerged(env, 'wa', 'wa:');
+  const msgs = [];
+  for (const wid of ids) { const m = await siteKvGet(env, 'wa:' + wid, { type: 'json' }); if (m && m.kind === 'msg' && (phoneLast10(m.from) === last || phoneLast10(m.to) === last)) msgs.push(m); }
+  msgs.sort(function (a, b) { return String(a.at).localeCompare(String(b.at)); });
+  if (!msgs.length) return { ok: false, error: 'no_thread' };
+  const inbound = msgs.filter(function (m) { return m.direction === 'in'; });
+  const lastIn = inbound[inbound.length - 1] || null;
+  const lang = waDetectLang(lastIn ? lastIn.body : '');
+  const who = await matchPhoneEmail(env, phone);
+  const snap = (await siteKvGet(env, 'catalog:snap', { type: 'json' })) || null;
+  const listings = snap && Array.isArray(snap.listings) ? snap.listings : [];
+  const factFor = function (l) { return { mls: String(l.mls || ''), address: String(l.street || '') + (l.city ? ', ' + l.city : ''), price: (l.price == null ? '' : String(l.price)), beds: (l.beds == null ? '' : String(l.beds)), type: String(l.type || ''), status: String(l.status || '') }; };
+  const threadText = msgs.slice(-8).map(function (m) { return (m.direction === 'in' ? 'Contact: ' : 'Business: ') + String(m.body || '').slice(0, 500); }).join('\n');
+  const mlsRefs = [];
+  const re = /\bR\d{7}\b/g; let mm;
+  const scanText = inbound.map(function (m) { return String(m.body || ''); }).join('\n');
+  while ((mm = re.exec(scanText)) !== null) { if (mlsRefs.indexOf(mm[0]) === -1) mlsRefs.push(mm[0]); }
+  const facts = [];
+  for (const ref of mlsRefs) {
+    const hit = listings.filter(function (l) { return String(l.mls || '') === ref; })[0];
+    if (!hit) {
+      return { ok: true, lang: lang, grounded: false, needsConfirm: true, draft: WA_CONFIRM_FIRST[lang] || WA_CONFIRM_FIRST.en, summary: 'Asked about ' + ref + ', which is not in the current catalog — details must be confirmed before replying.', temperature: 'warm', matchedEmail: who ? who.email : '', matchedName: who ? (who.name || '') : '' };
+    }
+    facts.push(factFor(hit));
+  }
+  if (!facts.length) {
+    // No specific listing referenced: ground on a small current-catalog
+    // sample so the brain can still answer general questions from data.
+    for (const l of listings.slice(0, 5)) facts.push(factFor(l));
+  }
+  const factsText = facts.length ? facts.map(function (f) { return '- ' + f.mls + ' · ' + f.address + ' · $' + f.price + ' · ' + f.beds + ' bed · ' + f.type + ' · ' + f.status; }).join('\n') : '(no listings in the catalog right now)';
+  const sys = 'You are the drafting assistant for EH REALTY, a British Columbia real-estate business. You write ONE WhatsApp reply draft for the advisor to review — you never send anything yourself. Write the reply in ' + (BRAIN_LANG_NAMES[lang] || 'English') + ', warm and professional, at most 60 words, first person as the business. ' + BRAIN_GROUND + ' Also return a one-line English summary of the thread and a lead-temperature suggestion (cold, warm or hot). Reply with ONLY a JSON object: {"reply": "...", "summary": "...", "temperature": "cold|warm|hot"}.';
+  const prompt = 'FACTS (the only data you may use):\n' + factsText + '\n\nCONTACT: ' + (who ? ((who.name || 'a client') + ' <' + who.email + '>') : 'not yet in the CRM') + '\n\nTHREAD (oldest first):\n' + threadText + '\n\nWrite the JSON draft now.';
+  const r = await brainJsonCall(env, { task: 'whatsapp-draft', system: sys, prompt: prompt, maxTokens: 500 }, { reply: 'str', summary: 'str', temperature: 'str' });
+  if (!r.ok) return { ok: false, error: r.capped ? 'brain_cap' : (r.error || 'ai_unavailable'), capped: !!r.capped };
+  const j = r.json;
+  let draft = String(j.reply || '').trim().slice(0, 1200);
+  if (!draft) return { ok: false, error: 'ai_empty' };
+  // Defence in depth: a number in the draft that is NOT in the facts
+  // block is an invention — replace the whole draft with confirm-first.
+  const factNums = {};
+  const fn = String(factsText).replace(/,/g, '').match(/\d+/g) || [];
+  for (const n of fn) if (n) factNums[n] = 1;
+  const draftNums = draft.match(/\$?\d[\d,]{3,}/g) || [];
+  for (const dn of draftNums) { const bare = dn.replace(/[^0-9]/g, ''); if (bare.length >= 4 && !factNums[bare]) { draft = WA_CONFIRM_FIRST[lang] || WA_CONFIRM_FIRST.en; break; } }
+  const temp = ['cold', 'warm', 'hot'].indexOf(String(j.temperature || '').toLowerCase()) !== -1 ? String(j.temperature).toLowerCase() : 'warm';
+  return { ok: true, lang: lang, grounded: true, needsConfirm: false, draft: draft, summary: String(j.summary || '').slice(0, 200), temperature: temp, matchedEmail: who ? who.email : '', matchedName: who ? (who.name || '') : '' };
+}
 // ---- KV list-usage counter ------------------------------------------------
 // The free plan caps list operations at 1,000/day (that is the budget that
 // ran out on 2026-10-22). The worker counts its own app-traffic list calls
@@ -13266,6 +13468,37 @@ async function handleRequest(request, env, ctx) {
         if (stored.ok && stored.msg) await forwardSmsToOwner(env, ccfg, stored.msg);
         return empty;
       }
+      if (path === '/api/calls/twilio/whatsapp' && request.method === 'POST') {
+        // Pack PortalWhatsApp (2026-11-12): inbound WhatsApp on the
+        // same Twilio plumbing. Fail-closed exactly like the SMS route:
+        // no cfg:calls (or no number) → 503 before anything is read;
+        // no auth token or a bad signature → 403 before anything is
+        // stored.
+        const ccfg = await getCallsCfg(env);
+        if (!ccfg || !ccfg.number) return new Response('not configured', { status: 503 });
+        const params = await readFormParams(request);
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response('forbidden', { status: 403 });
+        const empty = new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
+        const fromN = normPhone(waStripPrefix(params.From || ''));
+        const body = String(params.Body || '');
+        // Twilio sandbox join: "join <code>" enrols the sender with the
+        // sandbox — a system event, never a lead message (no CRM match,
+        // no activity entry, no window touch).
+        if (/^join\s+[a-z0-9][a-z0-9-]*$/i.test(body.trim())) {
+          await storeWa(env, { providerMsgId: params.MessageSid || params.SmsSid || '', direction: 'in', from: fromN, to: ccfg.number, body: body, kind: 'system', event: 'sandbox_join' });
+          return empty;
+        }
+        if (limited('wain:' + fromN, 20, 3600000)) return empty; // inbound flood guard, SMS parity
+        const media = [];
+        const nMedia = Math.min(10, parseInt(params.NumMedia || '0', 10) || 0);
+        for (let i = 0; i < nMedia; i++) { const u = String(params['MediaUrl' + i] || ''); if (u.indexOf('https://api.twilio.com/') === 0) media.push({ url: u, type: String(params['MediaContentType' + i] || '').slice(0, 80) }); }
+        const stored = await storeWa(env, { providerMsgId: params.MessageSid || params.SmsSid || '', direction: 'in', from: fromN, to: waStripPrefix(params.To || '') || ccfg.number, body: body, media: media });
+        if (stored.ok && stored.msg) await waThreadTouch(env, stored.msg);
+        // No owner-cell copy (unlike SMS): WhatsApp threads surface in
+        // the portal with unread counts; smsrelay semantics do not
+        // translate to WhatsApp. The owner replies from the portal.
+        return empty;
+      }
       if (path === '/api/sms/ingest' && request.method === 'POST') {
         if (limited('ingest:' + ip, 600, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         const ccfg = await getCallsCfg(env);
@@ -18498,6 +18731,116 @@ async function handleRequest(request, env, ctx) {
           }
         }
         return json({ ok: true, marked: marked }, 200, origin);
+      }
+
+      // ---- admin: business WhatsApp threads (Pack PortalWhatsApp) ----
+      if (path === '/api/admin/whatsapp' && request.method === 'GET') {
+        const ccfg = await getCallsCfg(env);
+        const limit = Math.min(300, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+        const wids = await idxGetMerged(env, 'wa', 'wa:');
+        let msgs = [], systemEvents = 0;
+        for (const wid of wids) { const m2 = await siteKvGet(env, 'wa:' + wid, { type: 'json' }); if (!m2) continue; if (m2.kind === 'system') { systemEvents++; continue; } msgs.push(m2); }
+        msgs.sort(function (a, b) { return String(b.at).localeCompare(String(a.at)); });
+        let unread = 0;
+        const unreadBy = {};
+        for (const m3 of msgs) { if (m3.direction === 'in' && !m3.read) { unread++; const l3 = phoneLast10(m3.from); if (l3) unreadBy[l3] = (unreadBy[l3] || 0) + 1; } }
+        const threads = {}, seenT = {};
+        for (const m4 of msgs) {
+          const o = m4.direction === 'in' ? m4.from : m4.to; const l = phoneLast10(o);
+          if (!l || seenT[l]) continue; seenT[l] = 1;
+          const w = await waWindow(env, l);
+          const th = (await siteKvGet(env, 'wathread:' + l, { type: 'json' })) || {};
+          threads[l] = { phone: th.phone || o, name: m4.matchedName || th.matchedName || '', email: m4.matchedEmail || th.matchedEmail || '', lastInAt: w.lastInAt, windowOpen: w.open, windowClosesAt: w.closesAt, unread: unreadBy[l] || 0 };
+        }
+        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', unread: unread, systemEvents: systemEvents, templates: waTemplates(ccfg), threads: threads, messages: msgs.slice(0, limit) }, 200, origin);
+      }
+      if (path === '/api/admin/whatsapp/send' && request.method === 'POST') {
+        const ccfg = await getCallsCfg(env);
+        if (!ccfg || !ccfg.number) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const to = normPhone(d.phone || d.to || '');
+        const last = phoneLast10(to);
+        if (last.length < 10) return json({ ok: false, error: 'validation' }, 400, origin);
+        const body = String(d.body || '').trim().slice(0, 1600);
+        const tpl = d.template && typeof d.template === 'object' ? d.template : null;
+        if (!!body === !!tpl) return json({ ok: false, error: 'validation' }, 400, origin); // exactly one of free-form body / template
+        const win = await waWindow(env, last);
+        let sid = false, sentBody = body;
+        if (tpl) {
+          const entry = waTemplates(ccfg).filter(function (t) { return t.name === String(tpl.name || '') && t.lang === String(tpl.lang || ''); })[0];
+          if (!entry) return json({ ok: false, error: 'template_not_found' }, 400, origin);
+          const vars = Array.isArray(tpl.variables) ? tpl.variables : [];
+          if (entry.sid) { sid = await sendWhatsApp(env, ccfg, to, { contentSid: entry.sid, variables: vars }); sentBody = waRenderTemplate(entry.body, vars); }
+          else { sentBody = waRenderTemplate(entry.body, vars); sid = await sendWhatsApp(env, ccfg, to, { body: sentBody }); }
+        } else {
+          // THE 24H LAW: free-form text only inside the window.
+          if (!win.open) return json({ ok: false, error: 'outside_24h_window', windowOpen: false, lastInAt: win.lastInAt, closesAt: win.closesAt }, 403, origin);
+          sid = await sendWhatsApp(env, ccfg, to, { body: body });
+        }
+        if (!sid) return json({ ok: false, error: 'send_failed' }, 502, origin);
+        let storedId = '', storeWarn = false;
+        try { const stored = await storeWa(env, { providerMsgId: typeof sid === 'string' ? sid : 'portal-' + randHex(8), direction: 'out', from: ccfg.number, to: to, body: sentBody }); storedId = stored.id; if (stored.msg) await waThreadTouch(env, stored.msg); } catch (e) { storeWarn = true; } // sent already: a store failure must not read as a send failure (SMS parity)
+        return json({ ok: true, id: storedId, warning: storeWarn ? 'sent_but_unstored' : undefined }, 200, origin);
+      }
+      if (path === '/api/admin/whatsapp/read' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const target = phoneLast10(d.phone || '');
+        if (target.length < 10) return json({ ok: false, error: 'validation' }, 400, origin);
+        const wids = await idxGetMerged(env, 'wa', 'wa:');
+        let marked = 0;
+        for (const wid of wids) {
+          const m2 = await siteKvGet(env, 'wa:' + wid, { type: 'json' });
+          if (m2 && m2.kind === 'msg' && m2.direction === 'in' && !m2.read && phoneLast10(m2.from) === target) {
+            m2.read = true;
+            await siteKvPut(env, 'wa:' + wid, JSON.stringify(m2));
+            marked++;
+          }
+        }
+        return json({ ok: true, marked: marked }, 200, origin);
+      }
+      if (path === '/api/admin/whatsapp/draft' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const phone = normPhone(d.phone || '');
+        const last = phoneLast10(phone);
+        if (last.length < 10) return json({ ok: false, error: 'validation' }, 400, origin);
+        const out = await waDraftFor(env, phone);
+        if (!out.ok) return json(out, out.error === 'no_thread' ? 404 : 200, origin);
+        const rec = { draft: out.draft, lang: out.lang, summary: out.summary, temperature: out.temperature, grounded: out.grounded, needsConfirm: out.needsConfirm, matchedEmail: out.matchedEmail || '', at: Date.now(), status: 'draft' };
+        await siteKvPut(env, 'wadraft:' + last, JSON.stringify(rec));
+        return json(Object.assign({ ok: true, phone: phone }, rec), 200, origin);
+      }
+      if (path === '/api/admin/whatsapp/draft/accept' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const last = phoneLast10(d.phone || '');
+        if (last.length < 10) return json({ ok: false, error: 'validation' }, 400, origin);
+        const rec = (await siteKvGet(env, 'wadraft:' + last, { type: 'json' })) || null;
+        if (!rec) return json({ ok: false, error: 'no_draft' }, 404, origin);
+        const who = await matchPhoneEmail(env, d.phone || '');
+        if (!who) return json({ ok: false, error: 'no_match' }, 400, origin);
+        // A NOTE on the profile — never a stage change, never a send.
+        await pushActivity(env, who.email, 'whatsapp-ai', '🤖 AI suggestion (WhatsApp draft): ' + String(rec.summary || '').slice(0, 90) + ' · suggested temperature: ' + String(rec.temperature || 'warm'));
+        rec.status = 'accepted'; rec.acceptedAt = Date.now();
+        await siteKvPut(env, 'wadraft:' + last, JSON.stringify(rec));
+        return json({ ok: true, email: who.email }, 200, origin);
+      }
+      if (path === '/api/admin/whatsapp/draft/discard' && request.method === 'POST') {
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        const last = phoneLast10(d.phone || '');
+        if (last.length < 10) return json({ ok: false, error: 'validation' }, 400, origin);
+        // Drafts are the one WhatsApp artefact WITH a delete path —
+        // message records (wa:) deliberately have none.
+        await siteKvDelete(env, 'wadraft:' + last).catch(function () {});
+        return json({ ok: true }, 200, origin);
       }
 
       // ---- admin: business call log ----
