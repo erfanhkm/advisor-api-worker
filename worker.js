@@ -4466,6 +4466,63 @@ async function vmTranscribeAndStore(env, callId) {
     }
   } catch (e) {}
 }
+/* ---- Pack TelephonyClick2Call (2026-11-12): portal click-to-call --
+   The owner clicks Call on a CRM person panel; the worker asks
+   Twilio to ring the OWNER's cell (cfg:calls.forwardTo) FIRST with
+   a bridge TwiML URL, and only when he answers does the bridge
+   route emit the Dial to the contact — so a contact is never
+   dialled unless the owner picked up (no ghost calls). The
+   contact's number ALWAYS comes from the person's stored record
+   (findPersonByEmail) — the portal request carries only the
+   person's email, never a number. One shared dial-TwiML builder
+   (outboundDialXml) serves both this bridge and the DISA route,
+   so the caller-ID + recording posture can never drift apart.
+   The contact leg's status lands on
+   /api/calls/twilio/status?dir=portal and is stored by storeCall
+   as ONE record with direction 'outbound-portal', matched to the
+   person like its siblings. Attempts live at c2c:<attemptId>
+   (the bridge token IS the attempt id); c2cflight:<last10> is
+   the in-flight guard. */
+async function findPersonByEmail(env, email) {
+  const ne = normEmail(email || '');
+  if (!ne) return null;
+  const u = await siteKvGet(env, 'user:' + ne, { type: 'json' });
+  if (u && u.email) return { email: u.email, name: u.name || '', phone: (u.profile && u.profile.phone) || '' };
+  const lids = await idxGetMerged(env, 'leads', 'lead:');
+  for (const lid of lids) {
+    const l = await siteKvGet(env, 'lead:' + lid, { type: 'json' });
+    if (l && l.email && normEmail(l.email) === ne) return { email: l.email, name: l.name || '', phone: l.phone || '' };
+  }
+  return null;
+}
+async function twilioCreateCall(env, cfg, opts) {
+  // Places an outbound call through the Twilio Calls API (the
+  // sendSms posture: Basic auth, form body, bounded timeout; the
+  // call SID or false; credentials never logged or returned).
+  try {
+    if (!cfg || cfg.provider !== 'twilio' || !cfg.twilioAccountSid || !cfg.twilioAuthToken || !cfg.number) return false;
+    const form = new URLSearchParams({ From: cfg.number, To: String(opts.to || ''), Url: String(opts.url || ''), Method: 'POST' });
+    if (opts.statusCallback) { form.set('StatusCallback', String(opts.statusCallback)); form.set('StatusCallbackMethod', 'POST'); form.append('StatusCallbackEvent', 'completed'); }
+    const r = await fetch('https://api.twilio.com/2010-04-01/Accounts/' + encodeURIComponent(cfg.twilioAccountSid) + '/Calls.json', {
+      method: 'POST', signal: AbortSignal.timeout(8000),
+      headers: { Authorization: 'Basic ' + btoa(cfg.twilioAccountSid + ':' + cfg.twilioAuthToken), 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString()
+    });
+    if (!r.ok) return false;
+    const j = await r.json().catch(function () { return null; });
+    return (j && j.sid) ? String(j.sid) : false;
+  } catch (e) {}
+  return false;
+}
+function outboundDialXml(base, cfg, target, viaPortal) {
+  // THE outbound Dial TwiML — one implementation for the DISA
+  // route (viaPortal false; byte-identical to the TwiML it has
+  // always emitted) and the click-to-call bridge (viaPortal true;
+  // the status action carries dir=portal so the stored record is
+  // labelled 'outbound-portal'). Business caller ID + dual-channel
+  // recording from answer in both.
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + escapeXml(cfg.number) + '" record="record-from-answer-dual" action="' + base + '/api/calls/twilio/status?dir=' + (viaPortal ? 'portal' : 'out') + '" method="POST"><Number>' + escapeXml(target) + '</Number></Dial></Response>';
+}
 async function storeCall(env, rec, ctx) {
   const prov = String(rec.provider || 'generic').slice(0, 20);
   const pcid = String(rec.providerCallId || '').slice(0, 80);
@@ -4475,7 +4532,7 @@ async function storeCall(env, rec, ctx) {
   const now = new Date().toISOString();
   const merged = Object.assign({}, existing || {}, {
     id: id, provider: prov, providerCallId: pcid,
-    direction: rec.direction === 'out' ? 'out' : 'in',
+    direction: rec.direction === 'out' ? 'out' : (rec.direction === 'outbound-portal' ? 'outbound-portal' : 'in'), // Pack TelephonyClick2Call: portal click-to-call legs keep their own direction label; every consumer treats it as outbound (the match side is 'to', the screen pop stays inbound-only)
     from: normPhone(rec.from), to: normPhone(rec.to),
     startedAt: String(rec.startedAt || (existing && existing.startedAt) || now).slice(0, 40),
     durationSec: Math.max(0, Math.min(86400, parseInt(rec.durationSec, 10) || 0)),
@@ -15539,9 +15596,11 @@ async function handleRequest(request, env, ctx) {
         if (limited('callst:' + String(params.From || ''), 60, 3600000)) return new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
         const rawStatus = String(params.DialCallStatus || params.CallStatus || '').toLowerCase();
         const statusMap = { completed: 'completed', busy: 'busy', 'no-answer': 'no-answer', failed: 'failed', canceled: 'missed' };
+        const dirQ = url.searchParams.get('dir') || ''; // Pack TelephonyClick2Call: dir=portal marks the contact leg of a portal click-to-call (stored 'outbound-portal'); DISA keeps dir=out exactly as before
+        const isOutLeg = dirQ === 'out' || dirQ === 'portal' || String(params.Direction || 'inbound').indexOf('outbound') === 0;
         const rec = {
           provider: 'twilio', providerCallId: params.CallSid || params.DialCallSid || '',
-          direction: (url.searchParams.get('dir') === 'out' || String(params.Direction || 'inbound').indexOf('outbound') === 0) ? 'out' : 'in',
+          direction: dirQ === 'portal' ? 'outbound-portal' : (isOutLeg ? 'out' : 'in'),
           from: params.From || '', to: params.To || '',
           durationSec: parseInt(params.DialCallDuration || params.CallDuration || '0', 10) || 0,
           status: statusMap[rawStatus] || 'completed',
@@ -15667,8 +15726,73 @@ async function handleRequest(request, env, ctx) {
         if (!/^1?[2-9]\d{9}$/.test(rawDigits)) return new Response('<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">That number looks incomplete. Please call back and try again.</Say><Hangup/></Response>', { status: 200, headers: xmlHead }); // NANP only (cycle 27, Claude H2): no premium/international destinations
         const target = normPhone(rawDigits);
         const base = 'https://' + new URL(request.url).host;
-        const xml = '<?xml version="1.0" encoding="UTF-8"?><Response><Dial callerId="' + escapeXml(ccfg.number) + '" record="record-from-answer-dual" action="' + base + '/api/calls/twilio/status?dir=out" method="POST"><Number>' + escapeXml(target) + '</Number></Dial></Response>';
+        const xml = outboundDialXml(base, ccfg, target, false); // Pack TelephonyClick2Call: shared with the portal bridge route (outboundDialXml) — byte-identical TwiML for the DISA leg
         return new Response(xml, { status: 200, headers: xmlHead });
+      }
+      if (path === '/api/calls/twilio/voice/bridge' && request.method === 'POST') {
+        // Pack TelephonyClick2Call: the TwiML Twilio fetches when
+        // the OWNER answers the click-to-call ring. Own auth, the
+        // exact posture of the DISA outbound route: inert TwiML
+        // while unconfigured, unconditional signature verification,
+        // then the attempt + leg gates — the Dial is emitted ONLY
+        // for a live attempt whose owner leg this request is, so
+        // the contact is dialled only after the owner answered.
+        const ccfg = await getCallsCfg(env);
+        const xmlHead = { 'Content-Type': 'text/xml; charset=utf-8' };
+        const unavailable = '<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Sorry, this number is not in service yet.</Say><Hangup/></Response>';
+        if (!ccfg || !ccfg.number || !ccfg.forwardTo) return new Response(unavailable, { status: 200, headers: xmlHead });
+        const params = await readFormParams(request);
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response(unavailable, { status: 200, headers: xmlHead });
+        const attemptId = String(url.searchParams.get('k') || '');
+        if (!/^c2c_[0-9a-f]{16}$/.test(attemptId)) return new Response(unavailable, { status: 200, headers: xmlHead });
+        const attempt = await env.LEADS.get('c2c:' + attemptId, { type: 'json' });
+        if (!attempt || !attempt.contact) return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (!(Date.now() - Date.parse(attempt.at || '') < 15 * 60000)) return new Response(unavailable, { status: 200, headers: xmlHead }); // a stale bridge token dials nobody
+        if (attempt.state !== 'ringing-owner' && attempt.state !== 'bridged') return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (normPhone(params.To || '') !== normPhone(ccfg.forwardTo)) return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (normPhone(params.From || '') !== normPhone(ccfg.number)) return new Response(unavailable, { status: 200, headers: xmlHead });
+        if (attempt.ownerCallSid && String(params.CallSid || '') !== attempt.ownerCallSid) return new Response(unavailable, { status: 200, headers: xmlHead });
+        attempt.state = 'bridged';
+        attempt.bridgedAt = new Date().toISOString();
+        await env.LEADS.put('c2c:' + attemptId, JSON.stringify(attempt));
+        const base = 'https://' + new URL(request.url).host;
+        return new Response(outboundDialXml(base, ccfg, attempt.contact, true), { status: 200, headers: xmlHead });
+      }
+      if (path === '/api/calls/twilio/click-status' && request.method === 'POST') {
+        // Pack TelephonyClick2Call: terminal status for the OWNER
+        // leg of a click-to-call (the StatusCallback named at
+        // creation, carrying ?k=<attemptId> — the signature covers
+        // the query string like every sibling). Updates ONLY the
+        // attempt record (the contact leg stores its own call
+        // record via /status?dir=portal): an owner who never
+        // answered is logged 'owner-no-answer' on the attempt and
+        // on the person's activity feed — the contact was never
+        // dialled and no call record exists for the attempt.
+        const ccfg = await getCallsCfg(env);
+        if (!ccfg) return new Response('not configured', { status: 503 });
+        const params = await readFormParams(request);
+        if (!ccfg.twilioAuthToken || !(await twilioSigOk(env, ccfg, request, params))) return new Response('forbidden', { status: 403 });
+        const empty = new Response('<?xml version="1.0" encoding="UTF-8"?><Response></Response>', { status: 200, headers: { 'Content-Type': 'text/xml; charset=utf-8' } });
+        const attemptId = String(url.searchParams.get('k') || '');
+        if (!/^c2c_[0-9a-f]{16}$/.test(attemptId)) return empty;
+        const attempt = await env.LEADS.get('c2c:' + attemptId, { type: 'json' });
+        if (!attempt || !attempt.ownerCallSid || String(params.CallSid || '') !== attempt.ownerCallSid) return empty;
+        const st = String(params.CallStatus || '').toLowerCase();
+        let changed = false;
+        if (st === 'completed') {
+          if (attempt.state === 'ringing-owner') { attempt.state = 'owner-no-answer'; changed = true; } // the leg ended without the bridge ever being fetched (never answered / declined)
+          else if (attempt.state === 'bridged') { attempt.state = 'done'; changed = true; }
+        } else if (st === 'no-answer' || st === 'busy' || st === 'failed' || st === 'canceled') {
+          if (attempt.state === 'ringing-owner') { attempt.state = 'owner-no-answer'; changed = true; }
+        }
+        if (!changed) return empty;
+        attempt.endedAt = new Date().toISOString();
+        await env.LEADS.put('c2c:' + attemptId, JSON.stringify(attempt));
+        try { await env.LEADS.delete('c2cflight:' + attempt.contactLast10); } catch (e) {}
+        if (attempt.state === 'owner-no-answer' && attempt.email) {
+          await pushActivity(env, attempt.email, 'call', "📞 Click-to-call: you didn't answer your cell, so " + (attempt.name || 'the client') + ' was not called');
+        }
+        return empty;
       }
       if (path === '/api/calls/twilio/sms' && request.method === 'POST') {
         const ccfg = await getCallsCfg(env);
@@ -21534,6 +21658,45 @@ async function handleRequest(request, env, ctx) {
         let matchedName = '';
         for (const e of events) { if (e.matchedName) { matchedName = e.matchedName; break; } }
         return json({ ok: true, phone: phoneQ, email: emailQ, matchedName: matchedName, count: events.length, events: events }, 200, origin);
+      }
+
+      // ---- admin: portal click-to-call (Pack TelephonyClick2Call) ----
+      if (path === '/api/admin/calls/click-call' && request.method === 'POST') {
+        const ccfg = await getCallsCfg(env);
+        if (!ccfg || ccfg.provider !== 'twilio' || !ccfg.number || !ccfg.forwardTo || !ccfg.twilioAccountSid || !ccfg.twilioAuthToken) return json({ ok: false, error: 'not_configured' }, 503, origin);
+        let d = null;
+        try { d = await request.json(); } catch (e) {}
+        d = d || {};
+        // The request names a PERSON (email), never a number: the
+        // dialled number is read from that person's stored record
+        // below, so a typo'd or tampered number can never be called.
+        const email = normEmail(d.email || '');
+        if (!email) return json({ ok: false, error: 'validation' }, 400, origin);
+        const person = await findPersonByEmail(env, email);
+        if (!person) return json({ ok: false, error: 'not_found' }, 404, origin);
+        const contact = normPhone(person.phone || '');
+        const rawDigits = contact.replace(/\D/g, '');
+        if (phoneLast10(contact).length < 10) return json({ ok: false, error: 'no_phone' }, 400, origin);
+        if (!/^1?[2-9]\d{9}$/.test(rawDigits)) return json({ ok: false, error: 'bad_phone' }, 400, origin); // NANP only — the DISA posture (cycle 27, Claude H2)
+        if (phoneLast10(contact) === phoneLast10(ccfg.forwardTo)) return json({ ok: false, error: 'own_number' }, 400, origin);
+        const last10 = phoneLast10(contact);
+        const flightKey = 'c2cflight:' + last10;
+        if (await env.LEADS.get(flightKey)) return json({ ok: false, error: 'in_flight' }, 409, origin);
+        const attemptId = 'c2c_' + randHex(8);
+        const attempt = { id: attemptId, email: person.email, name: person.name || '', contact: contact, contactLast10: last10, at: new Date().toISOString(), state: 'ringing-owner', ownerCallSid: '' };
+        await env.LEADS.put('c2c:' + attemptId, JSON.stringify(attempt));
+        await env.LEADS.put(flightKey, attemptId, { expirationTtl: 300 });
+        const base = 'https://' + new URL(request.url).host;
+        const sid = await twilioCreateCall(env, ccfg, { to: ccfg.forwardTo, url: base + '/api/calls/twilio/voice/bridge?k=' + attemptId, statusCallback: base + '/api/calls/twilio/click-status?k=' + attemptId });
+        if (!sid) {
+          attempt.state = 'api-failed';
+          await env.LEADS.put('c2c:' + attemptId, JSON.stringify(attempt));
+          try { await env.LEADS.delete(flightKey); } catch (e) {}
+          return json({ ok: false, error: 'call_failed' }, 502, origin);
+        }
+        attempt.ownerCallSid = sid;
+        await env.LEADS.put('c2c:' + attemptId, JSON.stringify(attempt));
+        return json({ ok: true, id: attemptId, state: 'ringing-owner', toLast4: last10.slice(-4) }, 200, origin);
       }
 
       // ---- admin: business call log ----
