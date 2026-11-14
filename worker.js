@@ -6125,7 +6125,7 @@ async function academyAudit(env, action, target, ip, detail) {
   // {action, target, actor, ip, at, detail}, TTL 730 days.
   try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: action, target: target, actor: 'admin', ip: ip, at: new Date().toISOString(), detail: detail || {} }), { expirationTtl: 730 * 86400 }); } catch (e) {}
 }
-async function academyAuditScan(env, pred, cap, limit) {
+async function academyAuditScan(env, pred, cap, limit, budget) {
   // §6.3: bounded newest-first scan of the audit: prefix (newest 1,000).
   // Pack PortalAcademyTilesInviteFix (2026-11-13): each get is guarded
   // — one unparseable audit: value must not 500 the whole overview /
@@ -6135,10 +6135,31 @@ async function academyAuditScan(env, pred, cap, limit) {
   // entire prefix (the mig-era backlog made the overview read 400+
   // records to use the newest 10, which is what left the portal's
   // Academy count tiles stuck on "–").
-  const keys = await listAllKeys(env, 'audit:', typeof cap === 'number' ? cap : 1000);
+  // Pack PortalAcademyTilesRound2 (2026-11-13): two production-shape
+  // corrections the TilesInvite fixtures could not see. (1) WINDOW:
+  // listAllKeys returns keys ASCENDING, so the old default cap of
+  // 1,000 made the scan read the OLDEST 1,000 records — once the
+  // prefix outgrew the cap (per-item booklet_seed / tutor_seed /
+  // r2_mig audits, ~1,235 records), every newer record, including all
+  // current academy.* activity, fell OUTSIDE the window and
+  // recentActions silently froze at the window's edge. The default
+  // cap is now 10,000 keys (listing costs at most 10 ops — one per
+  // 1,000-key page) so iteration starts from the TRUE newest record.
+  // (2) EXAMINED BUDGET: a match limit alone does not bound cost when
+  // matches are sparse — the overview still examined ~1,000 records
+  // (~1,006 KV ops, ~10 s at live per-op latency) to collect 10
+  // matches from the oldest era, which is why the tiles stayed blank
+  // in production even after the TilesInvite fix. Callers may now
+  // pass BUDGET, a hard cap on records EXAMINED; the scan stops at
+  // whichever bound hits first.
+  const keys = await listAllKeys(env, 'audit:', typeof cap === 'number' ? cap : 10000);
   const out = [];
   const max = typeof limit === 'number' && limit > 0 ? limit : Infinity;
+  const maxExamined = typeof budget === 'number' && budget > 0 ? budget : Infinity;
+  let examined = 0;
   for (let i = keys.length - 1; i >= 0; i--) {
+    if (examined >= maxExamined) break;
+    examined++;
     let v = null;
     try { v = await env.LEADS.get(keys[i].name, { type: 'json' }); } catch (e) { v = null; }
     if (v && pred(v)) { out.push(v); if (out.length >= max) break; }
@@ -18746,7 +18767,7 @@ async function handleRequest(request, env, ctx) {
           }
         }
         expiring.sort(function (a, b) { return String(a.expiresAt).localeCompare(String(b.expiresAt)); });
-        const recentActions = (await academyAuditScan(env, function (v) { return String(v.action || '').indexOf('academy.') === 0; }, undefined, 10)).slice(0, 10);
+        const recentActions = (await academyAuditScan(env, function (v) { return String(v.action || '').indexOf('academy.') === 0; }, undefined, 10, 60)).slice(0, 10);
         return json({ counts: counts, expiring: expiring, recentActions: recentActions }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'GET') {
