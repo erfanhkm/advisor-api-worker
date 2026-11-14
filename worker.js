@@ -21115,7 +21115,12 @@ async function handleRequest(request, env, ctx) {
         // Transcribe tick from the stored flag (portal edit P4).
         // The config object itself is still never returned — the
         // same posture as the 'configured' boolean beside it.
-        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', transcribe: !!(ccfg && ccfg.transcribe === true), calls: listCalls, guardian: { day: vancouverDay(), alerts: gAlertsTS } }, 200, origin);
+        // Pack CallsIngestSecretSolo (2026-11-14): a lone
+        // 'hasSecret' boolean rides beside it so the card can
+        // render a truthful status for a secret-only cfg:calls
+        // (receptionist bridge armed, telephony still inert) —
+        // the boolean only; the secret itself never leaves.
+        return json({ ok: true, configured: !!(ccfg && ccfg.number), number: (ccfg && ccfg.number) || '', provider: (ccfg && ccfg.provider) || '', transcribe: !!(ccfg && ccfg.transcribe === true), hasSecret: !!(ccfg && ccfg.secret), calls: listCalls, guardian: { day: vancouverDay(), alerts: gAlertsTS } }, 200, origin);
       }
       // ---- admin: webhook health guardian (Pack TelephonyStronger) ----
       if (path === '/api/admin/calls/guardian' && request.method === 'GET') {
