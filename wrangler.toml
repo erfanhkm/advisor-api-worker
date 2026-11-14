@@ -31,8 +31,12 @@ service = "newsletter-signup"
 binding = "AICHAT"
 service = "ai-chat"
 
+# Pack UsageAlertNative (2026-11-13): the second expression is the
+# native usage watchdog (hourly at :07 UTC). scheduled() dispatches
+# on event.cron: "7 * * * *" runs ONLY the watchdog; the nightly
+# expression below never runs it.
 # Nightly automatic whole-site backup (worker scheduled handler;
 # 09:00 UTC = 01:00 PST / 02:00 PDT). The handler itself date-gates:
 # no backup is taken before 2026-12-01.
 [triggers]
-crons = ["0 9 * * *"]
+crons = ["0 9 * * *", "7 * * * *"]
