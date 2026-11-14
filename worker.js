@@ -4872,20 +4872,50 @@ async function runFullBackup(env, source) {
 // 1 get for the index + 1 get per item. idxGet self-heals: a missing index is
 // rebuilt with a single (rare) list and stored. Readers tolerate index
 // entries whose item was deleted (they filter nulls).
+// Pack BridgeStore (2026-11-14): per-isolate memo of the last
+// empty-index rescan, so the healing in idxGet below cannot turn a
+// genuinely empty collection into a prefix list on every read (list
+// calls are the scarcest resource — see the header above). A fresh
+// isolate always rescans; a warm one at most once per window.
+const idxEmptyRescanAt = new Map();
 async function idxGet(env, name, prefix, cap) {
   const raw = await env.LEADS.get('idx:' + name, { type: 'json' });
-  if (Array.isArray(raw)) return raw.slice();
+  if (Array.isArray(raw) && raw.length) return raw.slice();
+  if (Array.isArray(raw)) {
+    // Pack BridgeStore: a stored EMPTY index is NOT authoritative.
+    // It is what a build during an empty moment leaves behind, and
+    // once an idxAdd is lost to a transient KV write failure the
+    // record it belonged to stays invisible to every index reader
+    // forever (live proof 2026-11-14: idx:calls = [] while call
+    // records existed, so the receptionist bridge's calls never
+    // reached the portal list — readers never rescanned). Treat an
+    // empty stored index as unbuilt and rescan, rate-bound by the
+    // memo above; re-store only when the scan finds members (an
+    // empty result changes nothing — the stored value already is
+    // []). Non-empty indexes and the missing-index path below keep
+    // the original behaviour byte-for-byte.
+    const last = idxEmptyRescanAt.get(name) || 0;
+    if (Date.now() - last < 300000) return [];
+    idxEmptyRescanAt.set(name, Date.now());
+  }
   const keys = await listAllKeys(env, prefix, cap || 5000);
   const ids = keys.map(function (k) { return String(k.name || k).slice(prefix.length); });
-  try { await env.LEADS.put('idx:' + name, JSON.stringify(ids)); } catch (e) {}
+  if (ids.length || !Array.isArray(raw)) { try { await env.LEADS.put('idx:' + name, JSON.stringify(ids)); } catch (e) {} }
   return ids;
 }
 async function idxAdd(env, name, id) {
   try {
     const raw = await env.LEADS.get('idx:' + name, { type: 'json' });
     if (!Array.isArray(raw)) return; // not built yet: idxGet builds from live keys, and the item is already written
-    if (raw.indexOf(id) === -1) { raw.push(id); await env.LEADS.put('idx:' + name, JSON.stringify(raw)); }
-  } catch (e) {}
+    if (raw.indexOf(id) !== -1) return;
+    raw.push(id);
+    try { await env.LEADS.put('idx:' + name, JSON.stringify(raw)); return; }
+    catch (e) { /* Pack BridgeStore: one retry with a fresh read-merge-write below */ }
+    const raw2 = await env.LEADS.get('idx:' + name, { type: 'json' });
+    const arr = Array.isArray(raw2) ? raw2 : raw;
+    if (arr.indexOf(id) === -1) arr.push(id);
+    await env.LEADS.put('idx:' + name, JSON.stringify(arr));
+  } catch (e) { console.error(JSON.stringify({ event: 'idx_add_fail', name: name })); } // Pack BridgeStore: a lost index write hides an already-stored record from every index reader — it must never fail silently again (the success path above is unchanged)
 }
 async function idxRemove(env, name, id) {
   try {
@@ -15041,7 +15071,13 @@ async function handleRequest(request, env, ctx) {
         let d = null;
         try { d = await request.json(); } catch (e) {}
         if (!d || typeof d !== 'object') return json({ ok: false, error: 'validation' }, 400, origin);
-        const rr = await storeCall(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }), ctx);
+        // Pack BridgeStore: storeCall runs unguarded helpers against
+        // live KV (e.g. matchPhoneEmail) — a throw must surface as an
+        // honest, loggable 500 the bridge will retry, not as a bare
+        // top-level 500 with no route-level trace (2026-11-14).
+        let rr;
+        try { rr = await storeCall(env, Object.assign({}, d, { provider: d.provider || ccfg.provider || 'generic' }), ctx); }
+        catch (e) { console.error(JSON.stringify({ event: 'ingest_store_fail' })); return json({ ok: false, error: 'store' }, 500, origin); }
         return json(rr, rr.ok ? 200 : 400, origin);
       }
       if (path === '/api/calls/twilio/voice' && request.method === 'POST') {
