@@ -2425,6 +2425,246 @@ function publicSettings(s, base) {
   return out;
 }
 
+/* ==== Pack UsageAlertNative (2026-11-13): the native usage watchdog ====
+   The 80% usage watchdog that used to run as an external hourly job
+   (hidden_files/usage-alert-check.mjs, driven by a Muse cron) now
+   lives INSIDE the worker: a dedicated Cloudflare Cron Trigger
+   (USAGE_ALERT_CRON, hourly at :07 UTC — see advisor-wrangler.toml)
+   dispatches scheduled() to runUsageAlertWatchdog ONLY; the nightly
+   chain never runs the watchdog and the watchdog tick never runs the
+   nightly chain.
+   - Metrics come from buildUsageSplit(env) — the SAME computation
+     behind GET /api/admin/usage-split; the math exists in exactly
+     one place.
+   - ElevenLabs is the one metric the split cannot read (its row is
+     state 'external', pct null): the watchdog reads an API key from
+     cfg:elevenlabs ONLY when that cfg exists ({apiKey|key|token});
+     absent ⇒ the leg is skipped silently. NO other system's keys
+     are read (three-pools law — cfg:tutor is the Academy's own and
+     is never touched here; the tutor numbers arrive through the
+     split's existing read-only bridge).
+   - Dedupe: one alert per metric per reset period, state in KV at
+     'usagealert:<metricKey>|<periodId>' (period rules identical to
+     the retired cron script: utc-day / vancouver-day / monthly) plus
+     a single 'usagealert:lastcheck' stamp. NO per-check audit keys.
+   - Delivery is fully internal (cfg:mail is unprovisioned and
+     auto-send stays OFF): (a) a portal Web Push via puNotifyPush,
+     (b) a HELD queueMail record kind 'usage-alert' (sent:false)
+     carrying the full Persian body — the push and the held mail are
+     attempted independently; one failing never blocks the other.
+     'usage-alert' sits in MAIL_POLICY_TRANSACTIONAL (see queueMail):
+     this is an operations notice to the owner's own business inbox,
+     and the DNC gate must never silently drop it. The keyed
+     queueMail call (key 'usagealert:<metric>|<period>') makes the
+     held record itself idempotent as a second layer.
+   - buildUsageSplit attaches a `watchdog` status block (last check
+     stamp + how many metrics sit in an alerted state for their
+     current period) which the portal Usage section renders as one
+     line; inside a watchdog run the block reflects the PREVIOUS
+     check, which is the truth the owner sees anyway. */
+const USAGE_ALERT_THRESHOLD = 80;
+const USAGE_ALERT_CRON = '7 * * * *';
+const USAGE_ALERT_TO = 'erfanbcrealestate@gmail.com';
+const USAGE_ALERT_KNOW = {
+  ai_chats: { fa: 'چت‌های هوش مصنوعی سایت', drivers: 'گفت‌وگوهای بازدیدکنندگان با دستیار سایت؛ هر گفت‌وگوی جدید یک واحد از سقف روزانه کم می‌کند.', solution: 'اقدام فوری لازم نیست؛ سقف ساعت ۱۷:۰۰ ونکوور ریست می‌شود. اگر زودتر پر شود، دستیار به‌جای پاسخ کامل، پاسخ مؤدبانهٔ جایگزین می‌دهد و سایت از کار نمی‌افتد.' },
+  ai_searches: { fa: 'جست‌وجوهای وب دستیار سایت', drivers: 'جست‌وجوهای زنده‌ای که دستیار سایت برای پاسخ به پرسش‌های بازار و اخبار انجام می‌دهد.', solution: 'اقدام فوری لازم نیست؛ ساعت ۱۷:۰۰ ونکوور ریست می‌شود. تا آن موقع دستیار بدون جست‌وجوی تازه و با دانش موجود جواب می‌دهد.' },
+  brain: { fa: 'فراخوانی‌های مغز پورتال', drivers: 'کارهای دستیار داخل پورتال: پیش‌نویس ایمیل و پیام، تحلیل لید، بریف بازار و پاسخ‌های دستیار دسک.', solution: 'این سقف «نرم» است؛ رد شدنش چیزی را خراب نمی‌کند — مغز تا نیمه‌شب ونکوور به پاسخ‌های قانون‌محور برمی‌گردد.' },
+  kv_lists: { fa: 'عملیات لیست KV سایت (LEADS)', drivers: 'بارگذاری فهرست‌های پورتال (لیدها، ایمیل‌ها، رزروها، دانشجویان) و کارهای پس‌زمینه‌ای که کلیدها را می‌شمارند.', solution: 'اقدام فوری لازم نیست؛ ساعت ۱۷:۰۰ ونکوور ریست می‌شود. فهرست‌های پورتال کش نسلی دارند و تا ریست با دادهٔ کمی قدیمی‌تر کار می‌کنند.' },
+  kv_writes: { fa: 'نوشتن‌های KV سایت (LEADS)', drivers: 'ورودها، ذخیرهٔ پیشرفت و وضعیت‌ها، و کارهای دسته‌ای (بکاپ، ایمپورت). این شاخص خودشمار ندارد و از آلارم‌های کلودفلر سنجیده می‌شود.', solution: 'اگر نوشتن متوقف شد، کارهای دسته‌ای را تا ریست (۱۷:۰۰ ونکوور) نگه دارید؛ فاز سایتِ سرریز KV (P0-2) این ریسک را برای همیشه می‌بندد.' },
+  academy_kv_lists: { fa: 'عملیات لیست KV آکادمی', drivers: 'فهرست دانشجویان در پورتال، اسکن‌های وضعیت آکادمی و بررسی‌های دوره‌ای.', solution: 'اقدام فوری لازم نیست؛ ساعت ۱۷:۰۰ ونکوور ریست می‌شود.' },
+  academy_kv_writes: { fa: 'نوشتن‌های KV آکادمی', drivers: 'ورود دانشجویان، ذخیرهٔ پیشرفت درس و کوئیز، ادعاهای پرداخت Stripe و کارهای دسته‌ای مثل سید تیوتر و مایگریشن. (۱۲ نوامبر همین سقف با سید تیوتر + آدیت‌های مایگریشن پر شد.)', solution: 'در روزِ سقف، ورود و ذخیرهٔ پیشرفت دانشجو خطا می‌دهد تا ریست ۱۷:۰۰ ونکوور. با دیپلوی سرریز KV (KvSpillway) این‌ها خودکار روی R2 می‌روند و بعد از ریست برمی‌گردند.' },
+  tutor_credits: { fa: 'اعتبار چت تیوتر آکادمی', drivers: 'هر نوبت چت دانشجو با تیوتر آکادمی یک اعتبار کم می‌کند؛ سقف هر دانشجو ۴۰ در روز و سقف کلی ۲۰۰۰ در روز (روز ونکوور) است.', solution: 'اقدام فوری لازم نیست؛ نیمه‌شب ونکوور ریست می‌شود. تا آن موقع تیوتر برای امروز جواب نمی‌دهد ولی بقیهٔ آکادمی (درس، کوئیز، بوکلت) سالم است.' },
+  r2_storage: { fa: 'فضای ذخیره‌سازی ویدیوی R2', drivers: 'کتابخانهٔ ویدیوهای آکادمی (فایل‌های HLS)؛ الان ۴۱ درس ≈ ۷٫۶ گیگابایت است و هر درس تازه چندصد مگابایت اضافه می‌کند. این سقف روزانه ریست نمی‌شود.', solution: 'تصمیم لازم است: یا پلن R2 ارتقا پیدا کند (پولی)، یا ویدیوهای آرشیوی به B2 منتقل شوند. تا قبل از ۱۰ گیگابایت چیزی از کار نمی‌افتد.' },
+  elevenlabs: { fa: 'اعتبار ElevenLabs (نریشن)', drivers: 'نریشن ویدیوهای آکادمی؛ هر کاراکتر متن ≈ یک اعتبار روی مدل v3. نریشن ۴۷ درس باقی‌مانده ≈ ۵۵۴ هزار اعتبار می‌خواهد در حالی که کل چرخه ۱۲۱٬۷۵۹ اعتبار است.', solution: 'تصمیم مالی با شماست: صبر تا چرخهٔ ماه بعد، یا ارتقای پلن. تا آن موقع نریشن تازه نسازید؛ درس‌های ضبط‌شده سالم‌اند.' }
+};
+function usageAlertFaName(m) { const k = USAGE_ALERT_KNOW[m.key]; return (k && k.fa) || m.label || m.key; }
+function usageAlertVanDay(d) { try { return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d); } catch (e) { return d.toISOString().slice(0, 10); } }
+function usageAlertPeriodId(kind, now) {
+  if (kind === 'utc-day') return 'utc:' + now.toISOString().slice(0, 10);
+  if (kind === 'vancouver-day') return 'van:' + usageAlertVanDay(now);
+  if (kind === 'monthly') return 'mon:' + now.toISOString().slice(0, 7);
+  return 'once';
+}
+function usageAlertResetTextFa(m, now) {
+  if (m.resetKind === 'utc-day') return 'امروز ساعت ۱۷:۰۰ به وقت ونکوور (نیمه‌شب UTC)';
+  if (m.resetKind === 'vancouver-day') return 'نیمه‌شب امشب به وقت ونکوور (شروع ' + usageAlertVanDay(new Date(now.getTime() + 86400000)) + ')';
+  if (m.resetKind === 'monthly') {
+    if (m.key === 'elevenlabs') return 'با چرخهٔ ماهانهٔ اشتراک ElevenLabs (روز دقیق چرخه در پنل ElevenLabs مشخص است)';
+    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    let stamp = ''; try { stamp = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Vancouver', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(next); } catch (e) {}
+    return 'اول ماه بعد، ساعت ۱۷:۰۰ به وقت ونکوور (' + stamp + ')';
+  }
+  return m.resetText || '—';
+}
+function usageAlertCompose(m, now) {
+  const k = USAGE_ALERT_KNOW[m.key] || { fa: m.label, drivers: 'مصرف عادی سرویس‌های پلتفرم.', solution: 'اقدام فوری لازم نیست؛ زمان ریست در پایین آمده است.' };
+  const pct = Math.round(m.pct * 10) / 10;
+  const subject = '⚠️ هشدار مصرف: ' + k.fa + ' به ' + pct + '٪ رسید';
+  const body = [
+    'سلام عرفان،',
+    '',
+    'شاخص «' + k.fa + '» (' + m.label + ') به ' + pct + '٪ از سقفش رسیده است: ' + Number(m.used).toLocaleString('en-CA') + ' از ' + Number(m.limit).toLocaleString('en-CA') + ' ' + (m.unit || '') + '.',
+    '',
+    '۱) راه‌حل / چه کار کنیم:',
+    k.solution,
+    '',
+    '۲) چه چیزهایی این شاخص را به سقف نزدیک می‌کند:',
+    k.drivers,
+    '',
+    '۳) پوشش جایگزین (فال‌بک):',
+    m.fallback || 'برای این شاخص پوشش جایگزین خودکار تعریف نشده است.',
+    '',
+    '۴) کی ریست می‌شود:',
+    usageAlertResetTextFa(m, now) + (m.resetText ? ' (' + m.resetText + ')' : ''),
+    '',
+    '— نگهبان خودکار ساعتی مصرف سایت (EH REALTY) · آستانهٔ هشدار: ۸۰٪ · برای هر شاخص، در هر دورهٔ ریست فقط یک هشدار'
+  ].join('\n');
+  return { subject: subject, body: body };
+}
+/* The ElevenLabs leg: cfg:elevenlabs ONLY, and only when present.
+   Returns {character_count, character_limit} or null (absent key,
+   unreadable balance, provider error — all silent by design). */
+async function usageAlertElevenLabs(env) {
+  let cfg = null;
+  try { cfg = await env.LEADS.get('cfg:elevenlabs', { type: 'json' }); } catch (e) {}
+  const key = cfg && (cfg.apiKey || cfg.key || cfg.token);
+  if (!key) return null;
+  try {
+    const ctl = new AbortController(); const tm = setTimeout(function () { ctl.abort(); }, 15000);
+    const r = await fetch('https://api.elevenlabs.io/v1/user', { signal: ctl.signal, headers: { 'xi-api-key': String(key), 'User-Agent': 'advisor-api/usage-watchdog' } });
+    clearTimeout(tm);
+    if (!r.ok) return null;
+    const j = await r.json().catch(function () { return null; });
+    const sub = (j && j.subscription) || j || {};
+    if (typeof sub.character_count === 'number' && typeof sub.character_limit === 'number') return { character_count: sub.character_count, character_limit: sub.character_limit };
+  } catch (e) {}
+  return null;
+}
+/* Portal status block: attached to the usage-split payload by
+   buildUsageSplit. Counts the metrics whose CURRENT period already
+   carries a fired alert — direct key reads only, never a list. */
+async function usageAlertStatus(env, metrics) {
+  const st = { on: true, lastCheckAt: null, alertsThisPeriod: 0, alertedMetrics: [] };
+  try { const lc = await env.LEADS.get('usagealert:lastcheck', { type: 'json' }); if (lc && lc.at) st.lastCheckAt = lc.at; } catch (e) {}
+  const now = new Date();
+  for (const m of (metrics || [])) {
+    if (!m || typeof m.pct !== 'number') continue;
+    let v = null;
+    try { v = await env.LEADS.get('usagealert:' + m.key + '|' + usageAlertPeriodId(m.resetKind, now)); } catch (e) {}
+    if (v) { st.alertsThisPeriod++; st.alertedMetrics.push(m.key); }
+  }
+  return st;
+}
+/* One watchdog check. opts (test hooks; production passes nothing):
+   { now, payload, eleven } bypass the split build / the ElevenLabs
+   read so pins can drive the decision logic deterministically. */
+async function runUsageAlertWatchdog(env, opts) {
+  opts = opts || {};
+  const now = opts.now ? new Date(opts.now) : new Date();
+  const out = { at: now.toISOString(), crossed: [], alerted: [], skipped: [] };
+  let payload = opts.payload || null;
+  if (!payload) { try { payload = await buildUsageSplit(env); } catch (e) { payload = null; } }
+  const metrics = [];
+  if (payload) for (const sec of [payload.site, payload.academy]) {
+    if (!sec || !Array.isArray(sec.metrics)) continue;
+    for (const m of sec.metrics) if (m && typeof m.pct === 'number' && m.key !== 'elevenlabs') metrics.push(m);
+  }
+  let eleven = ('eleven' in opts) ? opts.eleven : null;
+  if (!('eleven' in opts)) { try { eleven = await usageAlertElevenLabs(env); } catch (e) { eleven = null; } }
+  if (eleven && typeof eleven.character_count === 'number' && typeof eleven.character_limit === 'number' && eleven.character_limit > 0) {
+    metrics.push({ key: 'elevenlabs', label: 'ElevenLabs credits', used: eleven.character_count, limit: eleven.character_limit, unit: 'credits', pct: Math.round(eleven.character_count / eleven.character_limit * 1000) / 10, resetText: 'Monthly subscription cycle (Creator plan).', resetKind: 'monthly', fallback: 'None — narration pauses when the pool empties; recorded lessons are unaffected.', state: 'ok' });
+  }
+  for (const m of metrics) {
+    if (!(m.pct >= USAGE_ALERT_THRESHOLD)) continue;
+    out.crossed.push(m.key);
+    const pid = usageAlertPeriodId(m.resetKind, now);
+    const dkey = 'usagealert:' + m.key + '|' + pid;
+    let seen = null;
+    try { seen = await env.LEADS.get(dkey); } catch (e) {}
+    if (seen) { out.skipped.push(m.key); continue; }
+    const mail = usageAlertCompose(m, now);
+    let mailOk = false, mid = null;
+    try {
+      mid = await queueMail(env, { kind: 'usage-alert', to: USAGE_ALERT_TO, lang: 'fa', name: 'Erfan', subject: mail.subject, body: mail.body, usageAlert: { metric: m.key, pct: m.pct, period: pid } }, { key: 'usagealert:' + m.key + '|' + pid, consentBasis: 'operations' });
+      mailOk = true;
+    } catch (e) { console.error(e); }
+    let push = null;
+    try { push = await puNotifyPush(env, { title: '⚠️ هشدار مصرف: ' + usageAlertFaName(m), body: usageAlertFaName(m) + ' به ' + m.pct + '٪ از سقفش رسید — جزئیات در صف ایمیل پورتال', url: '/portal-9f3k7x2q.html' }); } catch (e) {}
+    if (mailOk) {
+      try { await env.LEADS.put(dkey, JSON.stringify({ at: now.toISOString(), pct: m.pct, mail: mid || 'deduped', push: push ? { sent: push.sent || 0, attempted: push.attempted || 0 } : null })); } catch (e) {}
+      out.alerted.push(m.key);
+    }
+  }
+  try { await env.LEADS.put('usagealert:lastcheck', JSON.stringify({ at: out.at, crossed: out.crossed, alerted: out.alerted })); } catch (e) {}
+  return out;
+}
+
+
+async function buildUsageSplit(env) {
+        const pctOf = function (u, l) { return (typeof u === 'number' && typeof l === 'number' && l > 0) ? Math.round(u / l * 1000) / 10 : null; };
+        const RESET_UTC = 'Resets 17:00 Vancouver (00:00 UTC)';
+        const siteM = [], acadM = [];
+        const aiU = await aiInternal(env, '/api/internal/usage', {});
+        if (aiU && aiU.ok && aiU.chat) {
+          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: aiU.chat.used, limit: aiU.chat.budget, unit: 'chats', pct: pctOf(aiU.chat.used, aiU.chat.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI); at zero the assistant answers with a polite fallback.', state: 'ok' });
+          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: aiU.search.used, limit: aiU.search.budget, unit: 'searches', pct: pctOf(aiU.search.used, aiU.search.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'ok' });
+        } else {
+          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: null, limit: 700, unit: 'chats', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI).', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
+          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: null, limit: 150, unit: 'searches', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
+        }
+        const bcfgS = await brainCfg(env);
+        const busedS = await brainUsage(env);
+        siteM.push({ key: 'brain', label: 'Portal brain calls', used: busedS, limit: bcfgS.dailyCap, unit: 'calls', pct: pctOf(busedS, bcfgS.dailyCap), resetText: 'Resets midnight Vancouver', resetKind: 'vancouver-day', fallback: 'Soft cap — past it the brain degrades to rules-only answers; nothing breaks.', state: 'ok' });
+        let listsS = null;
+        try { const lvS = await env.LEADS.get('usage:lists:' + utcDay(), { type: 'json' }); listsS = (typeof lvS === 'number') ? lvS : ((lvS && typeof lvS.count === 'number') ? lvS.count : 0); } catch (e) {}
+        siteM.push({ key: 'kv_lists', label: 'LEADS KV list ops', used: listsS, limit: 1000, unit: 'lists', pct: pctOf(listsS, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Portal lists are generation-cached; reads keep working — only freshness suffers.', state: listsS === null ? 'unreadable' : 'ok' });
+        siteM.push({ key: 'kv_writes', label: 'LEADS KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 is LIVE on the site deployment too (resilience P0-2, deployed 2026-11-12): on a write-cap day, records divert to R2 and drain back into KV after the reset.', state: 'provider-metered', note: 'No self-counter exists; cap events surface as Cloudflare alert emails.' });
+        let mqUnsent = null, mqOldest = null;
+        try {
+          const mk = await listAllKeys(env, 'mailq:', 2000);
+          let n = 0, oldest = null;
+          for (let i = 0; i < mk.length; i += 20) {
+            const batch = await Promise.all(mk.slice(i, i + 20).map(function (k) { return env.LEADS.get(String(k.name || k), { type: 'json' }).catch(function () { return null; }); }));
+            for (const mr of batch) { if (mr && !mr.sent) { n++; if (mr.created_at && (!oldest || mr.created_at < oldest)) oldest = mr.created_at; } }
+          }
+          mqUnsent = n; mqOldest = oldest;
+        } catch (e) {}
+        siteM.push({ key: 'mail_queue', label: 'Mail queue — unsent', used: mqUnsent, limit: null, unit: 'emails', pct: null, resetText: 'No reset — the queue drains only when sending is provisioned.', resetKind: 'none', fallback: 'None — mail sending is unprovisioned (cfg:mail unset, auto-send off); held mail waits for the December activation.', state: mqUnsent === null ? 'unreadable' : 'info', note: 'Unsent records only. The queue list also counts already-sent history, so its total can read higher.', extra: { oldestUnsentAt: mqOldest } });
+        let bkS = null;
+        try { bkS = await env.LEADS.get('backup:last', { type: 'json' }); } catch (e) {}
+        siteM.push({ key: 'kv_backup', label: 'Last KV backup (LEADS)', used: null, limit: null, unit: '', pct: null, resetText: 'Auto-backup runs nightly from Dec 1; the weekly snapshot stamps here too.', resetKind: 'none', fallback: 'In-namespace rollback copy only — the off-platform export is resilience P0-4.', state: 'info', note: bkS ? null : 'No backup stamp recorded yet.', extra: bkS ? { at: bkS.at || null, keys: bkS.keys || 0 } : null });
+        let canS = null, maintAt = null;
+        try { const ml = await env.LEADS.get('maint:last', { type: 'json' }); if (ml) { maintAt = ml.at || null; canS = ml.canary || null; } } catch (e) {}
+        siteM.push({ key: 'canary', label: 'Worker health (canary)', used: null, limit: null, unit: '', pct: null, resetText: 'Checked on every maintenance run.', resetKind: 'none', fallback: 'The 5-minute failover monitor watches the public surfaces independently.', state: 'info', note: canS ? (canS.ok ? 'Last maintenance canary passed.' : 'Last maintenance canary flagged a problem — see the Maintenance report.') : 'No maintenance report yet.', extra: { at: maintAt, ok: canS ? !!canS.ok : null } });
+        let au = null, auErr = null;
+        try {
+          const icfgS = await env.LEADS.get('cfg:internal', { type: 'json' });
+          if (icfgS && icfgS.secret) {
+            const ctl = new AbortController(); const tm = setTimeout(function () { ctl.abort(); }, 30000);
+            const rr = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/usage', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgS.secret), 'User-Agent': 'advisor-api/usage-split' }, body: '{}' });
+            clearTimeout(tm);
+            const jj = await rr.json().catch(function () { return null; });
+            if (rr.ok && jj && jj.ok) au = jj; else auErr = 'bridge_' + rr.status;
+          } else auErr = 'not_configured';
+        } catch (e) { auErr = 'unreachable'; }
+        if (au) {
+          if (au.tutor) acadM.push({ key: 'tutor_credits', label: 'Tutor chat credits', used: au.tutor.globalUsed, limit: au.tutor.globalCap, unit: 'credits', pct: pctOf(au.tutor.globalUsed, au.tutor.globalCap), resetText: 'Resets midnight Vancouver (Vancouver day)', resetKind: 'vancouver-day', fallback: 'Dual-provider chain (Groq + Gemini) with Workers AI behind it; per-student cap ' + au.tutor.perStudentCap + '/day.', state: 'ok', extra: { perProvider: au.tutor.perProvider || {}, perStudentCap: au.tutor.perStudentCap, voiceUsed: au.tutor.voiceUsed } });
+          if (typeof au.kvListsToday === 'number') acadM.push({ key: 'academy_kv_lists', label: 'ACADEMY KV list ops', used: au.kvListsToday, limit: 1000, unit: 'lists', pct: pctOf(au.kvListsToday, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Reads are generous (100k/day); list calls are cached where it matters.', state: 'ok' });
+          acadM.push({ key: 'academy_kv_writes', label: 'ACADEMY KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 (Pack KvSpillway) is LIVE — the video migration is complete and the spillway deployed on 2026-11-12 — so logins, sessions and progress saves keep working through a cap day, and the drain replays them after the reset.', state: 'provider-metered', note: 'No self-counter exists. This account hit the cap on 2026-11-12 (tutor seed + migration audit writes); student logins were blocked until the 17:00 Vancouver reset.' });
+          if (au.r2) {
+            acadM.push({ key: 'r2_storage', label: 'R2 video storage', used: au.r2.bytes, limit: 10737418240, unit: 'bytes', pct: pctOf(au.r2.bytes, 10737418240), resetText: 'Storage is a monthly-cycle quota — it does not reset daily; reads are 10M/month with free egress.', resetKind: 'monthly', fallback: 'If R2 is unreachable, video reads fall back to the B2 copy automatically.', state: 'ok', extra: { objects: au.r2.objects, mediaBytes: au.r2.mediaBytes, overflowObjects: au.r2.overflowObjects } });
+            acadM.push({ key: 'r2_spillway', label: 'KV spillway overflow (in R2)', used: au.r2.overflowObjects, limit: null, unit: 'objects', pct: null, resetText: 'Drained back into KV after the daily reset (17:00 Vancouver).', resetKind: 'none', fallback: 'This IS the fallback working — overflow records are served from R2 until drained.', state: 'info', note: au.r2.overflowObjects > 0 ? 'Records the KV write cap diverted to R2.' : 'Empty — no spill has occurred.' });
+          }
+          acadM.push({ key: 'b2_backup', label: 'B2 backup copy (video)', used: null, limit: 2500, unit: 'Class B reads/day', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'B2 IS the fallback for R2 reads; the R2 copy is primary.', state: 'provider-metered', note: 'Provider-metered. The 2,500/day Class B read cap was exceeded on 2026-11-12 (verification reads). Fallback key state: ' + (au.b2 && au.b2.configured ? 'stored.' : 'NOT stored — the fallback is unarmed until a fresh key is provisioned.') });
+          acadM.push({ key: 'elevenlabs', label: 'ElevenLabs credits', used: null, limit: 121759, unit: 'credits', pct: null, resetText: 'Monthly subscription cycle (Creator plan, 121,759 credits).', resetKind: 'monthly', fallback: 'None — narration pauses when the pool empties; recorded lessons are unaffected.', state: 'external', note: 'The portal cannot read this balance directly; the hourly alert job reads it live. Last live read (2026-11-13): 109,230 of 121,759 used (~90%) — already past the 80% alert line.' });
+          if (typeof au.students === 'number') acadM.push({ key: 'students', label: 'Academy students', used: au.students, limit: null, unit: 'students', pct: null, resetText: '—', resetKind: 'none', fallback: '', state: 'info' });
+        } else {
+          acadM.push({ key: 'academy_bridge', label: 'Academy usage', used: null, limit: null, unit: '', pct: null, resetText: '', resetKind: 'none', fallback: '', state: 'unreadable', note: 'Academy probe failed (' + (auErr || 'unknown') + ') — Academy numbers are unavailable right now. Nothing is hidden; the probe itself failed.' });
+        }
+        const wdStatus = await usageAlertStatus(env, siteM.concat(acadM));
+        return { ok: true, at: new Date().toISOString(), site: { label: 'EH REALTY — Site usage', metrics: siteM }, academy: { label: 'EH REALTY ACADEMY — Academy usage', metrics: acadM }, watchdog: wdStatus };
+}
+
 // queueMail: appends one held (never auto-sent) record to the mail
 // queue. With opts.key the queue is DETERMINISTIC (Pack A, F-04 H1 /
 // F-05 H3): the record lives under mailq:<key> and queueing is
@@ -2438,8 +2678,9 @@ function publicSettings(s, base) {
 const MAIL_TTL_BY_KIND = { verify: 86400, viewing: 14 * 86400, alert: 129600, reminder: 129600, reminder_unconfirmed: 129600 };
 const MAIL_TTL_DEFAULT = 30 * 86400;
 // Pack PMV1: queueMail's recipient-policy tables (see queueMail).
+// Pack UsageAlertNative (2026-11-13): 'usage-alert' added to the transactional set below — the native usage watchdog's held alert to the owner's own business inbox is an operations notice, not marketing; the DNC gate must never silently drop it.
 // Transactional kinds are exempt from the queue-level DNC drop.
-const MAIL_POLICY_TRANSACTIONAL = new Set(['verify', 'viewing', 'alert', 'reminder', 'reminder_unconfirmed', 'academy_invite']); // Pack MailSend (2026-11-10): 'academy_invite' added — an enrolment invite is transactional by nature (the student paid for access), the same posture as 'verify'; without it queueMail's DNC gate would silently drop invites to any previously-DNC'd address and resend-invite could never send.
+const MAIL_POLICY_TRANSACTIONAL = new Set(['verify', 'viewing', 'alert', 'reminder', 'reminder_unconfirmed', 'academy_invite', 'usage-alert']); // Pack MailSend (2026-11-10): 'academy_invite' added — an enrolment invite is transactional by nature (the student paid for access), the same posture as 'verify'; without it queueMail's DNC gate would silently drop invites to any previously-DNC'd address and resend-invite could never send.
 const MAIL_CONSENT_BY_KIND = { verify: 'account', viewing: 'booking', reminder: 'booking', reminder_unconfirmed: 'booking', alert: 'saved_search' };
 async function queueMail(env, item, opts) {
   opts = opts || {};
@@ -20890,67 +21131,7 @@ async function handleRequest(request, env, ctx) {
       // higher than this number (49 listed vs 46 unsent on
       // 2026-11-12).
       if (path === '/api/admin/usage-split' && request.method === 'GET') {
-        const pctOf = function (u, l) { return (typeof u === 'number' && typeof l === 'number' && l > 0) ? Math.round(u / l * 1000) / 10 : null; };
-        const RESET_UTC = 'Resets 17:00 Vancouver (00:00 UTC)';
-        const siteM = [], acadM = [];
-        const aiU = await aiInternal(env, '/api/internal/usage', {});
-        if (aiU && aiU.ok && aiU.chat) {
-          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: aiU.chat.used, limit: aiU.chat.budget, unit: 'chats', pct: pctOf(aiU.chat.used, aiU.chat.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI); at zero the assistant answers with a polite fallback.', state: 'ok' });
-          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: aiU.search.used, limit: aiU.search.budget, unit: 'searches', pct: pctOf(aiU.search.used, aiU.search.budget), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'ok' });
-        } else {
-          siteM.push({ key: 'ai_chats', label: 'Site AI chats', used: null, limit: 700, unit: 'chats', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Provider cascade (Groq → Gemini → Workers AI).', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
-          siteM.push({ key: 'ai_searches', label: 'Web searches (site AI)', used: null, limit: 150, unit: 'searches', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Same provider cascade as chats.', state: 'unreadable', note: 'The ai-chat worker could not be read this time.' });
-        }
-        const bcfgS = await brainCfg(env);
-        const busedS = await brainUsage(env);
-        siteM.push({ key: 'brain', label: 'Portal brain calls', used: busedS, limit: bcfgS.dailyCap, unit: 'calls', pct: pctOf(busedS, bcfgS.dailyCap), resetText: 'Resets midnight Vancouver', resetKind: 'vancouver-day', fallback: 'Soft cap — past it the brain degrades to rules-only answers; nothing breaks.', state: 'ok' });
-        let listsS = null;
-        try { const lvS = await env.LEADS.get('usage:lists:' + utcDay(), { type: 'json' }); listsS = (typeof lvS === 'number') ? lvS : ((lvS && typeof lvS.count === 'number') ? lvS.count : 0); } catch (e) {}
-        siteM.push({ key: 'kv_lists', label: 'LEADS KV list ops', used: listsS, limit: 1000, unit: 'lists', pct: pctOf(listsS, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Portal lists are generation-cached; reads keep working — only freshness suffers.', state: listsS === null ? 'unreadable' : 'ok' });
-        siteM.push({ key: 'kv_writes', label: 'LEADS KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 is LIVE on the site deployment too (resilience P0-2, deployed 2026-11-12): on a write-cap day, records divert to R2 and drain back into KV after the reset.', state: 'provider-metered', note: 'No self-counter exists; cap events surface as Cloudflare alert emails.' });
-        let mqUnsent = null, mqOldest = null;
-        try {
-          const mk = await listAllKeys(env, 'mailq:', 2000);
-          let n = 0, oldest = null;
-          for (let i = 0; i < mk.length; i += 20) {
-            const batch = await Promise.all(mk.slice(i, i + 20).map(function (k) { return env.LEADS.get(String(k.name || k), { type: 'json' }).catch(function () { return null; }); }));
-            for (const mr of batch) { if (mr && !mr.sent) { n++; if (mr.created_at && (!oldest || mr.created_at < oldest)) oldest = mr.created_at; } }
-          }
-          mqUnsent = n; mqOldest = oldest;
-        } catch (e) {}
-        siteM.push({ key: 'mail_queue', label: 'Mail queue — unsent', used: mqUnsent, limit: null, unit: 'emails', pct: null, resetText: 'No reset — the queue drains only when sending is provisioned.', resetKind: 'none', fallback: 'None — mail sending is unprovisioned (cfg:mail unset, auto-send off); held mail waits for the December activation.', state: mqUnsent === null ? 'unreadable' : 'info', note: 'Unsent records only. The queue list also counts already-sent history, so its total can read higher.', extra: { oldestUnsentAt: mqOldest } });
-        let bkS = null;
-        try { bkS = await env.LEADS.get('backup:last', { type: 'json' }); } catch (e) {}
-        siteM.push({ key: 'kv_backup', label: 'Last KV backup (LEADS)', used: null, limit: null, unit: '', pct: null, resetText: 'Auto-backup runs nightly from Dec 1; the weekly snapshot stamps here too.', resetKind: 'none', fallback: 'In-namespace rollback copy only — the off-platform export is resilience P0-4.', state: 'info', note: bkS ? null : 'No backup stamp recorded yet.', extra: bkS ? { at: bkS.at || null, keys: bkS.keys || 0 } : null });
-        let canS = null, maintAt = null;
-        try { const ml = await env.LEADS.get('maint:last', { type: 'json' }); if (ml) { maintAt = ml.at || null; canS = ml.canary || null; } } catch (e) {}
-        siteM.push({ key: 'canary', label: 'Worker health (canary)', used: null, limit: null, unit: '', pct: null, resetText: 'Checked on every maintenance run.', resetKind: 'none', fallback: 'The 5-minute failover monitor watches the public surfaces independently.', state: 'info', note: canS ? (canS.ok ? 'Last maintenance canary passed.' : 'Last maintenance canary flagged a problem — see the Maintenance report.') : 'No maintenance report yet.', extra: { at: maintAt, ok: canS ? !!canS.ok : null } });
-        let au = null, auErr = null;
-        try {
-          const icfgS = await env.LEADS.get('cfg:internal', { type: 'json' });
-          if (icfgS && icfgS.secret) {
-            const ctl = new AbortController(); const tm = setTimeout(function () { ctl.abort(); }, 30000);
-            const rr = await fetch('https://advisor-academy.erfanbcrealestate.workers.dev/api/internal/academy/usage', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', 'X-Internal-Secret': String(icfgS.secret), 'User-Agent': 'advisor-api/usage-split' }, body: '{}' });
-            clearTimeout(tm);
-            const jj = await rr.json().catch(function () { return null; });
-            if (rr.ok && jj && jj.ok) au = jj; else auErr = 'bridge_' + rr.status;
-          } else auErr = 'not_configured';
-        } catch (e) { auErr = 'unreachable'; }
-        if (au) {
-          if (au.tutor) acadM.push({ key: 'tutor_credits', label: 'Tutor chat credits', used: au.tutor.globalUsed, limit: au.tutor.globalCap, unit: 'credits', pct: pctOf(au.tutor.globalUsed, au.tutor.globalCap), resetText: 'Resets midnight Vancouver (Vancouver day)', resetKind: 'vancouver-day', fallback: 'Dual-provider chain (Groq + Gemini) with Workers AI behind it; per-student cap ' + au.tutor.perStudentCap + '/day.', state: 'ok', extra: { perProvider: au.tutor.perProvider || {}, perStudentCap: au.tutor.perStudentCap, voiceUsed: au.tutor.voiceUsed } });
-          if (typeof au.kvListsToday === 'number') acadM.push({ key: 'academy_kv_lists', label: 'ACADEMY KV list ops', used: au.kvListsToday, limit: 1000, unit: 'lists', pct: pctOf(au.kvListsToday, 1000), resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Reads are generous (100k/day); list calls are cached where it matters.', state: 'ok' });
-          acadM.push({ key: 'academy_kv_writes', label: 'ACADEMY KV writes', used: null, limit: 1000, unit: 'writes', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 (Pack KvSpillway) is LIVE — the video migration is complete and the spillway deployed on 2026-11-12 — so logins, sessions and progress saves keep working through a cap day, and the drain replays them after the reset.', state: 'provider-metered', note: 'No self-counter exists. This account hit the cap on 2026-11-12 (tutor seed + migration audit writes); student logins were blocked until the 17:00 Vancouver reset.' });
-          if (au.r2) {
-            acadM.push({ key: 'r2_storage', label: 'R2 video storage', used: au.r2.bytes, limit: 10737418240, unit: 'bytes', pct: pctOf(au.r2.bytes, 10737418240), resetText: 'Storage is a monthly-cycle quota — it does not reset daily; reads are 10M/month with free egress.', resetKind: 'monthly', fallback: 'If R2 is unreachable, video reads fall back to the B2 copy automatically.', state: 'ok', extra: { objects: au.r2.objects, mediaBytes: au.r2.mediaBytes, overflowObjects: au.r2.overflowObjects } });
-            acadM.push({ key: 'r2_spillway', label: 'KV spillway overflow (in R2)', used: au.r2.overflowObjects, limit: null, unit: 'objects', pct: null, resetText: 'Drained back into KV after the daily reset (17:00 Vancouver).', resetKind: 'none', fallback: 'This IS the fallback working — overflow records are served from R2 until drained.', state: 'info', note: au.r2.overflowObjects > 0 ? 'Records the KV write cap diverted to R2.' : 'Empty — no spill has occurred.' });
-          }
-          acadM.push({ key: 'b2_backup', label: 'B2 backup copy (video)', used: null, limit: 2500, unit: 'Class B reads/day', pct: null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'B2 IS the fallback for R2 reads; the R2 copy is primary.', state: 'provider-metered', note: 'Provider-metered. The 2,500/day Class B read cap was exceeded on 2026-11-12 (verification reads). Fallback key state: ' + (au.b2 && au.b2.configured ? 'stored.' : 'NOT stored — the fallback is unarmed until a fresh key is provisioned.') });
-          acadM.push({ key: 'elevenlabs', label: 'ElevenLabs credits', used: null, limit: 121759, unit: 'credits', pct: null, resetText: 'Monthly subscription cycle (Creator plan, 121,759 credits).', resetKind: 'monthly', fallback: 'None — narration pauses when the pool empties; recorded lessons are unaffected.', state: 'external', note: 'The portal cannot read this balance directly; the hourly alert job reads it live. Last live read (2026-11-13): 109,230 of 121,759 used (~90%) — already past the 80% alert line.' });
-          if (typeof au.students === 'number') acadM.push({ key: 'students', label: 'Academy students', used: au.students, limit: null, unit: 'students', pct: null, resetText: '—', resetKind: 'none', fallback: '', state: 'info' });
-        } else {
-          acadM.push({ key: 'academy_bridge', label: 'Academy usage', used: null, limit: null, unit: '', pct: null, resetText: '', resetKind: 'none', fallback: '', state: 'unreadable', note: 'Academy probe failed (' + (auErr || 'unknown') + ') — Academy numbers are unavailable right now. Nothing is hidden; the probe itself failed.' });
-        }
-        return json({ ok: true, at: new Date().toISOString(), site: { label: 'EH REALTY — Site usage', metrics: siteM }, academy: { label: 'EH REALTY ACADEMY — Academy usage', metrics: acadM } }, 200, origin);
+        return json(await buildUsageSplit(env), 200, origin);
       }
 
       // ---- admin: KV backup stamp (the weekly backup job reports success here) ----
@@ -21727,6 +21908,11 @@ export default {
     const minuteField = cronStr ? cronStr.trim().split(/\s+/)[0] : '';
     const fixedMinute = /^\d+$/.test(minuteField) ? parseInt(minuteField, 10) : null;
     const heavyOk = fixedMinute === null || new Date().getUTCMinutes() === fixedMinute;
+    // Pack UsageAlertNative (2026-11-13): the hourly watchdog tick runs ONLY
+    // the watchdog — the nightly chain below (backup, folds, automations,
+    // reconcile) is untouched and never fires on this expression; the
+    // nightly expression never runs the watchdog.
+    if (cronStr === USAGE_ALERT_CRON) { ctx.waitUntil(runUsageAlertWatchdog(env).catch(function (e) { console.error(e); })); return; }
     ctx.waitUntil((async function () {
       if (heavyOk) {
         await runFullBackup(env, 'cron').catch(async function (e) { try { console.error(e); const bl = (await env.LEADS.get('backup:log', { type: 'json' })) || []; bl.unshift({ at: new Date().toISOString(), day: vancouverDay(), ok: false, via: 'cron-catch', error: String((e && e.message) || e).slice(0, 160) }); await env.LEADS.put('backup:log', JSON.stringify(bl.slice(0, 40))); } catch (e2) {} }); // a rejected backup must still leave a failure entry the freshness alarm can see (cycle 30, Claude M7)
