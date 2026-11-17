@@ -123,12 +123,12 @@ const TS_HOSTS = ['real-estate-platform-0aei.onrender.com', 'ehrealtybc.com', 'w
 function cors(origin) {
   const h = {
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-CSRF-Token',
     'Access-Control-Max-Age': '600',
     'Vary': 'Origin',
     'Cache-Control': 'no-store'
   };
-  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) h['Access-Control-Allow-Origin'] = origin;
+  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) { h['Access-Control-Allow-Origin'] = origin; h['Access-Control-Allow-Credentials'] = 'true'; } // Pack DP12: credentialed CORS only on the allowlist echo — never with '*' (the Academy media helper below mirrors cors() for playback and deliberately stays credential-less)
   else if (!origin) h['Access-Control-Allow-Origin'] = '*';
   return h;
 }
@@ -8936,30 +8936,74 @@ async function mailReleaseSend(env, mid, ip) {
 // expires them. The record itself holds { email, exp } — unchanged.
 async function usessKey(token) { return 'usess:' + await sha256hex(token); }
 
-async function userAuth(request, env) {
-  const h = request.headers.get('Authorization') || '';
-  const m = h.match(/^Bearer (u_[0-9a-f]{32})$/);
-  if (!m) return null;
-  const token = m[1];
+async function userSession(request, env) {
+  // Pack DP12 (F-048): the session token is resolved from the httpOnly
+  // ehsess cookie first, then from the Bearer header. Bearer is the
+  // TRANSITION path (the Capacitor app, the Academy front-end and
+  // not-yet-updated site bundles still present it); it is removed by a
+  // follow-up pack once every client is on cookies — see
+  // packs/FIX-DP12/DESIGN.md ("Transition call").
+  let token = '';
+  let via = '';
+  const cm = /(?:^|; )ehsess=(u_[0-9a-f]{32})/.exec(request.headers.get('Cookie') || '');
+  if (cm) { token = cm[1]; via = 'cookie'; }
+  if (!token) {
+    const h = request.headers.get('Authorization') || '';
+    const m = h.match(/^Bearer (u_[0-9a-f]{32})$/);
+    if (m) { token = m[1]; via = 'bearer'; }
+  }
+  if (!token) return null;
   const cKey = 'usess:' + token; // isolate cache key only — never a KV key any more
   const c = sessCache.get(cKey);
   if (c && Date.now() - c.t < SESS_CACHE_TTL && (!c.exp || Date.now() <= c.exp)) {
     if (c.email && (await isBanned(env, c.email))) return null;
-    return c.email;
+    return c.email ? { email: c.email, token: token, via: via, csrf: c.csrf || '' } : null;
   }
   let raw = await siteKvGet(env, await usessKey(token));
   if (!raw) raw = await env.LEADS.get('usess:' + token); // legacy pre-hash session
   let email = null;
   let exp = 0;
+  let csrf = '';
   if (raw) {
     let s = null;
     try { s = JSON.parse(raw); } catch (e) {}
-    if (s && Date.now() <= s.exp) { email = s.email; exp = s.exp; }
+    if (s && Date.now() <= s.exp) { email = s.email; exp = s.exp; csrf = String(s.csrf || ''); }
   }
   if (sessCache.size > 5000) { let nEv = 0; for (const kk of sessCache.keys()) { sessCache.delete(kk); if (++nEv >= 1000) break; } }
-  sessCache.set(cKey, { t: Date.now(), email: email, exp: exp });
+  sessCache.set(cKey, { t: Date.now(), email: email, exp: exp, csrf: csrf });
   if (email && (await isBanned(env, email))) return null;
-  return email;
+  return email ? { email: email, token: token, via: via, csrf: csrf } : null;
+}
+async function userAuth(request, env) {
+  const s = await userSession(request, env);
+  return s ? s.email : null;
+}
+// Pack DP12 (F-048): session cookies. ehsess is httpOnly — no client
+// script can read the session token (the F-048 fix). ehcsrf is the
+// readable double-submit companion; its value is ALSO stored in the
+// session record, so csrfOk compares header, cookie and record.
+// SameSite=None because the API is cross-origin (advisor-api.* vs the
+// site / Academy hosts); Secure always; Max-Age mirrors the 30-day exp.
+const USESS_COOKIE = 'ehsess';
+const CSRF_COOKIE = 'ehcsrf';
+const SESSION_COOKIE_MAXAGE = 30 * 86400;
+function sessionCookieStrings(token, csrf) {
+  const base = '; Max-Age=' + SESSION_COOKIE_MAXAGE + '; Path=/; Secure; SameSite=None';
+  return [USESS_COOKIE + '=' + token + '; HttpOnly' + base, CSRF_COOKIE + '=' + csrf + base];
+}
+function clearSessionCookieStrings() {
+  return [USESS_COOKIE + '=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=None', CSRF_COOKIE + '=; Max-Age=0; Path=/; Secure; SameSite=None'];
+}
+function appendSetCookies(headers, strings) { for (const s of strings) headers.append('Set-Cookie', s); }
+function csrfCookieValue(request) {
+  const m = /(?:^|; )ehcsrf=([0-9a-f]{32})/.exec(request.headers.get('Cookie') || '');
+  return m ? m[1] : '';
+}
+function csrfOk(request, sess) {
+  if (!sess || sess.via !== 'cookie') return true; // a Bearer header is not ambient authority; issuance + logout are exempt by design
+  const h = request.headers.get('X-CSRF-Token') || '';
+  if (!h || !sess.csrf) return false;
+  return h === sess.csrf && h === csrfCookieValue(request);
 }
 async function userSaved(env, email) {
   return (await env.LEADS.get('usaved:' + email, { type: 'json' })) || [];
@@ -20904,9 +20948,11 @@ async function handleRequest(request, env, ctx) {
         if (await isBanned(env, gEmail)) return json({ ok: false, error: 'banned' }, 403, origin);
         if (!(await siteKvGet(env, 'user:' + gEmail))) return json({ ok: false, error: 'code' }, 401, origin);
         const gtok = 'u_' + randHex(16);
-        await siteKvPut(env, await usessKey(gtok), JSON.stringify({ email: gEmail, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const gcsrf = randHex(16);
+        await siteKvPut(env, await usessKey(gtok), JSON.stringify({ email: gEmail, exp: Date.now() + 30 * 86400000, csrf: gcsrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
         const grr = json({ ok: true, token: gtok }, 200, origin);
         grr.headers.set('Cache-Control', 'no-store');
+        appendSetCookies(grr.headers, sessionCookieStrings(gtok, gcsrf)); // Pack DP12: httpOnly session cookie
         return grr;
       }
       // ---- visitor accounts (public) ----
@@ -20931,8 +20977,11 @@ async function handleRequest(request, env, ctx) {
         await env.LEADS.put('uverify:' + vt, email, { expirationTtl: 7 * 86400 });
         await queueMail(env, { kind: 'verify', to: email, lang: ulang, name: name, token: vt });
         const token = 'u_' + randHex(16);
-        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
-        return json({ ok: true, token: token, user: { name: name, email: email, lang: ulang } }, 200, origin);
+        const csrf = randHex(16);
+        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const rr = json({ ok: true, token: token, user: { name: name, email: email, lang: ulang } }, 200, origin);
+        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf)); // Pack DP12: httpOnly session cookie
+        return rr;
       }
       if (path === '/api/user/verify' && request.method === 'GET') {
         const vt = String(url.searchParams.get('t') || '');
@@ -20975,8 +21024,50 @@ async function handleRequest(request, env, ctx) {
         user.lastLogin = new Date().toISOString();
         if (hashUpgraded || loginStale) await siteKvPut(env, 'user:' + email, JSON.stringify(user)); // write only on hash upgrade or a >24h-stale lastLogin (cycle 26: fewer writes, narrower verify race)
         const token = 'u_' + randHex(16);
-        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000 }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
-        return json({ ok: true, token: token, user: { name: user.name, email: user.email, lang: user.lang } }, 200, origin);
+        const csrf = randHex(16);
+        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const rr = json({ ok: true, token: token, user: { name: user.name, email: user.email, lang: user.lang } }, 200, origin);
+        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf)); // Pack DP12: httpOnly session cookie
+        return rr;
+      }
+      // ---- Pack DP12 (F-048): cookie migration endpoints ----
+      if (path === '/api/user/session-exchange' && request.method === 'POST') {
+        if (limited('sx:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
+        // Bearer ONLY: this endpoint migrates a legacy localStorage session
+        // onto the httpOnly cookie. The session itself (token + exp) is
+        // unchanged; a csrf is minted onto the record when it has none.
+        const bh = request.headers.get('Authorization') || '';
+        if (!/^Bearer (u_[0-9a-f]{32})$/.test(bh)) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess || sess.via !== 'bearer') return json({ ok: false, error: 'auth' }, 401, origin);
+        let csrf = sess.csrf;
+        if (!csrf) {
+          csrf = randHex(16);
+          let rec = null;
+          const rraw = await siteKvGet(env, await usessKey(sess.token));
+          if (rraw) { try { rec = JSON.parse(rraw); } catch (e) {} }
+          if (!rec) { const lraw = await env.LEADS.get('usess:' + sess.token); if (lraw) { try { rec = JSON.parse(lraw); } catch (e) {} } }
+          if (rec && rec.email) { rec.csrf = csrf; await siteKvPut(env, await usessKey(sess.token), JSON.stringify(rec), { expirationTtl: Math.max(60, Math.floor((rec.exp - Date.now()) / 1000)) }); }
+          sessCache.delete('usess:' + sess.token); // next read sees the record's csrf
+        }
+        const xr = json({ ok: true }, 200, origin);
+        appendSetCookies(xr.headers, sessionCookieStrings(sess.token, csrf));
+        return xr;
+      }
+      if (path === '/api/user/logout' && request.method === 'POST') {
+        // Always ok:true (the academy student-logout posture): the client
+        // clears its own state regardless; here the server session dies
+        // and both cookies are cleared. CSRF-exempt by design — the worst
+        // a forged call achieves is signing someone out.
+        const sess = await userSession(request, env);
+        if (sess) {
+          try { await env.LEADS.delete(await usessKey(sess.token)); } catch (e) {}
+          try { await env.LEADS.delete('usess:' + sess.token); } catch (e) {} // legacy raw key, if any
+          sessCache.delete('usess:' + sess.token);
+        }
+        const lr = json({ ok: true }, 200, origin);
+        appendSetCookies(lr.headers, clearSessionCookieStrings());
+        return lr;
       }
       if (path === '/api/user/me' && request.method === 'GET') {
         if (limited(ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -21001,8 +21092,10 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/user/save' && request.method === 'POST') {
         if (limited('sv:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         const mls = String((d || {}).mls || '').slice(0, 40);
@@ -21021,8 +21114,10 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/user/searches' && request.method === 'POST') {
         if (limited('us:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
@@ -21082,8 +21177,10 @@ async function handleRequest(request, env, ctx) {
       }
       const usm = path.match(/^\/api\/user\/searches\/([A-Za-z0-9_-]+)$/);
       if (usm && request.method === 'DELETE') {
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         // null entries are guarded (Pack A, F-05 L4): one corrupt
         // element must not brick every later PATCH/DELETE.
         const searches = (await userSearches(env, email)).filter(function (s) { return s && s.id !== usm[1]; });
@@ -21094,8 +21191,10 @@ async function handleRequest(request, env, ctx) {
         // alerts on/off for an existing saved search (creation already takes
         // `notify`; this completes the visitor-side management)
         if (limited('us:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         const searches = await userSearches(env, email);
@@ -21137,8 +21236,10 @@ async function handleRequest(request, env, ctx) {
       // ---- visitor account v2: profile (all fields optional), recent, my viewings ----
       if (path === '/api/user/profile' && request.method === 'POST') {
         if (limited('pf:' + ip, 30, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         d = d || {};
@@ -21159,8 +21260,10 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/user/recent' && request.method === 'POST') {
         if (limited('rc:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         let d = null;
         try { d = await request.json(); } catch (e) {}
         const mls = String((d || {}).mls || '').slice(0, 40);
@@ -21215,8 +21318,10 @@ async function handleRequest(request, env, ctx) {
       const uvm = path.match(/^\/api\/user\/viewings\/([A-Za-z0-9_-]+)\/(cancel|reschedule)$/);
       if (uvm && request.method === 'POST') {
         if (limited('vw:' + ip, 20, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin); // namespaced (Pack A): see the login limiter — same max+window used to mean a shared bucket
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env);
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        if (!csrfOk(request, sess)) return json({ ok: false, error: 'csrf' }, 403, origin);
+        const email = sess.email;
         // Pack MyViewingsFix: no emailVerified gate here either (see
         // the GET route above) — userAuth + the rec.email ownership
         // check immediately below are the access control.
@@ -21428,7 +21533,8 @@ async function handleRequest(request, env, ctx) {
         // nothing: an anonymous click is never bound
         // speculatively, so a call that did not originate from
         // a signed-in site click carries no tag.
-        const iEmail = await userAuth(request, env);
+        const iSess = await userSession(request, env);
+        const iEmail = (iSess && csrfOk(request, iSess)) ? iSess.email : null; // Pack DP12: a cookie call without CSRF binds nothing
         if (!iEmail) return json({ ok: true, bound: false }, 200, origin);
         let idata = null;
         try { idata = await request.json(); } catch (e) {}
