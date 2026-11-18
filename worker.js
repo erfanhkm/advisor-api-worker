@@ -3960,7 +3960,7 @@ async function eb3ActOne(env, ref, action, body, ip) {
       if (!rec.fixId) return done(409, false, 'refused', 'no_fix_attached');
       const fx = await env.LEADS.get('eb8:fix:' + rec.fixId, { type: 'json' }).catch(function () { return null; });
       if (!fx) return done(404, false, 'refused', 'fix_not_found');
-      if (fx.state !== 'proposed') return done(409, false, 'refused', 'fix_' + fx.state);
+      if (!eb8FixClaimable(fx)) return done(409, false, 'refused', 'fix_' + fx.state);
       const ex = await eb8ExecuteFix(env, fx, 'owner');
       rec.state = ex.executed ? 'approved-executed' : 'approve-failed';
       rec.decidedAt = new Date().toISOString();
@@ -6840,17 +6840,71 @@ function eb8Id() { return Date.now().toString(36) + '-' + randHex(6); }
 async function eb8Emit(env, type, data) { try { await ebEmit(env, type, data || {}, { source: 'eb-itsupport' }); } catch (e) {} }
 
 /* ---------- model access: EB-8's own cap over ebModelCall ---------- */
+/* EB-8-FIXES F-04: the cap used to be a single read-modify-write counter
+   (two racers read 39, both pass, both write 40 — one call over the cap on
+   every race). Plain KV has no atomic increment, so spend is now tracked
+   with reservation KEYS: each spender writes a unique
+   eb8:capres:<day>:<ts>-<rand> key (distinct keys cannot lose-update each
+   other), ranks itself among the day's reservations, and proceeds only if
+   base + settled + rank + 1 fits the cap. A call that ran settles its
+   reservation into an eb8:capdone: key (settled written BEFORE the
+   reservation is deleted, so a crash between the two over-counts by one —
+   conservative); a call that never ran (dormant / zero attempts) deletes
+   its reservation — a full refund, the old increment-only-on-run rule.
+   The base is adopted once per day from the legacy eb8:cap: counter into
+   eb8:capbase:<day>; every adopter writes the same value, so adoption is
+   idempotent and a pre-existing or ops-seeded counter stays binding. The
+   legacy counter record is still maintained as a settled-count cache for
+   existing readers; the gate itself never trusts it after adoption. */
+async function eb8CapParts(env) {
+  const day = eb5YmdDigits();
+  let base = null;
+  try { const b = await env.LEADS.get('eb8:capbase:' + day, { type: 'json' }); if (b && typeof b.count === 'number') base = b.count; } catch (e) {}
+  if (base === null) { try { const r = await env.LEADS.get('eb8:cap:' + day, { type: 'json' }); base = (r && typeof r.count === 'number') ? r.count : 0; } catch (e) { base = 0; } }
+  let res = [], done = [];
+  try { res = (await listAllKeys(env, 'eb8:capres:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) {}
+  try { done = (await listAllKeys(env, 'eb8:capdone:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) {}
+  return { day: day, base: base, res: res, done: done };
+}
 async function eb8CapGet(env) {
-  try { const r = await env.LEADS.get('eb8:cap:' + eb5YmdDigits(), { type: 'json' }); return (r && typeof r.count === 'number') ? r.count : 0; } catch (e) { return 0; }
+  const p = await eb8CapParts(env);
+  return p.base + p.done.length + p.res.length;
+}
+async function eb8CapCacheWrite(env, day) {
+  try { const p = await eb8CapParts(env); await env.LEADS.put('eb8:cap:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: p.base + p.done.length })); } catch (e) {}
 }
 async function eb8ModelCall(env, opts) {
   if (eb8Counted(env)) return { ok: false, error: 'counted-env', skippedCap: true };
-  const used = await eb8CapGet(env);
-  if (used >= EB8_DAILY_MODEL_CALLS) return { ok: false, error: 'eb8_cap', skippedCap: true };
+  const day = eb5YmdDigits();
+  try {
+    const b = await env.LEADS.get('eb8:capbase:' + day, { type: 'json' });
+    if (!b || typeof b.count !== 'number') {
+      const r = await env.LEADS.get('eb8:cap:' + day, { type: 'json' });
+      await env.LEADS.put('eb8:capbase:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: (r && typeof r.count === 'number') ? r.count : 0 }));
+    }
+  } catch (e) {}
+  let parts = await eb8CapParts(env);
+  if (parts.base + parts.done.length + parts.res.length >= EB8_DAILY_MODEL_CALLS) return { ok: false, error: 'eb8_cap', skippedCap: true };
+  const suffix = String(Date.now()).padStart(13, '0') + '-' + randHex(8);
+  const resKey = 'eb8:capres:' + day + ':' + suffix;
+  try { await env.LEADS.put(resKey, JSON.stringify({ at: new Date().toISOString() })); } catch (e) { return { ok: false, error: 'eb8_cap', skippedCap: true }; }
+  parts = await eb8CapParts(env);
+  const rank = parts.res.indexOf(resKey);
+  const projected = parts.base + parts.done.length + (rank === -1 ? parts.res.length : rank + 1);
+  if (rank === -1 || projected > EB8_DAILY_MODEL_CALLS) {
+    try { await env.LEADS.delete(resKey); } catch (e) {}
+    return { ok: false, error: 'eb8_cap', skippedCap: true };
+  }
   const r = await ebModelCall(env, opts);
+  const ran = !!(r && !r.dormant && (r.ok || (typeof r.attempts === 'number' && r.attempts > 0)));
+  if (ran) {
+    try { await env.LEADS.put('eb8:capdone:' + day + ':' + suffix, JSON.stringify({ at: new Date().toISOString() })); } catch (e) {}
+    try { await env.LEADS.delete(resKey); } catch (e) {}
+    await eb8CapCacheWrite(env, day);
+  } else {
+    try { await env.LEADS.delete(resKey); } catch (e) {}
+  }
   if (r && r.dormant) return { ok: false, error: r.reason || 'dormant', dormant: r.reason === 'no-brain-pool', dormantReason: r.reason || null, attempts: (typeof r.attempts === 'number' ? r.attempts : 0) };
-  const ran = !!(r && (r.ok || (typeof r.attempts === 'number' && r.attempts > 0)));
-  if (ran) { try { await env.LEADS.put('eb8:cap:' + eb5YmdDigits(), JSON.stringify({ date: eb4VanYmd(Date.now()), count: used + 1 })); } catch (e) {} }
   return r;
 }
 
@@ -7219,9 +7273,50 @@ async function eb8IncidentWrite(env, rec) {
   try { await env.LEADS.put('eb8:incident:' + id, JSON.stringify(full)); } catch (e) { return null; }
   return full;
 }
+/* EB-8-FIXES F-03: claim-before-execute. Approval used to read the fix,
+   check state==='proposed' and execute, with the terminal state written
+   only at the END of eb8ExecuteFix — two concurrent approves (an owner
+   double-tap is enough) both passed the check and the fix ran twice.
+   KV has no compare-and-swap, so the claim is a write-then-verify
+   discipline: re-read the stored record, refuse unless it is 'proposed'
+   (or an 'executing' claim older than the stale window — a crashed
+   executor), write state:'executing' with a unique claim token, then
+   re-read TWICE and proceed only if both reads show the claim is ours.
+   The loser observes the winner's claim (or terminal state) and returns
+   already_claimed without any provider call and without overwriting the
+   winner's record. Counted envs skip the claim (inert-suite discipline,
+   like every other EB-8 write). */
+const EB8_FIX_CLAIM_STALE_MS = 10 * 60 * 1000;
+/* A fix is claimable when proposed, or when a previous claim went stale
+   (the claiming executor crashed before writing a terminal state — the
+   record must not brick itself). Used by the claim, the approve route
+   and the card approve branch so all three agree. */
+function eb8FixClaimable(fix) {
+  if (!fix) return false;
+  if (fix.state === 'proposed') return true;
+  return fix.state === 'executing' && !!fix.claimedAt && (Date.now() - Date.parse(fix.claimedAt) > EB8_FIX_CLAIM_STALE_MS);
+}
+async function eb8ClaimFix(env, fix) {
+  if (eb8Counted(env)) return { ok: true, claim: null };
+  const key = 'eb8:fix:' + fix.id;
+  let stored = null; try { stored = await env.LEADS.get(key, { type: 'json' }); } catch (e) {}
+  if (!stored) return { ok: false, reason: 'fix_not_stored' };
+  if (!eb8FixClaimable(stored)) return { ok: false, reason: 'already_claimed' };
+  const claim = eb8Id() + '-' + randHex(8);
+  const claimed = Object.assign({}, stored, { state: 'executing', claim: claim, claimedAt: new Date().toISOString() });
+  try { await env.LEADS.put(key, JSON.stringify(claimed)); } catch (e) { return { ok: false, reason: 'claim_write_failed' }; }
+  for (let i = 0; i < 2; i++) {
+    let verify = null; try { verify = await env.LEADS.get(key, { type: 'json' }); } catch (e) {}
+    if (!verify || verify.state !== 'executing' || verify.claim !== claim) return { ok: false, reason: 'already_claimed' };
+  }
+  return { ok: true, claim: claim };
+}
 async function eb8ExecuteFix(env, fix, via) {
   const type = fix.type, params = fix.params || {};
   const startedAt = new Date().toISOString();
+  const claimRes = await eb8ClaimFix(env, fix);
+  if (!claimRes.ok) return { executed: false, verified: false, reason: claimRes.reason, result: null };
+  if (claimRes.claim) { fix.state = 'executing'; fix.claim = claimRes.claim; fix.claimedAt = new Date().toISOString(); }
   const done = async function (executed, verified, reason, result) {
     fix.state = executed ? 'executed' : 'failed';
     fix.executedAt = new Date().toISOString();
@@ -7347,7 +7442,7 @@ async function eb8ExecuteFix(env, fix, via) {
       if (!g) return done(false, false, 'golden_not_found');
       const res = await eb8GoldenApply(env, g);
       const diff = await eb8GoldenDiff(env, g);
-      return done(true, diff.stateDrift.length === 0, diff.stateDrift.length ? 'residual_state_drift' : null, { goldenId: g.id, restored: res.restored, removed: res.removed, cfgDriftResidual: diff.cfgDrift });
+      return done(true, diff.stateDrift.length === 0, diff.stateDrift.length ? 'residual_state_drift' : null, { goldenId: g.id, restored: res.restored, removed: res.removed, refused: res.refused || [], cfgDriftResidual: diff.cfgDrift });
     }
     return done(false, false, 'not_allowlisted');
   } catch (e) { return done(false, false, 'executor_error'); }
@@ -7383,15 +7478,25 @@ async function eb8Critic(env, diagnosis, fixType, probes, sources) {
   if (!j || typeof j.agree !== 'boolean') return { agree: null, note: 'Critic answer unparseable — the diagnosis is UNVERIFIED.', unavailable: true };
   return { agree: j.agree, note: String(j.note || '').slice(0, 500) };
 }
+/* The propose-time Level-3 gate: an L3 fix type may only be proposed when
+   cfg:itops carries the leg that type needs. Factored out (EB-8-FIXES
+   F-02) because it must run not only on the original diagnosis but ALSO
+   on any fix the panel judge substitutes — the substitution path used to
+   re-validate and re-shadow the new type but never re-checked this gate,
+   so an L3 proposal could be created under a partial cfg:itops. */
+async function eb8ItopsGateFor(env, type) {
+  if (EB8_L3_TYPES.indexOf(type) === -1) return { ok: true };
+  const shape = eb8ItopsShape(await eb8Itops(env));
+  const need = type === 'l3_render_restart' ? 'render' : (type === 'l3_github_patch_pr' ? 'github' : 'cf');
+  if (!shape.configured || !shape[need]) return { ok: false, reason: 'itops_unconfigured' };
+  return { ok: true };
+}
 /* Build + store a fix proposal (shared by chat + proactive + cards). */
 async function eb8ProposeFix(env, diag, probes, via) {
   const v = eb8ValidateFix(diag.fixType, diag.params);
   if (!v.ok) return { ok: false, reason: v.reason };
-  if (EB8_L3_TYPES.indexOf(diag.fixType) !== -1) {
-    const shape = eb8ItopsShape(await eb8Itops(env));
-    const need = diag.fixType === 'l3_render_restart' ? 'render' : (diag.fixType === 'l3_github_patch_pr' ? 'github' : 'cf');
-    if (!shape.configured || !shape[need]) return { ok: false, reason: 'itops_unconfigured' };
-  }
+  const gate0 = await eb8ItopsGateFor(env, diag.fixType);
+  if (!gate0.ok) return { ok: false, reason: gate0.reason };
   /* Digital-Twin shadow test (Amendment #2): the fix is first
      applied to a shadow copy of the relevant state and validated.
      A failed shadow test means the fix may NOT be proposed for
@@ -7434,6 +7539,13 @@ async function eb8ProposeFix(env, diag, probes, via) {
       if (panel.judge.fixType && (panel.judge.fixType !== diag.fixType || JSON.stringify(panel.judge.params || {}) !== JSON.stringify(v.params))) {
         const v2 = eb8ValidateFix(panel.judge.fixType, panel.judge.params || {});
         if (v2.ok) {
+          /* EB-8-FIXES F-02: the substituted fix must pass the SAME
+             propose-time Level-3 gate as an original diagnosis. If the
+             judge's substitute is an L3 type whose cfg:itops leg is not
+             provisioned, the proposal fails closed exactly like a direct
+             proposal of that type — nothing is stored as 'proposed'. */
+          const gate2 = await eb8ItopsGateFor(env, panel.judge.fixType);
+          if (!gate2.ok) return { ok: false, reason: gate2.reason, panel: panel, substitutedFixType: panel.judge.fixType };
           const shadow2 = await eb8ShadowTest(env, panel.judge.fixType, v2.params);
           if (shadow2.ok) { diag = Object.assign({}, diag, { fixType: panel.judge.fixType, params: v2.params, diagnosis: diag.diagnosis + ' [Panel judge substituted the fix: ' + panel.judge.fixType + ']' }); v.params = v2.params; critic = await eb8Critic(env, diag.diagnosis, diag.fixType, probes, []); }
         }
@@ -7534,7 +7646,7 @@ async function eb8Chat(env, body) {
       if (prop.reason === 'shadow_failed') return finish(diag.diagnosis + '\n\n🧪 Digital-Twin shadow test FAILED for the proposed fix (' + diag.fixType + '): ' + ((prop.shadow && prop.shadow.note) || 'validation failed') + ' A fix that fails in the twin is never proposed for production; the attempt was recorded for audit.');
       if (prop.reason === 'panel_rejected') return finish(diag.diagnosis + '\n\n👥 The multi-model panel was convened (the Critic disagreed, was unavailable, or confidence was low) and its judge concluded that NO fix should be proposed. Judge: ' + ((prop.panel && prop.panel.judge && prop.panel.judge.summary) || 'n/a') + ((prop.panel && prop.panel.judge && prop.panel.judge.dissent) ? '\nDissent noted: ' + prop.panel.judge.dissent : ''));
       if (prop.reason === 'panel_inconclusive') return finish(diag.diagnosis + '\n\n👥 The multi-model panel was convened (the Critic disagreed, was unavailable, or confidence was low), but its judge could not render a verdict — so NO fix is proposed. A convened panel without a verdict never fails open; the attempt was recorded as panel-inconclusive and nothing was executed. Ask again to retry the panel.' + ((prop.fix && prop.fix.critic && prop.fix.critic.note) ? '\nCritic cross-check: ' + (prop.fix.critic.agree === false ? 'DISAGREES — ' : '') + prop.fix.critic.note : '') + ((prop.panel && prop.panel.views && prop.panel.views.length) ? '\nPanel views:\n' + prop.panel.views.map(function (vw) { return '[' + vw.persona + '] ' + vw.diagnosis + ' | fix: ' + (vw.fixType || 'none'); }).join('\n') : '\nPanel views: none could be obtained.'));
-      if (prop.reason === 'itops_unconfigured') return finish(diag.diagnosis + '\n\nThe proposed action (' + diag.fixType + ') is a Level 3 Operator action, but cfg:itops is not provisioned for it — Level 3 is OFF until the parent/owner places the infra tokens. Nothing was proposed for approval.');
+      if (prop.reason === 'itops_unconfigured') return finish(diag.diagnosis + '\n\nThe proposed action (' + (prop.substitutedFixType || diag.fixType) + ') is a Level 3 Operator action, but cfg:itops is not provisioned for it — Level 3 is OFF until the parent/owner places the infra tokens. Nothing was proposed for approval.');
       base.refused = 'hard-exclusion';
       return finish(diag.diagnosis + '\n\nThe suggested action (' + diag.fixType + ') is not on the allow-list (' + prop.reason + '), so no fix was proposed. Allow-listed fixes: ' + EB8_ALL_FIX_TYPES.join(', ') + '. Config/key edits, deploys, merges and customer sends are hard exclusions.');
     }
@@ -7821,15 +7933,24 @@ async function eb8ShadowTest(env, type, params) {
     if (type === 'restore_golden') {
       const g = await eb8GoldenLoad(env, params.goldenId);
       if (!g) { ck('golden-exists', false, 'golden snapshot not found (' + (params.goldenId || 'latest') + ')'); return done(); }
+      /* EB-8-FIXES F-01: the twin applies the same allow-list filter as
+         production apply — foreign keys in a planted snapshot are
+         refused here too (and named), never twin-copied. */
+      const filtered = eb8GoldenFilterState(g.state);
+      const gState = filtered.state;
       const cur = await eb8GoldenStateRead(env);
       for (const k of Object.keys(cur)) await env.LEADS.put(eb8TwinKey(k), cur[k]);
-      for (const k of Object.keys(g.state)) await env.LEADS.put(eb8TwinKey(k), g.state[k]);
-      for (const k of Object.keys(cur)) if (!(k in g.state)) await env.LEADS.delete(eb8TwinKey(k));
+      for (const k of Object.keys(gState)) await env.LEADS.put(eb8TwinKey(k), gState[k]);
+      for (const k of Object.keys(cur)) if (!(k in gState)) await env.LEADS.delete(eb8TwinKey(k));
       let drift = 0;
-      for (const k of Object.keys(g.state)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== g.state[k]) drift++; }
-      for (const k of Object.keys(cur)) { if (!(k in g.state)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) drift++; } }
+      for (const k of Object.keys(gState)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== gState[k]) drift++; }
+      for (const k of Object.keys(cur)) { if (!(k in gState)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) drift++; } }
       ck('twin-restore', drift === 0, 'golden state applied to twin copies of the live state; post-restore twin drift = ' + drift);
+      let leaked = 0;
+      for (const k of filtered.refused) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) leaked++; }
+      ck('apply-allowlist', leaked === 0, filtered.refused.length ? ('refused ' + filtered.refused.length + ' foreign key(s) in the snapshot: ' + filtered.refused.join(', ') + ' — none were twin-copied') : 'snapshot carries only golden-eligible keys');
       for (const k of Object.keys(cur)) { try { await env.LEADS.delete(eb8TwinKey(k)); } catch (e) {} }
+      for (const k of Object.keys(gState)) { try { await env.LEADS.delete(eb8TwinKey(k)); } catch (e) {} }
       return done();
     }
     if (EB8_L3_TYPES.indexOf(type) !== -1) {
@@ -8084,6 +8205,23 @@ async function eb8GoldenLoad(env, goldenId) {
     return (g && g.state) ? g : null;
   } catch (e) { return null; }
 }
+/* EB-8-FIXES F-01: the golden allow-list, enforced at APPLY time (and in
+   the diff + shadow), not only implicitly at capture. Capture builds the
+   state exclusively from EB8_GOLDEN_STATE_KEYS + EB8_GOLDEN_STATE_PREFIXES,
+   so any other key found in a golden record was planted out-of-band and
+   must never be written — before this fix, eb8GoldenApply wrote ANY key
+   in the record (a planted snapshot could overwrite cfg:* config or lead
+   records, or plant tok: session records, behind an owner approve). */
+function eb8GoldenKeyEligible(k) {
+  if (EB8_GOLDEN_STATE_KEYS.indexOf(k) !== -1) return true;
+  for (const p of EB8_GOLDEN_STATE_PREFIXES) if (String(k).indexOf(p) === 0) return true;
+  return false;
+}
+function eb8GoldenFilterState(state) {
+  const clean = {}, refused = [];
+  for (const k of Object.keys(state || {})) { if (eb8GoldenKeyEligible(k)) clean[k] = state[k]; else refused.push(k); }
+  return { state: clean, refused: refused };
+}
 async function eb8GoldenDiff(env, golden) {
   const cfgDrift = [], stateDrift = [];
   for (const k of Object.keys(golden.cfgShapes || {})) {
@@ -8092,24 +8230,29 @@ async function eb8GoldenDiff(env, golden) {
     if (cur.present !== golden.cfgShapes[k].present) cfgDrift.push({ key: k, kind: 'presence' });
     else if (JSON.stringify(cur.shape) !== JSON.stringify(golden.cfgShapes[k].shape)) cfgDrift.push({ key: k, kind: 'shape' });
   }
+  const filtered = eb8GoldenFilterState(golden.state);
+  const target = filtered.state;
   const curState = await eb8GoldenStateRead(env);
-  for (const k of Object.keys(golden.state || {})) {
+  for (const k of Object.keys(target)) {
     if (!(k in curState)) stateDrift.push({ key: k, kind: 'missing' });
-    else if (curState[k] !== golden.state[k]) stateDrift.push({ key: k, kind: 'changed' });
+    else if (curState[k] !== target[k]) stateDrift.push({ key: k, kind: 'changed' });
   }
-  for (const k of Object.keys(curState)) if (!((golden.state || {})[k] !== undefined)) stateDrift.push({ key: k, kind: 'extra' });
-  return { cfgDrift: cfgDrift, stateDrift: stateDrift, ok: cfgDrift.length === 0 && stateDrift.length === 0 };
+  for (const k of Object.keys(curState)) if (!(target[k] !== undefined)) stateDrift.push({ key: k, kind: 'extra' });
+  return { cfgDrift: cfgDrift, stateDrift: stateDrift, refusedKeys: filtered.refused, ok: cfgDrift.length === 0 && stateDrift.length === 0 };
 }
 async function eb8GoldenApply(env, golden) {
+  const filtered = eb8GoldenFilterState(golden.state);
+  const target = filtered.state;
   const restored = [], removed = [];
   const curState = await eb8GoldenStateRead(env);
-  for (const k of Object.keys(golden.state || {})) {
-    if (curState[k] !== golden.state[k]) { await env.LEADS.put(k, golden.state[k]); restored.push(k); }
+  for (const k of Object.keys(target)) {
+    if (curState[k] !== target[k]) { await env.LEADS.put(k, target[k]); restored.push(k); }
   }
   for (const k of Object.keys(curState)) {
-    if (!((golden.state || {})[k] !== undefined)) { await env.LEADS.delete(k); removed.push(k); }
+    if (!eb8GoldenKeyEligible(k)) continue;
+    if (!(target[k] !== undefined)) { await env.LEADS.delete(k); removed.push(k); }
   }
-  return { restored: restored, removed: removed };
+  return { restored: restored, removed: removed, refused: filtered.refused };
 }
 
 /* ----- deploy correlation + upstream status context for diagnoses ----- */
@@ -28017,8 +28160,9 @@ async function handleRequest(request, env, ctx) {
         const fid = String((d && d.fixId) || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60);
         const fix = fid ? await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; }) : null;
         if (!fix) return json({ ok: false, error: 'not_found' }, 404, origin);
-        if (fix.state !== 'proposed') return json({ ok: false, error: 'not_proposed', state: fix.state }, 409, origin);
+        if (!eb8FixClaimable(fix)) return json({ ok: false, error: 'not_proposed', state: fix.state }, 409, origin);
         const res = await eb8ExecuteFix(env, fix, 'owner');
+        if (res && res.reason === 'already_claimed') return json({ ok: false, error: 'already_claimed', fixId: fid }, 409, origin);
         return json(Object.assign({ ok: true, fixId: fid }, res), 200, origin);
       }
       if (path === '/api/admin/eb/itsupport/fix/reject' && request.method === 'POST') {
