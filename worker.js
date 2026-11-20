@@ -8116,13 +8116,28 @@ async function eb8IncidentWrite(env, rec) {
    winner's record. Counted envs skip the claim (inert-suite discipline,
    like every other EB-8 write). */
 const EB8_FIX_CLAIM_STALE_MS = 10 * 60 * 1000;
+/* EB8-P2-JUDGE (02-M7): proposal records live for 48h — long enough
+   for an owner weekend gap, short enough that a stale proposal
+   (whose dry-run embeds time-sensitive state) cannot be approved
+   days later against changed conditions. The eb:e: ledger and the
+   incident records remain the durable audit trail. */
+const EB8_FIX_TTL_SEC = 48 * 3600;
 /* A fix is claimable when proposed, or when a previous claim went stale
    (the claiming executor crashed before writing a terminal state — the
    record must not brick itself). Used by the claim, the approve route
    and the card approve branch so all three agree. */
 function eb8FixClaimable(fix) {
   if (!fix) return false;
-  if (fix.state === 'proposed') return true;
+  if (fix.state === 'proposed') {
+    /* EB8-P2-JUDGE (02-M7): a proposal older than the proposal TTL is
+       stale against changed conditions and no longer claimable, even
+       if the record itself outlived its KV TTL (e.g. it was written
+       before the TTL existed). A missing/unparseable timestamp keeps
+       the legacy behaviour — old records are not bricked. */
+    const at = Date.parse(fix.at || '');
+    if (isFinite(at) && (Date.now() - at > EB8_FIX_TTL_SEC * 1000)) return false;
+    return true;
+  }
   return fix.state === 'executing' && !!fix.claimedAt && (Date.now() - Date.parse(fix.claimedAt) > EB8_FIX_CLAIM_STALE_MS);
 }
 async function eb8ClaimFix(env, fix) {
@@ -8366,13 +8381,13 @@ function eb8EvidenceText(probes, sources) {
   return parts.join('\n').slice(0, 7000);
 }
 async function eb8Diagnose(env, message, probes, sources) {
-  const sys = 'EB8-DIAGNOSIS. You are the diagnostic engine of an IT support system for a real-estate platform family (site worker + Academy deployment + receptionist service). Use ONLY the probe evidence and runbook sources provided — never invent state. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of clear_breaker|regen_briefing|reconcile|watchdog_tick|clear_record|l3_cf_cache_purge|l3_render_restart|l3_github_patch_pr|l3_cf_ip_block|restore_golden or null>,"params":{...},"scope":"site|academy|receptionist","confidence":"high|low"}. Set confidence "low" when the evidence is thin, stale or contradictory. Choose a fixType ONLY when the evidence proves the condition it cures; otherwise fixType null. For clear_breaker params {"leg":"groq|gemini|backup-groq|backup-gemini"}; regen_briefing {"kind":"am|pm"}; reconcile {"date":"YYYY-MM-DD"}; clear_record {"key":"<exact KV key from the evidence>"}; l3_cf_cache_purge {"surface":"site|academy"}; l3_github_patch_pr {"repo":"...","path":"...","patch":"<UNIFIED DIFF for exactly that one file, git format: --- a/<path> / +++ b/<path> headers and @@ hunks; NEVER full file content; at most 400 changed lines>","title":"..."}. The diagnosis text must state the surface (site / academy / receptionist) it concerns.';
+  const sys = 'EB8-DIAGNOSIS. You are the diagnostic engine of an IT support system for a real-estate platform family (site worker + Academy deployment + receptionist service). Use ONLY the probe evidence and runbook sources provided — never invent state. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of clear_breaker|regen_briefing|reconcile|watchdog_tick|clear_record|l3_cf_cache_purge|l3_render_restart|l3_github_patch_pr|l3_cf_ip_block|l3_cf_ip_unblock|restore_golden or null>,"params":{...},"scope":"site|academy|receptionist","confidence":"high|low"}. Set confidence "low" when the evidence is thin, stale or contradictory. Choose a fixType ONLY when the evidence proves the condition it cures; otherwise fixType null. For clear_breaker params {"leg":"groq|gemini|backup-groq|backup-gemini"}; regen_briefing {"kind":"am|pm"}; reconcile {"date":"YYYY-MM-DD"}; clear_record {"key":"<exact KV key from the evidence>"}; l3_cf_cache_purge {"surface":"site|academy"}; l3_github_patch_pr {"repo":"...","path":"...","patch":"<UNIFIED DIFF for exactly that one file, git format: --- a/<path> / +++ b/<path> headers and @@ hunks; NEVER full file content; at most 400 changed lines>","title":"..."}. For l3_cf_ip_block params {\"ip\":\"<IPv4 or IPv6 address from the evidence>\",\"hours\":<integer 1-168>,\"surface\":\"site|academy\"}; l3_cf_ip_unblock {\"blockId\":\"<the EB-8 block id from the evidence>\"}; l3_render_restart {}; restore_golden {\"goldenId\":\"<snapshot id from the evidence, or empty string for the latest snapshot>\"}. The diagnosis text must state the surface (site / academy / receptionist) it concerns.';
   const ctx = await eb8DiagnosisContext(env, message).catch(function () { return ''; });
   const r = await eb8ModelCall(env, { task: 'eb8_diagnosis', system: sys, prompt: 'OWNER MESSAGE: ' + String(message || '').slice(0, 1200) + '\n\nPROBE EVIDENCE + RUNBOOK SOURCES:\n' + eb8EvidenceText(probes, sources) + ctx, maxTokens: 900 });
   if (!r || !r.ok) return { ok: false, dormant: !!(r && r.dormant), reason: (r && (r.dormantReason || r.error)) || 'model_failed' };
   const j = eb8JsonFrom(r.text);
   if (!j || typeof j.diagnosis !== 'string') return { ok: false, reason: 'diagnosis_unparseable' };
-  return { ok: true, diagnosis: j.diagnosis.slice(0, 1200), fixType: (typeof j.fixType === 'string' && j.fixType) ? j.fixType : null, params: (j.params && typeof j.params === 'object') ? j.params : {}, scope: (j.scope === 'academy' || j.scope === 'receptionist' || j.scope === 'site') ? j.scope : null, confidence: j.confidence === 'low' ? 'low' : 'high', provider: r.provider || null };
+  return { ok: true, diagnosis: j.diagnosis.slice(0, 1200), fixType: (typeof j.fixType === 'string' && j.fixType) ? j.fixType : null, params: (j.params && typeof j.params === 'object') ? j.params : {}, scope: (j.scope === 'academy' || j.scope === 'receptionist' || j.scope === 'site') ? j.scope : null, confidence: j.confidence === 'high' ? 'high' : 'low', provider: r.provider || null };
 }
 async function eb8Critic(env, diagnosis, fixType, probes, sources) {
   const sys = 'EB8-CRITIC. You are the independent cross-checker for an IT support diagnosis (the EB-5 Critic pattern). Judge ONLY whether the probe evidence actually supports the diagnosis and the proposed fix. Reply with ONLY a JSON object {"agree":true|false,"note":"..."}. Disagree when the evidence is missing, stale, contradictory, or the fix would not cure the diagnosed condition.';
@@ -8395,8 +8410,45 @@ async function eb8ItopsGateFor(env, type) {
   if (!shape.configured || !shape[need]) return { ok: false, reason: 'itops_unconfigured' };
   return { ok: true };
 }
+/* EB8-P2-JUDGE (02-H2): risk tiers for judge substitutions, defined
+   from the code's own groupings — tier 1 the auto-eligible Level 2
+   set (EB8_FIX_TYPES), tier 2 restore_golden (approval-gated state
+   restore, deliberately outside auto-eligibility), tier 3 the Level
+   3 external-effect set (EB8_L3_TYPES). A substitution may only move
+   to an equal or lower tier. */
+function eb8FixTier(type) {
+  if (EB8_L3_TYPES.indexOf(type) !== -1) return 3;
+  if (type === 'restore_golden') return 2;
+  if (EB8_FIX_TYPES.indexOf(type) !== -1) return 1;
+  return 99;
+}
+/* Canonical params equality for proposal de-duplication (02-M7):
+   recursive key-sorted JSON, so key order never creates a phantom
+   difference. */
+function eb8StableParams(params) {
+  const norm = function (x) {
+    if (Array.isArray(x)) return x.map(norm);
+    if (x && typeof x === 'object') { const o = {}; for (const k of Object.keys(x).sort()) o[k] = norm(x[k]); return o; }
+    return x;
+  };
+  return JSON.stringify(norm(params || {}));
+}
+/* An open (proposed + still claimable) proposal for the same
+   (type, params), if one exists — repeated chats about the same
+   condition converge on ONE proposal instead of duplicating it. */
+async function eb8FindOpenProposal(env, type, params) {
+  const want = eb8StableParams(params);
+  const rows = await eb7Scan(env, 'eb8:fix:', 200);
+  for (const row of rows) {
+    const rec = row.rec;
+    if (!rec || rec.state !== 'proposed' || rec.type !== type) continue;
+    if (!eb8FixClaimable(rec)) continue;
+    if (eb8StableParams(rec.params) === want) return rec;
+  }
+  return null;
+}
 /* Build + store a fix proposal (shared by chat + proactive + cards). */
-async function eb8ProposeFix(env, diag, probes, via) {
+async function eb8ProposeFix(env, diag, probes, via, sources) {
   const v = eb8ValidateFix(diag.fixType, diag.params);
   if (!v.ok) return { ok: false, reason: v.reason };
   const gate0 = await eb8ItopsGateFor(env, diag.fixType);
@@ -8409,17 +8461,24 @@ async function eb8ProposeFix(env, diag, probes, via) {
   const shadow = await eb8ShadowTest(env, diag.fixType, v.params);
   if (!shadow.ok) {
     const failed = { id: eb8Id(), at: new Date().toISOString(), type: diag.fixType, params: v.params, scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: diag.scope })), diagnosis: diag.diagnosis, dryRun: await eb8DryRun(env, diag.fixType, v.params), critic: null, shadow: shadow, state: 'shadow-failed', via: via || 'chat', probeSummary: probes.map(function (p) { return { probe: p.probe, scope: p.scope, ok: p.ok }; }) };
-    if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + failed.id, JSON.stringify(failed)); } catch (e) {} }
+    if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + failed.id, JSON.stringify(failed), { expirationTtl: EB8_FIX_TTL_SEC }); } catch (e) {} }
     await eb8Emit(env, 'itsupport.fix.shadow_failed', { fixId: failed.id, type: failed.type, scope: failed.scope });
     return { ok: false, reason: 'shadow_failed', shadow: shadow, fix: failed };
   }
-  let critic = await eb8Critic(env, diag.diagnosis, diag.fixType, probes, []);
+  let critic = await eb8Critic(env, diag.diagnosis, diag.fixType, probes, sources || []);
   /* Multi-model panel (Amendment #2): when the Critic disagrees, is
      unavailable, or the diagnosis self-reports low confidence,
      convene three independent diagnoses + a judge reconciliation.
      The judge may substitute the fix (re-validated + re-shadowed)
      or kill it; dissent is carried on the record and shown. */
   let panel = null;
+  /* EB8-P2-JUDGE: the shadow and scope the stored record will carry
+     — replaced by the substitute's when a substitution is accepted
+     (02-M6: the stored shadow is the PROPOSED fix's shadow;
+     02-L7: post-substitution scope is recomputed). */
+  let effShadow = shadow;
+  let shadowOriginal = null;
+  let effScope = diag.scope;
   if (critic.agree !== true || diag.confidence === 'low') {
     panel = await eb8Panel(env, diag, probes);
     if (panel && !panel.judge) {
@@ -8430,40 +8489,75 @@ async function eb8ProposeFix(env, diag, probes, via) {
          shows the diagnosis, the Critic's position and the panel
          views instead of silently proceeding. */
       const inc = { id: eb8Id(), at: new Date().toISOString(), type: diag.fixType, params: v.params, scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: diag.scope })), diagnosis: diag.diagnosis, dryRun: await eb8DryRun(env, diag.fixType, v.params), critic: critic, shadow: shadow, panel: panel, state: 'panel-inconclusive', via: via || 'chat', probeSummary: probes.map(function (p) { return { probe: p.probe, scope: p.scope, ok: p.ok }; }) };
-      if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + inc.id, JSON.stringify(inc)); } catch (e) {} }
+      if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + inc.id, JSON.stringify(inc), { expirationTtl: EB8_FIX_TTL_SEC }); } catch (e) {} }
       await eb8Emit(env, 'itsupport.fix.panel_inconclusive', { fixId: inc.id, type: inc.type, scope: inc.scope });
       return { ok: false, reason: 'panel_inconclusive', panel: panel, fix: inc };
     }
     if (panel && panel.judge) {
       if (panel.judge.fixType === null) {
         const killed = { id: eb8Id(), at: new Date().toISOString(), type: diag.fixType, params: v.params, scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: diag.scope })), diagnosis: diag.diagnosis, dryRun: await eb8DryRun(env, diag.fixType, v.params), critic: critic, shadow: shadow, panel: panel, state: 'panel-rejected', via: via || 'chat', probeSummary: probes.map(function (p) { return { probe: p.probe, scope: p.scope, ok: p.ok }; }) };
-        if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + killed.id, JSON.stringify(killed)); } catch (e) {} }
+        if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + killed.id, JSON.stringify(killed), { expirationTtl: EB8_FIX_TTL_SEC }); } catch (e) {} }
+        await eb8Emit(env, 'itsupport.fix.panel_rejected', { fixId: killed.id, type: killed.type, scope: killed.scope });
         return { ok: false, reason: 'panel_rejected', panel: panel, fix: killed };
       }
       if (panel.judge.fixType && (panel.judge.fixType !== diag.fixType || JSON.stringify(panel.judge.params || {}) !== JSON.stringify(v.params))) {
-        const v2 = eb8ValidateFix(panel.judge.fixType, panel.judge.params || {});
-        if (v2.ok) {
-          /* EB-8-FIXES F-02: the substituted fix must pass the SAME
-             propose-time Level-3 gate as an original diagnosis. If the
-             judge's substitute is an L3 type whose cfg:itops leg is not
-             provisioned, the proposal fails closed exactly like a direct
-             proposal of that type — nothing is stored as 'proposed'. */
-          const gate2 = await eb8ItopsGateFor(env, panel.judge.fixType);
-          if (!gate2.ok) return { ok: false, reason: gate2.reason, panel: panel, substitutedFixType: panel.judge.fixType };
-          const shadow2 = await eb8ShadowTest(env, panel.judge.fixType, v2.params);
-          if (shadow2.ok) { diag = Object.assign({}, diag, { fixType: panel.judge.fixType, params: v2.params, diagnosis: diag.diagnosis + ' [Panel judge substituted the fix: ' + panel.judge.fixType + ']' }); v.params = v2.params; critic = await eb8Critic(env, diag.diagnosis, diag.fixType, probes, []); }
-        }
+        /* EB8-P2-JUDGE (02-H1/H2): the judge's substitute is
+           re-validated, re-gated (F-02), tier-checked and
+           re-shadowed — and a refusal at ANY stage fails CLOSED.
+           Before this pack a failed validation or shadow silently
+           fell through and the ORIGINAL fix was proposed (the
+           fail-open class QC D2 closed). A refused substitution is
+           recorded as panel-inconclusive carrying a
+           substitutionRefusal object; the original fix is never
+           proposed in its place. A higher-tier substitute is
+           withheld and surfaced as dissent (DESIGN §2). */
+        const subType = panel.judge.fixType;
+        const fromTier = eb8FixTier(diag.fixType), toTier = eb8FixTier(subType);
+        const refuseSub = async function (stage, reason) {
+          if (stage === 'tier') panel.judge.dissent = String(panel.judge.dissent || '') + ' [Withheld by the tier rule: the judge\'s substitute ' + subType + ' is a higher risk tier than the diagnosed fix ' + diag.fixType + '; tier-escalating substitutions are never proposed. Recorded as dissent only — the owner may request ' + subType + ' directly.]';
+          const rec = { id: eb8Id(), at: new Date().toISOString(), type: diag.fixType, params: v.params, scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: diag.scope })), diagnosis: diag.diagnosis, dryRun: await eb8DryRun(env, diag.fixType, v.params), critic: critic, shadow: shadow, panel: panel, substitutionRefusal: { stage: stage, type: subType, reason: reason, fromTier: fromTier, toTier: toTier }, state: 'panel-inconclusive', via: via || 'chat', probeSummary: probes.map(function (p) { return { probe: p.probe, scope: p.scope, ok: p.ok }; }) };
+          if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + rec.id, JSON.stringify(rec), { expirationTtl: EB8_FIX_TTL_SEC }); } catch (e) {} }
+          await eb8Emit(env, 'itsupport.fix.panel_inconclusive', { fixId: rec.id, type: rec.type, scope: rec.scope, substitutionRefusal: stage });
+          if (stage === 'itops') return { ok: false, reason: 'itops_unconfigured', panel: panel, substitutedFixType: subType, fix: rec };
+          return { ok: false, reason: 'substitution_refused', refusalStage: stage, refusalType: subType, refusalReason: reason, panel: panel, fix: rec };
+        };
+        const v2 = eb8ValidateFix(subType, panel.judge.params || {});
+        if (!v2.ok) return await refuseSub('validate', v2.reason);
+        /* EB-8-FIXES F-02: the substituted fix must pass the SAME
+           propose-time Level-3 gate as an original diagnosis. If the
+           judge's substitute is an L3 type whose cfg:itops leg is not
+           provisioned, the proposal fails closed exactly like a direct
+           proposal of that type — nothing is stored as 'proposed'.
+           (EB8-P2-JUDGE: the refusal is now recorded like every other
+           refused substitution.) */
+        const gate2 = await eb8ItopsGateFor(env, subType);
+        if (!gate2.ok) return await refuseSub('itops', gate2.reason);
+        if (toTier > fromTier) return await refuseSub('tier', 'tier_escalation');
+        const shadow2 = await eb8ShadowTest(env, subType, v2.params);
+        if (!shadow2.ok) return await refuseSub('shadow', 'shadow_failed');
+        diag = Object.assign({}, diag, { fixType: subType, params: v2.params, diagnosis: diag.diagnosis + ' [Panel judge substituted the fix: ' + subType + ']' });
+        v.params = v2.params;
+        effShadow = shadow2;
+        shadowOriginal = shadow;
+        effScope = (v2.params && (v2.params.surface === 'academy' || v2.params.surface === 'site')) ? v2.params.surface : diag.scope;
+        critic = await eb8Critic(env, diag.diagnosis, diag.fixType, probes, sources || []);
       }
     }
   }
+  /* EB8-P2-JUDGE (02-M7): de-duplication — if an open proposal for
+     the same final (type, params) already exists, return it instead
+     of storing a duplicate. */
+  const dupe = await eb8FindOpenProposal(env, diag.fixType, v.params);
+  if (dupe) return { ok: true, fix: dupe, deduped: true };
   const fix = {
     id: eb8Id(), at: new Date().toISOString(), type: diag.fixType, params: v.params,
-    scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: diag.scope })),
+    scope: eb8FixScope(diag.fixType, Object.assign({}, v.params, { scope: effScope })),
     diagnosis: diag.diagnosis, dryRun: await eb8DryRun(env, diag.fixType, v.params),
-    critic: critic, shadow: shadow, panel: panel, state: 'proposed', via: via || 'chat',
+    critic: critic, shadow: effShadow, panel: panel, state: 'proposed', via: via || 'chat',
     probeSummary: probes.map(function (p) { return { probe: p.probe, scope: p.scope, ok: p.ok }; })
   };
-  if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + fix.id, JSON.stringify(fix)); } catch (e) {} }
+  if (shadowOriginal) fix.shadowOriginal = shadowOriginal;
+  if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + fix.id, JSON.stringify(fix), { expirationTtl: EB8_FIX_TTL_SEC }); } catch (e) {} }
   await eb8Emit(env, 'itsupport.fix.proposed', { fixId: fix.id, type: fix.type, scope: fix.scope, via: fix.via, criticAgree: critic.agree });
   return { ok: true, fix: fix };
 }
@@ -8545,11 +8639,12 @@ async function eb8Chat(env, body) {
     }
     base.modelCalled = true;
     if (!diag.fixType) return finish(diag.diagnosis);
-    const prop = await eb8ProposeFix(env, diag, probes, 'chat');
+    const prop = await eb8ProposeFix(env, diag, probes, 'chat', sources);
     if (!prop.ok) {
       if (prop.reason === 'shadow_failed') return finish(diag.diagnosis + '\n\n🧪 Digital-Twin shadow test FAILED for the proposed fix (' + diag.fixType + '): ' + ((prop.shadow && prop.shadow.note) || 'validation failed') + ' A fix that fails in the twin is never proposed for production; the attempt was recorded for audit.');
       if (prop.reason === 'panel_rejected') return finish(diag.diagnosis + '\n\n👥 The multi-model panel was convened (the Critic disagreed, was unavailable, or confidence was low) and its judge concluded that NO fix should be proposed. Judge: ' + ((prop.panel && prop.panel.judge && prop.panel.judge.summary) || 'n/a') + ((prop.panel && prop.panel.judge && prop.panel.judge.dissent) ? '\nDissent noted: ' + prop.panel.judge.dissent : ''));
       if (prop.reason === 'panel_inconclusive') return finish(diag.diagnosis + '\n\n👥 The multi-model panel was convened (the Critic disagreed, was unavailable, or confidence was low), but its judge could not render a verdict — so NO fix is proposed. A convened panel without a verdict never fails open; the attempt was recorded as panel-inconclusive and nothing was executed. Ask again to retry the panel.' + ((prop.fix && prop.fix.critic && prop.fix.critic.note) ? '\nCritic cross-check: ' + (prop.fix.critic.agree === false ? 'DISAGREES — ' : '') + prop.fix.critic.note : '') + ((prop.panel && prop.panel.views && prop.panel.views.length) ? '\nPanel views:\n' + prop.panel.views.map(function (vw) { return '[' + vw.persona + '] ' + vw.diagnosis + ' | fix: ' + (vw.fixType || 'none'); }).join('\n') : '\nPanel views: none could be obtained.'));
+      if (prop.reason === 'substitution_refused') return finish(diag.diagnosis + '\n\n👥 The multi-model panel was convened (the Critic disagreed, was unavailable, or confidence was low) and its judge substituted a different fix (' + prop.refusalType + '), but the substitution was refused: ' + (prop.refusalStage === 'validate' ? ('the substitute failed validation (' + prop.refusalReason + ')') : (prop.refusalStage === 'tier' ? 'the substitute is a higher risk tier than the diagnosed fix, and tier-escalating substitutions are withheld' : 'the substitute failed its Digital-Twin shadow test')) + '. So NO fix is proposed — a refused substitution never falls back to the original fix. The attempt was recorded as panel-inconclusive; the judge\'s substitute stands as dissent only. If you want that fix, ask for it directly and it will go through the normal gates.');
       if (prop.reason === 'itops_unconfigured') return finish(diag.diagnosis + '\n\nThe proposed action (' + (prop.substitutedFixType || diag.fixType) + ') is a Level 3 Operator action, but cfg:itops is not provisioned for it — Level 3 is OFF until the parent/owner places the infra tokens. Nothing was proposed for approval.');
       base.refused = 'hard-exclusion';
       return finish(diag.diagnosis + '\n\nThe suggested action (' + diag.fixType + ') is not on the allow-list (' + prop.reason + '), so no fix was proposed. Allow-listed fixes: ' + EB8_ALL_FIX_TYPES.join(', ') + '. Config/key edits, deploys, merges and customer sends are hard exclusions.');
@@ -8889,14 +8984,23 @@ async function eb8Panel(env, diag, probes) {
     { id: 'provider-specialist', lens: 'Focus on provider behaviour: quotas, parked legs, retired model ids, failover rules, pool separation.' },
     { id: 'operations-pragmatist', lens: 'Focus on the operational cause and the smallest safe, reversible cure.' }
   ];
-  const views = [];
-  for (const p of personas) {
-    const sys = 'EB8-PANEL. You are one independent diagnostician (' + p.id + ') on a multi-model panel for an IT support system covering a real-estate site worker, its Academy deployment and a receptionist service. ' + p.lens + ' Use ONLY the evidence. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of ' + EB8_ALL_FIX_TYPES.join('|') + ' or null>,"params":{...},"confidence":"high|low"}.';
-    const r = await eb8ModelCall(env, { task: 'eb8_panel', system: sys, prompt: 'PRIMARY DIAGNOSIS UNDER REVIEW: ' + String(diag.diagnosis || '').slice(0, 800) + '\n\nPROBE EVIDENCE:\n' + eb8EvidenceText(probes, []).slice(0, 4500), maxTokens: 500 });
-    if (r && r.ok) { const j = eb8JsonFrom(r.text); if (j && typeof j.diagnosis === 'string') views.push({ persona: p.id, diagnosis: j.diagnosis.slice(0, 600), fixType: (typeof j.fixType === 'string' && j.fixType) ? j.fixType : null, params: (j.params && typeof j.params === 'object') ? j.params : {}, confidence: j.confidence === 'low' ? 'low' : 'high' }); }
-  }
+  /* EB8-P2-JUDGE (02-M4/M11): the three views are formed CONCURRENTLY
+     (Promise.all — the cap's reservation keys, EB-8-FIXES F-04,
+     already support parallel spenders) and INDEPENDENTLY: a view is
+     shown the probe evidence only, never the primary diagnosis (the
+     old prompt led with 'PRIMARY DIAGNOSIS UNDER REVIEW', anchoring
+     every view to the diagnosis under review), and the serving
+     provider is recorded on each view. Persona order in the views
+     array is preserved. */
+  const viewResults = await Promise.all(personas.map(async function (p) {
+    const sys = 'EB8-PANEL. You are one independent diagnostician (' + p.id + ') on a multi-model panel for an IT support system covering a real-estate site worker, its Academy deployment and a receptionist service. ' + p.lens + ' You have NOT been shown the primary diagnosis: form your own view from the evidence alone. Use ONLY the evidence. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of ' + EB8_ALL_FIX_TYPES.join('|') + ' or null>,"params":{...},"confidence":"high|low"}.';
+    const r = await eb8ModelCall(env, { task: 'eb8_panel', system: sys, prompt: 'PROBE EVIDENCE:\n' + eb8EvidenceText(probes, []).slice(0, 4500), maxTokens: 500 });
+    if (r && r.ok) { const j = eb8JsonFrom(r.text); if (j && typeof j.diagnosis === 'string') return { persona: p.id, diagnosis: j.diagnosis.slice(0, 600), fixType: (typeof j.fixType === 'string' && j.fixType) ? j.fixType : null, params: (j.params && typeof j.params === 'object') ? j.params : {}, confidence: j.confidence === 'high' ? 'high' : 'low', provider: r.provider || null }; }
+    return null;
+  }));
+  const views = viewResults.filter(function (vw) { return !!vw; });
   if (!views.length) return { convened: true, views: [], judge: null };
-  const jsys = 'EB8-JUDGE. You reconcile independent diagnoses of one IT incident against the probe evidence. Reply with ONLY a JSON object {"summary":"...","fixType":<allow-listed type or null>,"params":{...},"dissent":"<minority view the owner should see, or empty string>"}. Choose fixType null when the panel does not converge on a safe, evidence-backed cure.';
+  const jsys = 'EB8-JUDGE. You reconcile independent diagnoses of one IT incident against the probe evidence. Reply with ONLY a JSON object {"summary":"...","fixType":<allow-listed type or null>,"params":{...},"dissent":"<minority view the owner should see, or empty string>"}. Choose fixType null when the panel does not converge on a safe, evidence-backed cure. Substitution discipline: you may substitute ONLY a fix of equal or lower impact than the primary fix — the impact order is: Level 2 fixes (clear_breaker, regen_briefing, reconcile, watchdog_tick, clear_record), then restore_golden, then Level 3 fixes (l3_cf_cache_purge, l3_render_restart, l3_github_patch_pr, l3_cf_ip_block, l3_cf_ip_unblock). An escalating substitute is withheld and shown to the owner as dissent, never proposed.';
   const jr = await eb8ModelCall(env, { task: 'eb8_judge', system: jsys, prompt: 'PRIMARY DIAGNOSIS: ' + String(diag.diagnosis || '').slice(0, 800) + '\nPRIMARY FIX: ' + String(diag.fixType || 'none') + '\n\nPANEL VIEWS:\n' + views.map(function (v) { return '[' + v.persona + '] ' + v.diagnosis + ' | fix: ' + (v.fixType || 'none'); }).join('\n') + '\n\nEVIDENCE:\n' + eb8EvidenceText(probes, []).slice(0, 3500), maxTokens: 500 });
   let judge = null;
   if (jr && jr.ok) { const j = eb8JsonFrom(jr.text); if (j && typeof j.summary === 'string') judge = { summary: j.summary.slice(0, 800), fixType: (typeof j.fixType === 'string' && j.fixType) ? j.fixType : null, params: (j.params && typeof j.params === 'object') ? j.params : {}, dissent: String(j.dissent || '').slice(0, 400) }; }
