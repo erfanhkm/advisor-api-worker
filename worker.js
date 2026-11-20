@@ -7294,6 +7294,7 @@ async function eb7Nightly(env, opts) {
    itsupport.redteam / itsupport.extstatus / itsupport.silence /
    itsupport.escalation.push / itsupport.golden.captured. */
 const EB8_DAILY_MODEL_CALLS = 40;
+const EB8_CAP_TTL_SEC = 172800; /* EB8-P2-CAP: 48 h TTL on every eb8:cap* and eb8:twin: key (02-L3 / 02-L1 TTL half) */
 const EB8_MAX_PROBES = 6;
 const EB8_AUTO_MIN_SUCCESSES = 5;
 const EB8_FIX_TYPES = ['clear_breaker', 'regen_briefing', 'reconcile', 'watchdog_tick', 'clear_record'];
@@ -7610,54 +7611,76 @@ function eb8B64DecodeText(b64) {
    idempotent and a pre-existing or ops-seeded counter stays binding. The
    legacy counter record is still maintained as a settled-count cache for
    existing readers; the gate itself never trusts it after adoption. */
-async function eb8CapParts(env) {
-  const day = eb5YmdDigits();
-  let base = null;
-  try { const b = await env.LEADS.get('eb8:capbase:' + day, { type: 'json' }); if (b && typeof b.count === 'number') base = b.count; } catch (e) {}
-  if (base === null) { try { const r = await env.LEADS.get('eb8:cap:' + day, { type: 'json' }); base = (r && typeof r.count === 'number') ? r.count : 0; } catch (e) { base = 0; } }
-  let res = [], done = [];
-  try { res = (await listAllKeys(env, 'eb8:capres:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) {}
-  try { done = (await listAllKeys(env, 'eb8:capdone:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) {}
-  return { day: day, base: base, res: res, done: done };
+/* EB8-P2-CAP (02-H3/02-M1/02-L2/02-L4): ONE parts read per model call.
+   The day is passed in by eb8ModelCall (fixed at call entry, so a call
+   straddling Vancouver midnight ranks and settles in its entry day);
+   the display path (eb8CapGet) derives the current day itself. The
+   adopted base is clamped >= 0 at read time. Read failures are NO
+   LONGER swallowed into zeros for the gate: ok/resOk/doneOk/baseOk
+   report them and eb8ModelCall fails closed on !ok (a failed list
+   reading as zero settled spend was the 02-M1 under-count). */
+async function eb8CapParts(env, day) {
+  day = day || eb5YmdDigits();
+  let base = null, adopted = false, baseOk = true;
+  try { const b = await env.LEADS.get('eb8:capbase:' + day, { type: 'json' }); if (b && typeof b.count === 'number' && isFinite(b.count)) { base = Math.max(0, b.count); adopted = true; } } catch (e) { baseOk = false; }
+  if (base === null) { try { const r = await env.LEADS.get('eb8:cap:' + day, { type: 'json' }); base = (r && typeof r.count === 'number' && isFinite(r.count)) ? Math.max(0, r.count) : 0; } catch (e) { baseOk = false; base = 0; } }
+  let res = [], done = [], resOk = true, doneOk = true;
+  try { res = (await listAllKeys(env, 'eb8:capres:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) { resOk = false; }
+  try { done = (await listAllKeys(env, 'eb8:capdone:' + day + ':', 300)).map(function (k) { return String((k && k.name) || k); }).sort(); } catch (e) { doneOk = false; }
+  return { day: day, base: base, res: res, done: done, adopted: adopted, baseOk: baseOk, resOk: resOk, doneOk: doneOk, ok: baseOk && resOk && doneOk };
 }
 async function eb8CapGet(env) {
   const p = await eb8CapParts(env);
   return p.base + p.done.length + p.res.length;
 }
-async function eb8CapCacheWrite(env, day) {
-  try { const p = await eb8CapParts(env); await env.LEADS.put('eb8:cap:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: p.base + p.done.length })); } catch (e) {}
+/* EB8-P2-CAP: the settled count comes from the caller's single parts
+   read — this cache write no longer re-reads eb8CapParts (that was the
+   third parts read of every call). Best-effort display cache, as
+   before; the gate never trusts it after adoption. */
+async function eb8CapCacheWrite(env, day, count) {
+  try { await env.LEADS.put('eb8:cap:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: count }), { expirationTtl: EB8_CAP_TTL_SEC }); } catch (e) {}
 }
 async function eb8ModelCall(env, opts) {
   if (eb8Counted(env)) return { ok: false, error: 'counted-env', skippedCap: true };
   const day = eb5YmdDigits();
-  try {
-    const b = await env.LEADS.get('eb8:capbase:' + day, { type: 'json' });
-    if (!b || typeof b.count !== 'number') {
-      const r = await env.LEADS.get('eb8:cap:' + day, { type: 'json' });
-      await env.LEADS.put('eb8:capbase:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: (r && typeof r.count === 'number') ? r.count : 0 }));
-    }
-  } catch (e) {}
-  let parts = await eb8CapParts(env);
-  if (parts.base + parts.done.length + parts.res.length >= EB8_DAILY_MODEL_CALLS) return { ok: false, error: 'eb8_cap', skippedCap: true };
   const suffix = String(Date.now()).padStart(13, '0') + '-' + randHex(8);
   const resKey = 'eb8:capres:' + day + ':' + suffix;
-  try { await env.LEADS.put(resKey, JSON.stringify({ at: new Date().toISOString() })); } catch (e) { return { ok: false, error: 'eb8_cap', skippedCap: true }; }
-  parts = await eb8CapParts(env);
+  try { await env.LEADS.put(resKey, JSON.stringify({ at: new Date().toISOString() }), { expirationTtl: EB8_CAP_TTL_SEC }); } catch (e) { return { ok: false, error: 'eb8_cap', skippedCap: true }; }
+  /* EB8-P2-CAP (02-H3): the ONE parts read of this call — rank,
+     projection, adoption and the settle cache all reuse it. */
+  const parts = await eb8CapParts(env, day);
+  if (!parts.ok) {
+    /* 02-M1: a failed read must not read as zero spend — fail closed. */
+    try { await env.LEADS.delete(resKey); } catch (e) {}
+    return { ok: false, error: 'eb8_cap_unreadable', skippedCap: true };
+  }
+  if (!parts.adopted) { try { await env.LEADS.put('eb8:capbase:' + day, JSON.stringify({ date: eb4VanYmd(Date.now()), count: parts.base }), { expirationTtl: EB8_CAP_TTL_SEC }); } catch (e) {} }
   const rank = parts.res.indexOf(resKey);
   const projected = parts.base + parts.done.length + (rank === -1 ? parts.res.length : rank + 1);
   if (rank === -1 || projected > EB8_DAILY_MODEL_CALLS) {
     try { await env.LEADS.delete(resKey); } catch (e) {}
     return { ok: false, error: 'eb8_cap', skippedCap: true };
   }
-  const r = await brainServiceCall(env, Object.assign({}, opts, { consumer: 'eb8-judge' }));
-  const ran = !!(r && !r.dormant && (r.ok || (typeof r.attempts === 'number' && r.attempts > 0)));
+  /* EB8-P2-CAP (02-M2): the provider call is wrapped — a throw settles
+     conservatively (as if the call ran) and returns a structured error
+     instead of escaping to callers and leaking the reservation. */
+  let r = null, callThrew = false;
+  try { r = await brainServiceCall(env, Object.assign({}, opts, { consumer: 'eb8-judge' })); } catch (e) { callThrew = true; }
+  const ran = callThrew || !!(r && !r.dormant && (r.ok || (typeof r.attempts === 'number' && r.attempts > 0)));
   if (ran) {
-    try { await env.LEADS.put('eb8:capdone:' + day + ':' + suffix, JSON.stringify({ at: new Date().toISOString() })); } catch (e) {}
-    try { await env.LEADS.delete(resKey); } catch (e) {}
-    await eb8CapCacheWrite(env, day);
+    /* 02-M1: settle-or-keep — the reservation is deleted ONLY when the
+       settled write landed; a failed settle keeps the reservation, so
+       the spend stays counted (conservative) until its TTL. */
+    let settled = false;
+    try { await env.LEADS.put('eb8:capdone:' + day + ':' + suffix, JSON.stringify({ at: new Date().toISOString() }), { expirationTtl: EB8_CAP_TTL_SEC }); settled = true; } catch (e) {}
+    if (settled) {
+      try { await env.LEADS.delete(resKey); } catch (e) {}
+      await eb8CapCacheWrite(env, day, parts.base + parts.done.length + 1);
+    }
   } else {
     try { await env.LEADS.delete(resKey); } catch (e) {}
   }
+  if (callThrew) return { ok: false, error: 'eb8_call_error', attempts: 0 };
   if (r && r.dormant) return { ok: false, error: r.reason || 'dormant', dormant: r.reason === 'no-brain-pool', dormantReason: r.reason || null, attempts: (typeof r.attempts === 'number' ? r.attempts : 0) };
   return r;
 }
@@ -8901,7 +8924,7 @@ async function eb8ShadowTest(env, type, params) {
     if (type === 'clear_breaker') {
       const b = await ebBrainBrkGet(env, params.leg);
       if (!b) { ck('state-copy', true, 'no breaker record in production — nothing to copy; the executor will refuse (no_breaker_record), so the proposal is harmless'); return done(); }
-      await env.LEADS.put(eb8TwinKey('eb:brainbrk:' + params.leg), JSON.stringify(b));
+      await env.LEADS.put(eb8TwinKey('eb:brainbrk:' + params.leg), JSON.stringify(b), { expirationTtl: EB8_CAP_TTL_SEC });
       const tb = await env.LEADS.get(eb8TwinKey('eb:brainbrk:' + params.leg), { type: 'json' }).catch(function () { return null; });
       ck('state-copy', !!tb, 'breaker record copied into the twin');
       if (b.kind === 'auth') ck('invariant-auth-park', false, 'AUTH park: clearing is forbidden by design — the cure is a config change via provisioning, never a clear. Shadow confirms this fix must NOT proceed.');
@@ -8912,7 +8935,7 @@ async function eb8ShadowTest(env, type, params) {
     if (type === 'clear_record') {
       const raw = await env.LEADS.get(params.key).catch(function () { return null; });
       if (raw === null) { ck('state-copy', true, 'record absent in production — the fix would be a no-op'); return done(); }
-      await env.LEADS.put(eb8TwinKey(params.key), raw);
+      await env.LEADS.put(eb8TwinKey(params.key), raw, { expirationTtl: EB8_CAP_TTL_SEC });
       await env.LEADS.delete(eb8TwinKey(params.key));
       const gone = await env.LEADS.get(eb8TwinKey(params.key)).catch(function () { return 'x'; });
       ck('twin-apply', gone === null, 'twin copy deleted and verified absent; production record untouched');
@@ -8949,8 +8972,8 @@ async function eb8ShadowTest(env, type, params) {
         if (k === 'eb8:auto') { const pr = eb8GoldenTightenedAuto(cur[k], gState[k]); heldToggles = pr.held; heldKey = pr.heldKey; if (pr.value !== null && pr.value !== undefined) effective[k] = pr.value; else if (pr.heldKey && (k in cur)) effective[k] = cur[k]; }
         else effective[k] = gState[k];
       }
-      for (const k of Object.keys(cur)) await env.LEADS.put(eb8TwinKey(k), cur[k]);
-      for (const k of Object.keys(effective)) await env.LEADS.put(eb8TwinKey(k), effective[k]);
+      for (const k of Object.keys(cur)) await env.LEADS.put(eb8TwinKey(k), cur[k], { expirationTtl: EB8_CAP_TTL_SEC });
+      for (const k of Object.keys(effective)) await env.LEADS.put(eb8TwinKey(k), effective[k], { expirationTtl: EB8_CAP_TTL_SEC });
       for (const k of Object.keys(cur)) if (!(k in effective)) await env.LEADS.delete(eb8TwinKey(k));
       let drift = 0;
       for (const k of Object.keys(effective)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== effective[k]) drift++; }
@@ -9453,25 +9476,25 @@ async function eb8ChaosDrill(env, kind) {
   const T = function (k) { return 'eb8:twin:drill:' + kind + ':' + k; };
   try {
     if (kind === 'park_leg') {
-      await env.LEADS.put(T('brk'), JSON.stringify({ kind: 'quota', parkedUntil: new Date(Date.now() - 60000).toISOString(), reason: 'drill' }));
+      await env.LEADS.put(T('brk'), JSON.stringify({ kind: 'quota', parkedUntil: new Date(Date.now() - 60000).toISOString(), reason: 'drill' }), { expirationTtl: EB8_CAP_TTL_SEC });
       let rec = await env.LEADS.get(T('brk'), { type: 'json' });
       const recoverable = rec && rec.kind !== 'auth' && !(Date.parse(rec.parkedUntil) > Date.now());
       if (recoverable) await env.LEADS.delete(T('brk'));
       const gone = await env.LEADS.get(T('brk'));
       ck('expired-quota-recovers', recoverable && !gone, 'twin breaker with an expired QUOTA park is cleared by the recovery predicate');
-      await env.LEADS.put(T('brk'), JSON.stringify({ kind: 'auth', parkedUntil: new Date(Date.now() - 60000).toISOString(), reason: 'drill' }));
+      await env.LEADS.put(T('brk'), JSON.stringify({ kind: 'auth', parkedUntil: new Date(Date.now() - 60000).toISOString(), reason: 'drill' }), { expirationTtl: EB8_CAP_TTL_SEC });
       rec = await env.LEADS.get(T('brk'), { type: 'json' });
       const authRefused = rec && rec.kind === 'auth';
       ck('auth-park-refused', !!authRefused, 'an AUTH park is never clearable by the recovery predicate (config change is the only cure)');
       await env.LEADS.delete(T('brk'));
     } else if (kind === 'drop_manifest') {
-      await env.LEADS.put(T('counts'), JSON.stringify({ calls: { manifest: 5, landed: 3 }, sms: { manifest: 2, landed: 2 } }));
+      await env.LEADS.put(T('counts'), JSON.stringify({ calls: { manifest: 5, landed: 3 }, sms: { manifest: 2, landed: 2 } }), { expirationTtl: EB8_CAP_TTL_SEC });
       const counts = await env.LEADS.get(T('counts'), { type: 'json' });
       const gaps = Object.keys(counts).filter(function (f) { return counts[f].manifest !== counts[f].landed; });
       ck('mismatch-detected', gaps.length === 1 && gaps[0] === 'calls', 'a dropped-manifest gap (manifest 5 vs landed 3) is detected as a mismatch, matching fields stay quiet');
       await env.LEADS.delete(T('counts'));
     } else if (kind === 'corrupt_config') {
-      await env.LEADS.put(T('cfg'), '{"groqKey":');
+      await env.LEADS.put(T('cfg'), '{"groqKey":', { expirationTtl: EB8_CAP_TTL_SEC });
       const raw = await env.LEADS.get(T('cfg'));
       let flagged = false;
       try { const parsed = JSON.parse(raw); if (!parsed || typeof parsed !== 'object') flagged = true; } catch (e) { flagged = true; }
@@ -9539,7 +9562,7 @@ async function eb8RestoreDrill(env) {
   for (const i of sampleIdx) hashes[keys[i]] = await eb8Sha(dump.kv[keys[i]]);
   let restored = 0;
   const sampleKeys = keys.slice(0, 10);
-  for (const k of sampleKeys) { try { await env.LEADS.put(eb8TwinKey('restore:' + k), dump.kv[k]); } catch (e) {} }
+  for (const k of sampleKeys) { try { await env.LEADS.put(eb8TwinKey('restore:' + k), dump.kv[k], { expirationTtl: EB8_CAP_TTL_SEC }); } catch (e) {} }
   for (const k of sampleKeys) { try { const back = await env.LEADS.get(eb8TwinKey('restore:' + k)); if (back === dump.kv[k]) restored++; } catch (e) {} }
   for (const k of sampleKeys) { try { await env.LEADS.delete(eb8TwinKey('restore:' + k)); } catch (e) {} }
   if (restored !== sampleKeys.length) return fail('shadow_restore_mismatch', { day: day, restored: restored, sampled: sampleKeys.length });
