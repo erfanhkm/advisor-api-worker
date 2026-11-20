@@ -5096,6 +5096,367 @@ async function ebBrainDoorStatus(env) {
 
 
 
+/* ================= Pack BRAIN-MIGRATION-M5: Portal Owner Digest (2026-11-19) =================
+   Owner directive (2026-11-19): the portal's narrative summaries —
+   the owner digest and the per-lead priority notes — are generated
+   by the platform Executive Brain pool, not by Muse. This block is
+   the generator. It is a CLIENT of the Brain Service
+   (packs/BRAIN-POOL/): every model call goes through
+   brainServiceCall(env, { consumer:'portal-digest', ... }) — never a
+   provider directly, never another system's pool, and this block
+   never reads cfg:ebrain itself.
+
+   SPLICE POINT: paste this block into app/advisor-api-worker.js
+   AFTER the Pack BRAIN-POOL block (it needs brainServiceCall +
+   BRAIN_SVC_CONSUMERS) and after EB-1 (ebEmit / ebReadDayEvents /
+   ebIsIncident / ebDayKey), EB-4 (eb4VanYmd) and the core
+   listAllKeys helper. Routes + the scheduled hook live in
+   portal-digest-routes.js (same pack). The consumer registration
+   line for BRAIN_SVC_CONSUMERS is in consumer-registration.patch
+   (same pack) — without it brainServiceCall refuses this block with
+   'unknown-consumer' and every digest is the fail-closed raw form.
+
+   Standing rules honoured throughout:
+   - FAIL-CLOSED, NEVER SILENT, NEVER FABRICATED: if the Brain pool
+     is dormant / capped / erroring, or its reply fails validation,
+     the digest is the RAW structured form (counts + structured top
+     leads, mode:'raw', headline:null, narrative lists empty). A raw
+     digest is stored and served exactly like a brain digest — the
+     owner always gets the numbers; he never gets an invented story
+     and never gets silence.
+   - FACTS ONLY IN, FACTS ONLY OUT: the prompt carries only the
+     collected structured facts. The validator drops any leadNote or
+     decision whose leadId was not in the facts, truncates every
+     string to its cap, and caps every list — a model cannot widen
+     the digest beyond the evidence it was given.
+   - ONE model call per generation, no repair retry (EB-5 critic
+     precedent): a malformed reply is a fail-closed raw digest, not
+     a second spend.
+   - FAIL-OPEN to the host: generation failures never throw into a
+     cron chain or a route; routes answer the last stored digest.
+   - Counted-env discipline: under a countKvEnv budget
+     (env.__kvLeft) generation skips whole and silently, matching
+     EB-4/EB-5.
+   - KV-write frugal: one generation = the digest record + latest
+     pointer + lead-notes record + state record (4 puts) plus the
+     Brain Service's own accounting.
+
+   KV keys introduced (all in this worker's own LEADS namespace):
+     eb:digest:<yyyymmdd>:<id>   one digest record (shape below)
+     eb:digest:latest            the newest digest record (feed source)
+     eb:digest:leadnotes:latest  { date, generatedAt, notes:{leadId:note} }
+     eb:digest:state             { lastRunAt, lastDigestId, lastMode,
+                                   lastWeekMarker }
+   Digest record shape:
+     { id, generatedAt, mode:'brain'|'raw', reason:null|<taxonomy>,
+       provider:null|<leg>, window:{ from, to },
+       counts:{ newLeads, movedLeads, incidents, supervisorEvents,
+                maintRuns, maintFailed, callsTotal },
+       headline:null|<fa line>, happened:[], decisions:[{text,leadId}],
+       handled:[], leadNotes:[{leadId,note}],
+       topLeads:[{id,name,stage,tier,score,source,created_at}] }
+   The feed (GET /api/admin/eb/digest) returns this record verbatim
+   plus the consumer's Brain usage — the same json() envelope family
+   as /api/admin/eb/board and /api/admin/eb/quota, so the portal
+   renders it with its existing patterns. This block does NOT touch
+   the portal HTML. */
+const EB_DIGEST_CONSUMER = 'portal-digest';
+const EB_DIGEST_TASK = 'portal_digest';
+const EB_DIGEST_MAX_TOKENS = 1200;
+const EB_DIGEST_WINDOW_MIN_MS = 24 * 3600 * 1000;
+const EB_DIGEST_WINDOW_MAX_MS = 14 * 24 * 3600 * 1000;
+const EB_DIGEST_FIRST_WINDOW_MS = 7 * 24 * 3600 * 1000;
+const EB_DIGEST_LIMITS = { headline: 140, happened: 6, happenedItem: 160, decisions: 8, decisionItem: 200, handled: 6, handledItem: 160, leadNotes: 20, leadNoteItem: 110 };
+
+function ebDigestDayDigits(ms) { return eb4VanYmd(ms || Date.now()).replace(/-/g, ''); }
+function ebDigestCleanStr(v, cap) {
+  if (typeof v !== 'string') return '';
+  const s = v.replace(/\s+/g, ' ').trim();
+  return s.length > cap ? s.slice(0, cap - 1) + '…' : s;
+}
+async function ebDigestStateGet(env) {
+  try { const s = await env.LEADS.get('eb:digest:state', { type: 'json' }); return (s && typeof s === 'object' && !Array.isArray(s)) ? s : null; } catch (e) { return null; }
+}
+/* Tier of a lead, read the EB-3 way but dependency-free: the record's
+   own tier/band/temperature, else its numeric score banded, else the
+   lscore:<id> mirror, else 'warm' (the documented default). */
+function ebDigestTierOf(lead, lscore) {
+  const norm = function (v) { const s = String(v || '').toLowerCase(); return (s === 'hot' || s === 'warm' || s === 'cold') ? s : null; };
+  let t = norm(lead && (lead.tier || lead.band || lead.temperature));
+  if (t) return t;
+  const band = function (n) { return n >= 70 ? 'hot' : (n >= 35 ? 'warm' : 'cold'); };
+  if (lead && typeof lead.score === 'number') return band(lead.score);
+  t = norm(lscore && (lscore.band || lscore.tier));
+  if (t) return t;
+  if (lscore && typeof lscore.score === 'number') return band(lscore.score);
+  return 'warm';
+}
+function ebDigestLeadOut(l, lscore) {
+  return {
+    id: String(l.id || ''), name: String(l.name || ''), stage: String(l.stage || ''),
+    tier: ebDigestTierOf(l, lscore),
+    score: (typeof (lscore && lscore.score) === 'number') ? lscore.score : ((typeof l.score === 'number') ? l.score : null),
+    reason: ebDigestCleanStr((lscore && lscore.reason) || l.scoreReason || '', 120),
+    source: String(l.source || ''), created_at: String(l.created_at || '')
+  };
+}
+/* ---- Input collection: structured facts ONLY. Every source is
+   read defensively; a failed source degrades to its empty form with
+   its source label saying so — collection never throws. ---- */
+async function ebDigestCollect(env, fromMs, nowMs) {
+  const facts = { window: { from: new Date(fromMs).toISOString(), to: new Date(nowMs).toISOString() }, newLeads: [], movedLeads: [], incidents: [], supervisor: { events: 0, byType: {} }, maintenance: { runs: 0, failed: 0, lastAt: null, lastOk: null }, calls: { days: 0, total: null, manifestStatus: null } };
+  /* leads — lead: prefix listing (EB-4's read pattern: never the
+     merged index; side records lead:<id>:<x> skipped) */
+  try {
+    const keys = await listAllKeys(env, 'lead:', 1000);
+    const fresh = [], moved = [];
+    for (const k of keys) {
+      const name = String((k && k.name) || k);
+      if (name.indexOf(':') !== name.lastIndexOf(':')) continue;
+      let l = null;
+      try { l = await env.LEADS.get(name, { type: 'json' }); } catch (e) {}
+      if (!l) continue;
+      const rec = Object.assign({}, l, { id: l.id || name.slice(5) });
+      let ls = null;
+      try { ls = await env.LEADS.get('lscore:' + rec.id, { type: 'json' }); } catch (e) {}
+      const created = Date.parse(rec.created_at || '');
+      const stageAt = Date.parse(rec.stageAt || rec.updated_at || '');
+      if (isFinite(created) && created >= fromMs && created <= nowMs) fresh.push(ebDigestLeadOut(rec, ls));
+      else if (isFinite(stageAt) && stageAt >= fromMs && stageAt <= nowMs && rec.stage && rec.stage !== 'new') moved.push(ebDigestLeadOut(rec, ls));
+    }
+    const tierRank = { hot: 0, warm: 1, cold: 2 };
+    const byTier = function (a, b) { return (tierRank[a.tier] - tierRank[b.tier]) || String(b.created_at).localeCompare(String(a.created_at)); };
+    fresh.sort(byTier); moved.sort(byTier);
+    facts.newLeads = fresh.slice(0, 40);
+    facts.newLeadsTotal = fresh.length;
+    facts.movedLeads = moved.slice(0, 20);
+    facts.movedLeadsTotal = moved.length;
+  } catch (e) { facts.leadsSource = 'lead: scan failed'; }
+  /* EB supervisor — the EB-1 ledger over the window's UTC days */
+  try {
+    const seen = {};
+    let d = new Date(fromMs); d.setUTCHours(0, 0, 0, 0);
+    const end = new Date(nowMs); end.setUTCHours(0, 0, 0, 0);
+    while (d <= end) {
+      const evs = await ebReadDayEvents(env, ebDayKey(d));
+      for (const ev of evs) {
+        if (!ev || seen[ev.id]) continue; seen[ev.id] = 1;
+        const t = Date.parse(ev.ts || '');
+        if (!(t >= fromMs && t <= nowMs)) continue;
+        facts.supervisor.events++;
+        facts.supervisor.byType[ev.type] = (facts.supervisor.byType[ev.type] || 0) + 1;
+        if (ebIsIncident(ev) && facts.incidents.length < 15) facts.incidents.push({ ts: ev.ts, type: ev.type, source: ev.source || '' });
+      }
+      d = new Date(d.getTime() + 86400000);
+    }
+  } catch (e) { facts.supervisorSource = 'eb ledger read failed'; }
+  /* site maintenance verdicts — maint:log run records in window */
+  try {
+    const log = await env.LEADS.get('maint:log', { type: 'json' });
+    if (Array.isArray(log)) {
+      for (const r of log) {
+        const t = Date.parse((r && (r.at || r.ts)) || '');
+        if (!(t >= fromMs && t <= nowMs)) continue;
+        facts.maintenance.runs++;
+        const ok = (r.ok !== undefined) ? !!r.ok : !(r.canary && r.canary.ok === false);
+        if (!ok) facts.maintenance.failed++;
+        if (!facts.maintenance.lastAt || t > Date.parse(facts.maintenance.lastAt)) { facts.maintenance.lastAt = r.at || r.ts; facts.maintenance.lastOk = ok; }
+      }
+    }
+  } catch (e) { facts.maintenanceSource = 'maint:log read failed'; }
+  /* receptionist call stats — EB-6 landed counts per Vancouver day
+     in window, where the host provides them; otherwise the ledger's
+     call.landed events (already counted above) are the fallback and
+     total stays null rather than a fabricated number. */
+  try {
+    if (typeof eb6LandedCounts === 'function') {
+      let total = 0, days = 0, any = false;
+      let cur = fromMs;
+      while (cur <= nowMs && days < 15) {
+        const ymd = eb4VanYmd(cur);
+        const landed = await eb6LandedCounts(env, ymd);
+        let n = null;
+        if (typeof landed === 'number') n = landed;
+        else if (landed && typeof landed === 'object') n = (typeof landed.total === 'number') ? landed.total : ((typeof landed.calls === 'number') ? landed.calls : null);
+        if (typeof n === 'number') { total += n; any = true; }
+        days++; cur += 86400000;
+      }
+      facts.calls.days = days;
+      if (any) facts.calls.total = total;
+      if (typeof eb6Reconcile === 'function') { const rec = await eb6Reconcile(env, eb4VanYmd(nowMs), { emit: false }); facts.calls.manifestStatus = rec ? (rec.status || null) : null; }
+    }
+  } catch (e) { facts.callsSource = 'eb6 landed counts read failed'; }
+  return facts;
+}
+function ebDigestCounts(facts) {
+  return {
+    newLeads: (typeof facts.newLeadsTotal === 'number') ? facts.newLeadsTotal : facts.newLeads.length,
+    movedLeads: (typeof facts.movedLeadsTotal === 'number') ? facts.movedLeadsTotal : facts.movedLeads.length,
+    incidents: facts.incidents.length,
+    supervisorEvents: facts.supervisor.events,
+    maintRuns: facts.maintenance.runs,
+    maintFailed: facts.maintenance.failed,
+    callsTotal: facts.calls.total
+  };
+}
+function ebDigestTopLeads(facts) {
+  const seen = {}, out = [];
+  for (const l of facts.newLeads.concat(facts.movedLeads)) { if (!seen[l.id]) { seen[l.id] = 1; out.push(l); } }
+  return out.slice(0, 10);
+}
+/* ---- Prompt + schema. The model returns ONLY a JSON object:
+   { headline, happened[], decisions[{text,leadId}], handled[],
+     leadNotes[{leadId,note}] } — all Persian, all grounded in the
+   facts JSON, leadIds copied from the facts. Validation below is
+   the enforcement; the prompt is only the request. ---- */
+function ebDigestPrompt(facts) {
+  const system = [
+    'You are the Executive Brain of EH Realty, writing the owner portal digest for Erfan, the owner.',
+    'Write in Persian (Farsi), short and direct, in his style: what happened, what needs his decision, what was handled.',
+    'Use ONLY the facts in the user message. Never invent a number, a name, a lead, a time or an event that is not in the facts.',
+    'Refer to leads ONLY by the exact id values present in the facts. If a section has no facts, return an empty list for it.',
+    'Return ONLY a JSON object, no markdown, no prose outside it, with exactly these keys:',
+    '{"headline": string (one line, max 140 chars), "happened": [string, max 6], "decisions": [{"text": string, "leadId": string|null}], "handled": [string, max 6], "leadNotes": [{"leadId": string, "note": string (one line, max 110 chars)}]}',
+    'decisions = items that need the owner\'s own decision or action; handled = things the system already took care of; leadNotes = a one-line priority note for each lead that matters most (hot first), at most 20.'
+  ].join('\n');
+  const prompt = 'Facts for the digest window ' + facts.window.from + ' to ' + facts.window.to + ':\n' + JSON.stringify({
+    newLeads: facts.newLeads, movedLeads: facts.movedLeads, incidents: facts.incidents,
+    supervisor: facts.supervisor, maintenance: facts.maintenance, calls: facts.calls,
+    counts: ebDigestCounts(facts)
+  });
+  return { system: system, prompt: prompt };
+}
+/* Strict validator/sanitizer. Returns the narrative object or null.
+   Any leadId not present in the facts is dropped (notes) or nulled
+   (decisions); every string is whitespace-collapsed and truncated;
+   every list is capped. A reply with no usable content at all is
+   null — the caller then fails closed to the raw digest. */
+function ebDigestValidate(text, facts) {
+  let j = null;
+  try { j = JSON.parse(String(text || '').trim()); } catch (e) { return null; }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return null;
+  const L = EB_DIGEST_LIMITS;
+  const ids = {};
+  for (const l of facts.newLeads.concat(facts.movedLeads)) ids[l.id] = 1;
+  const strList = function (v, cap, itemCap) {
+    if (!Array.isArray(v)) return [];
+    const out = [];
+    for (const s of v) { const c = ebDigestCleanStr(s, itemCap); if (c) out.push(c); if (out.length >= cap) break; }
+    return out;
+  };
+  const out = { headline: ebDigestCleanStr(j.headline, L.headline), happened: strList(j.happened, L.happened, L.happenedItem), handled: strList(j.handled, L.handled, L.handledItem), decisions: [], leadNotes: [] };
+  if (Array.isArray(j.decisions)) {
+    for (const d of j.decisions) {
+      if (!d || typeof d !== 'object') continue;
+      const t = ebDigestCleanStr(d.text, L.decisionItem);
+      if (!t) continue;
+      out.decisions.push({ text: t, leadId: (d.leadId && ids[d.leadId]) ? String(d.leadId) : null });
+      if (out.decisions.length >= L.decisions) break;
+    }
+  }
+  if (Array.isArray(j.leadNotes)) {
+    const seen = {};
+    for (const n of j.leadNotes) {
+      if (!n || typeof n !== 'object') continue;
+      const id = String(n.leadId || '');
+      if (!ids[id] || seen[id]) continue;
+      const note = ebDigestCleanStr(n.note, L.leadNoteItem);
+      if (!note) continue;
+      seen[id] = 1;
+      out.leadNotes.push({ leadId: id, note: note });
+      if (out.leadNotes.length >= L.leadNotes) break;
+    }
+  }
+  if (!out.headline && !out.happened.length && !out.decisions.length && !out.handled.length && !out.leadNotes.length) return null;
+  return out;
+}
+function ebDigestRawRecord(id, generatedAt, facts, reason) {
+  return {
+    id: id, generatedAt: generatedAt, mode: 'raw', reason: String(reason || 'unknown').slice(0, 60), provider: null,
+    window: facts.window, counts: ebDigestCounts(facts),
+    headline: null, happened: [], decisions: [], handled: [], leadNotes: [],
+    topLeads: ebDigestTopLeads(facts)
+  };
+}
+/* ---- Generation. One Brain Service call; every outcome produces
+   a stored digest. Returns the record, or null only under a counted
+   env (skip-whole discipline) or a KV-less env. ---- */
+async function ebDigestGenerate(env, opts) {
+  opts = opts || {};
+  if (!env || !env.LEADS) return null;
+  if (typeof env.__kvLeft === 'function') return null;
+  const nowMs = (typeof opts.now === 'number') ? opts.now : Date.now();
+  const state = (await ebDigestStateGet(env)) || {};
+  let fromMs = (typeof opts.fromMs === 'number') ? opts.fromMs : (state.lastRunAt ? Date.parse(state.lastRunAt) : NaN);
+  if (!isFinite(fromMs)) fromMs = nowMs - EB_DIGEST_FIRST_WINDOW_MS;
+  if (nowMs - fromMs < EB_DIGEST_WINDOW_MIN_MS && !opts.force) fromMs = nowMs - EB_DIGEST_WINDOW_MIN_MS;
+  if (nowMs - fromMs > EB_DIGEST_WINDOW_MAX_MS) fromMs = nowMs - EB_DIGEST_WINDOW_MAX_MS;
+  const facts = await ebDigestCollect(env, fromMs, nowMs);
+  const generatedAt = new Date(nowMs).toISOString();
+  const id = 'dg-' + ebDigestDayDigits(nowMs) + '-' + String(nowMs % 86400000).padStart(8, '0');
+  let rec = null;
+  const p = ebDigestPrompt(facts);
+  const r = await brainServiceCall(env, { consumer: EB_DIGEST_CONSUMER, task: EB_DIGEST_TASK, system: p.system, prompt: p.prompt, maxTokens: EB_DIGEST_MAX_TOKENS });
+  if (r && r.ok) {
+    const narrative = ebDigestValidate(r.text, facts);
+    if (narrative) {
+      rec = {
+        id: id, generatedAt: generatedAt, mode: 'brain', reason: null, provider: r.provider || null,
+        window: facts.window, counts: ebDigestCounts(facts),
+        headline: narrative.headline || null, happened: narrative.happened, decisions: narrative.decisions,
+        handled: narrative.handled, leadNotes: narrative.leadNotes, topLeads: ebDigestTopLeads(facts)
+      };
+    } else {
+      rec = ebDigestRawRecord(id, generatedAt, facts, 'malformed-reply');
+    }
+  } else {
+    rec = ebDigestRawRecord(id, generatedAt, facts, (r && (r.reason || r.error)) || 'brain-error');
+  }
+  try { await env.LEADS.put('eb:digest:' + ebDigestDayDigits(nowMs) + ':' + id, JSON.stringify(rec)); } catch (e) {}
+  try { await env.LEADS.put('eb:digest:latest', JSON.stringify(rec)); } catch (e) {}
+  const notes = {};
+  for (const n of rec.leadNotes) notes[n.leadId] = n.note;
+  try { await env.LEADS.put('eb:digest:leadnotes:latest', JSON.stringify({ date: eb4VanYmd(nowMs), generatedAt: generatedAt, digestId: id, notes: notes })); } catch (e) {}
+  try { await env.LEADS.put('eb:digest:state', JSON.stringify({ lastRunAt: generatedAt, lastDigestId: id, lastMode: rec.mode, lastWeekMarker: state.lastWeekMarker || null })); } catch (e) {}
+  try { await ebEmit(env, 'portal.digest', { digestId: id, mode: rec.mode, reason: rec.reason, decisions: rec.decisions.length, leadNotes: rec.leadNotes.length, newLeads: rec.counts.newLeads }, { source: 'portal-digest' }); } catch (e) {}
+  return rec;
+}
+/* Weekly gate for the scheduled hook: the digest is due on the
+   first nightly run of each Vancouver week (Monday). The week
+   marker in state makes a second nightly run in the same week a
+   no-op; the on-demand route bypasses this gate entirely. */
+async function ebDigestMaybeWeekly(env, opts) {
+  opts = opts || {};
+  if (!env || !env.LEADS) return null;
+  if (typeof env.__kvLeft === 'function') return null;
+  const nowMs = (typeof opts.now === 'number') ? opts.now : Date.now();
+  const ymd = eb4VanYmd(nowMs);
+  const parts = ymd.split('-');
+  const dow = new Date(Date.UTC(+parts[0], +parts[1] - 1, +parts[2])).getUTCDay(); /* 1 = Monday */
+  if (dow !== 1 && !opts.force) return null;
+  const state = (await ebDigestStateGet(env)) || {};
+  if (state.lastWeekMarker === ymd && !opts.force) return null;
+  const rec = await ebDigestGenerate(env, { now: nowMs, force: !!opts.force });
+  if (rec) {
+    const s2 = (await ebDigestStateGet(env)) || {};
+    s2.lastWeekMarker = ymd;
+    try { await env.LEADS.put('eb:digest:state', JSON.stringify(s2)); } catch (e) {}
+  }
+  return rec;
+}
+/* The portal feed: the latest digest + the lead-notes map + this
+   consumer's Brain usage (ebBrainConsumers shape, BRAIN-POOL).
+   Read-only; answers the last stored digest even while the pool is
+   down — the feed itself never calls the Brain. */
+async function ebDigestFeed(env) {
+  const out = { ok: true, digest: null, leadNotes: {}, usage: null };
+  try { out.digest = await env.LEADS.get('eb:digest:latest', { type: 'json' }); } catch (e) {}
+  try { const ln = await env.LEADS.get('eb:digest:leadnotes:latest', { type: 'json' }); if (ln && ln.notes) out.leadNotes = ln.notes; } catch (e) {}
+  try { if (typeof ebBrainConsumers === 'function') { const all = await ebBrainConsumers(env); out.usage = all[EB_DIGEST_CONSUMER] || null; } } catch (e) {}
+  return out;
+}
+
+
 /* ================= Pack EB-4: Briefings & Memory (2026-11-15) =================
    Persian morning/evening briefings (deterministic facts FIRST, ONE
    optional model prose paragraph), the owner mode config (exam mode
@@ -29399,6 +29760,22 @@ async function handleRequest(request, env, ctx) {
       if (path === '/api/admin/eb/braindoor/status' && request.method === 'GET') {
         return json(await ebBrainDoorStatus(env), 200, origin);
       }
+      /* Pack BRAIN-MIGRATION-M5 (2026-11-19; integrated 2026-11-20):
+         the portal owner digest feed + on-demand generation.
+         Owner-session posture identical to probe-legs and the
+         braindoor routes above (neither path is in the
+         scopedAuthed allowlist, so machine tokens cannot reach
+         them). The feed serves the last stored digest and never
+         calls the Brain; generation is the POST. */
+      if (path === '/api/admin/eb/digest' && request.method === 'GET') {
+        return json(await ebDigestFeed(env), 200, origin);
+      }
+      if (path === '/api/admin/eb/digest/run' && request.method === 'POST') {
+        let force = false;
+        try { const b = await request.json(); force = !!(b && b.force); } catch (e) {}
+        const rec = await ebDigestGenerate(env, { force: force });
+        return json(rec ? { ok: true, id: rec.id, mode: rec.mode, reason: rec.reason } : { ok: false, error: 'skipped' }, 200, origin);
+      }
       /* The owner's lint override: stamps lintOverride {reason, at,
          by} onto the referenced draft record — a mailq id, or a
          WhatsApp draft by phone. The ref must exist and the reason
@@ -30872,6 +31249,7 @@ export default {
       try { await eb5Nightly(env); } catch (e) { console.error(e); } /* Pack EB-5: nightly QA run (golden + planted + invariants + provenance + fairness; counted-env skips whole inside) */
       try { await eb7Nightly(env); } catch (e) { console.error(e); } /* Pack EB-7: nightly radar + Sunday weekly (market read / insights / retention; counted-env skips whole inside) */
       try { await eb8Nightly(env); } catch (e) { console.error(e); } /* Pack EB-8: weekly IT report + security audit, chaos/restore drills, red-team round, integrity sweep, runbook replay, health snapshot (cadence markers inside; site scope only) */
+      try { await ebDigestMaybeWeekly(env); } catch (e) { console.error(e); } /* Pack BRAIN-MIGRATION-M5: weekly owner digest — the Vancouver-Monday gate + week marker live inside ebDigestMaybeWeekly, so this line is a no-op on other nights (and under a counted env); fail-open like every step in this chain */
       try { await ebTickWrite(env, cronStr); } catch (e) { console.error(e); }
     })());
   }
