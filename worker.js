@@ -4981,6 +4981,120 @@ async function ebBrainProbeLegs(env) {
   return out;
 }
 
+/* ================= Pack BRAIN-DOOR (2026-11-20): the external-
+   consumer door for the Brain Service =================
+   brainServiceCall is the platform's only access layer to the
+   Executive Brain pool, but it lives inside this worker. The four
+   out-of-worker consumers — M-3 failover-triage (cron module),
+   M-4 lead-drafts (cron pipeline), M-6 qc-first-pass (CLI) and
+   WS-5 nightly-regression (its own Worker) — hold NO provider
+   keys and NO chain code; they speak the ebModelCall contract to
+   a thin HTTPS door (BRAIN_SERVICE_URL + BRAIN_SERVICE_SECRET)
+   that never landed when the service deployed. This block is
+   that door's machinery; the route itself (POST /api/brain/call)
+   is registered in handleRequest's self-authenticating internal
+   region, and the provisioning routes (POST
+   /api/admin/eb/braindoor/provision, GET
+   /api/admin/eb/braindoor/status) sit beside probe-legs under
+   the owner session. Design record: packs/BRAIN-DOOR/DESIGN.md.
+
+   Credential model: ONE secret per consumer, minted worker-side
+   by the provision route (randHex(24) — the scoped-token shape),
+   stored only in the LEADS record cfg:braindoor, and never
+   returned by any route after its single provision response.
+   The presented secret RESOLVES the consumer (constant-time
+   compare against the allowlist below, in fixed order): the
+   caller cannot assert a consumer its secret does not map to —
+   a body `consumer` field or X-Brain-Consumer header naming a
+   different consumer is an auth failure (401, uniform body, no
+   oracle). Only consumers in BRAIN_DOOR_CONSUMERS can ever be
+   resolved or provisioned: the in-worker consumers
+   (eb-supervisor, eb8-judge, portal-digest, maintenance-analyst,
+   leg-probe) have no door credential, and a cfg:braindoor entry
+   naming one is ignored. The door is NOT in the scopedAuthed
+   allowlist — the shared SERVICE/INGEST tokens gain nothing
+   here — and it adds no provider keys, no chain code and no
+   path around brainServiceCall: registry refusals, per-consumer
+   caps, the brain.call ledger and the counted-env refusal all
+   remain the service's own, so a door call is accounted exactly
+   like the identical in-worker call. Auth failures write
+   nothing (a 401 spray must never become a KV write amplifier).
+   Payload discipline (M-2's conventions, sized by the client
+   census in the pack's DESIGN): system/prompt hard-sliced
+   server-side (8,000 / 65,536 — M-6's prompt assembly runs to
+   ~31k chars, so M-2's 12,000 slice would truncate it),
+   maxTokens floored and clamped to 4,000 or the consumer's
+   pinned default, and the ledger task pinned per consumer
+   (no client sends a task field). */
+const BRAIN_DOOR_CONSUMERS = {
+  'failover-triage': { task: 'failover_triage', defaultMaxTokens: 700 },
+  'lead-drafts': { task: 'lead_drafts', defaultMaxTokens: 900 },
+  'nightly-regression': { task: 'nightly_regression', defaultMaxTokens: 1200 },
+  'qc-first-pass': { task: 'qc_first_pass', defaultMaxTokens: 2000 }
+};
+const BRAIN_DOOR_SYSTEM_MAX = 8000;
+const BRAIN_DOOR_PROMPT_MAX = 65536;
+const BRAIN_DOOR_MAX_TOKENS = 4000;
+const BRAIN_DOOR_RATE_MAX = 600;
+/* The cfg:braindoor record ({ v:1, consumers:{ <id>:{ secret,
+   mintedAt } } }), or null when absent/malformed/unreadable —
+   the door treats null as unprovisioned (503), never as an
+   empty allowlist that a lucky guess could pass. */
+async function brainDoorCfg(env) {
+  try {
+    const r = await env.LEADS.get('cfg:braindoor', { type: 'json' });
+    return (r && typeof r === 'object' && !Array.isArray(r) && r.consumers && typeof r.consumers === 'object' && !Array.isArray(r.consumers)) ? r : null;
+  } catch (e) { return null; }
+}
+/* Resolve a presented secret to its consumer: the credential IS
+   the identity. Fixed allowlist order, timingSafeEqual per
+   candidate (the worker's own compare). Returns the consumer id
+   or null. */
+function brainDoorResolve(cfg, presented) {
+  if (!cfg || typeof presented !== 'string' || !presented) return null;
+  for (const id of Object.keys(BRAIN_DOOR_CONSUMERS)) {
+    const e = cfg.consumers[id];
+    if (e && typeof e.secret === 'string' && e.secret && timingSafeEqual(presented, e.secret)) return id;
+  }
+  return null;
+}
+/* POST /api/admin/eb/braindoor/provision handler (owner session;
+   the route registration sits beside probe-legs). Mints the
+   consumer's secret WORKER-SIDE — no value ever transits a
+   request the operator emits (the AcademyVideoCard lesson) —
+   and returns it exactly once, in this response, over the
+   owner's session. Refuses 409 once a secret exists unless
+   rotate is set; rotation kills the old secret immediately.
+   The ledger event carries the consumer + rotate flag only. */
+async function ebBrainDoorProvision(env, consumer, rotate) {
+  if (!Object.prototype.hasOwnProperty.call(BRAIN_DOOR_CONSUMERS, consumer)) return { status: 400, body: { ok: false, error: 'validation', detail: 'unknown door consumer' } };
+  if (!env || !env.LEADS) return { status: 503, body: { ok: false, error: 'not_configured' } };
+  const cfg = (await brainDoorCfg(env)) || { v: 1, consumers: {} };
+  const cur = cfg.consumers[consumer];
+  if (cur && typeof cur.secret === 'string' && cur.secret && !rotate) return { status: 409, body: { ok: false, error: 'already_provisioned', consumer: consumer } };
+  const secret = randHex(24);
+  const mintedAt = new Date().toISOString();
+  cfg.v = 1;
+  cfg.consumers[consumer] = { secret: secret, mintedAt: mintedAt };
+  await env.LEADS.put('cfg:braindoor', JSON.stringify(cfg));
+  try { await ebEmit(env, 'braindoor.provision', { consumer: consumer, rotate: !!rotate }, { source: 'brain-door' }); } catch (e) {}
+  return { status: 200, body: { ok: true, consumer: consumer, secret: secret, mintedAt: mintedAt } };
+}
+/* GET /api/admin/eb/braindoor/status handler (owner session):
+   booleans + mint timestamps only — a secret value is never
+   echoed by any route after its provision response (the
+   /api/admin/brain/status posture). */
+async function ebBrainDoorStatus(env) {
+  const cfg = (env && env.LEADS) ? await brainDoorCfg(env) : null;
+  const consumers = {};
+  for (const id of Object.keys(BRAIN_DOOR_CONSUMERS)) {
+    const e = (cfg && cfg.consumers[id]) || null;
+    consumers[id] = { provisioned: !!(e && typeof e.secret === 'string' && e.secret), mintedAt: (e && typeof e.mintedAt === 'string') ? e.mintedAt : null };
+  }
+  return { ok: true, consumers: consumers };
+}
+
+
 
 /* ================= Pack EB-4: Briefings & Memory (2026-11-15) =================
    Persian morning/evening briefings (deterministic facts FIRST, ONE
@@ -19945,6 +20059,46 @@ async function handleRequest(request, env, ctx) {
        behaviour), so this is inert until a deployment sets the flag. */
     if (!scopeAllows(env, path)) return json({ ok: false, error: 'not_found' }, 404, origin);
 
+    /* Pack BRAIN-DOOR (2026-11-20): the Brain Service door for
+       out-of-worker consumers — POST /api/brain/call. Self-
+       authenticating like the internal family below: the caller's
+       per-consumer secret (cfg:braindoor, minted worker-side by
+       POST /api/admin/eb/braindoor/provision) resolves the
+       consumer; a body/header consumer claim naming anyone else
+       is an auth failure. NOT in the scopedAuthed allowlist (the
+       shared SERVICE token gains nothing here) and NOT the site
+       pool's /internal/brain. Every admitted call is a plain
+       brainServiceCall with the consumer's pinned task — the
+       service result (incl. dormant consumer-cap) returns
+       unchanged at 200, so door calls ledger and account exactly
+       like in-worker calls. Fail-closed throughout: record
+       absent -> 503, bad/mismatched credential -> 401 (uniform,
+       no oracle, nothing written), malformed payload -> 400,
+       spray -> the braindoor: rate limiter. See the BRAIN-DOOR
+       section of the Brain Service block. */
+    if (path === '/api/brain/call' && request.method === 'POST') {
+      if (limited('braindoor:' + ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), BRAIN_DOOR_RATE_MAX, 3600000)) return json({ ok: false, error: 'rate_limit', attempts: 0 }, 429, origin);
+      const bdAuth = request.headers.get('Authorization') || '';
+      const bdM = bdAuth.match(/^Bearer ([0-9a-f]{48})$/);
+      if (!bdM) return json({ ok: false, error: 'unauthorized', attempts: 0 }, 401, origin);
+      const bdCfg = await brainDoorCfg(env);
+      if (!bdCfg) return json({ ok: false, error: 'not_configured', attempts: 0 }, 503, origin);
+      const bdConsumer = brainDoorResolve(bdCfg, bdM[1]);
+      if (!bdConsumer) return json({ ok: false, error: 'unauthorized', attempts: 0 }, 401, origin);
+      let bdBody = null;
+      try { bdBody = await request.json(); } catch (e) {}
+      if (!bdBody || typeof bdBody !== 'object' || Array.isArray(bdBody)) return json({ ok: false, error: 'bad_request', attempts: 0 }, 400, origin);
+      const bdHdr = request.headers.get('X-Brain-Consumer') || '';
+      if (bdBody.consumer !== bdConsumer || (bdHdr && bdHdr !== bdConsumer)) return json({ ok: false, error: 'unauthorized', attempts: 0 }, 401, origin);
+      const bdSystem = (typeof bdBody.system === 'string') ? bdBody.system.slice(0, BRAIN_DOOR_SYSTEM_MAX) : '';
+      const bdPrompt = (typeof bdBody.prompt === 'string') ? bdBody.prompt.slice(0, BRAIN_DOOR_PROMPT_MAX) : '';
+      if (!bdSystem || !bdPrompt) return json({ ok: false, error: 'bad_request', attempts: 0 }, 400, origin);
+      const bdSpec = BRAIN_DOOR_CONSUMERS[bdConsumer];
+      const bdMt = (typeof bdBody.maxTokens === 'number' && isFinite(bdBody.maxTokens) && bdBody.maxTokens > 0) ? Math.min(Math.floor(bdBody.maxTokens), BRAIN_DOOR_MAX_TOKENS) : bdSpec.defaultMaxTokens;
+      const bdR = await brainServiceCall(env, { consumer: bdConsumer, task: bdSpec.task, system: bdSystem, prompt: bdPrompt, maxTokens: bdMt });
+      return json(bdR, 200, origin);
+    }
+
     /* Free Split (2026-11-10): session introspection bridge — the
        SITE deployment is the single session authority. The academy
        deployment POSTs a presented admin token here; the shared
@@ -28239,6 +28393,25 @@ async function handleRequest(request, env, ctx) {
          leave KV (see ebBrainProbeLegs in the Brain Service block). */
       if (path === '/api/admin/eb/probe-legs' && request.method === 'POST') {
         return json(await ebBrainProbeLegs(env), 200, origin);
+      }
+      /* Pack BRAIN-DOOR (2026-11-20): per-consumer secret
+         provisioning for the Brain Service door (POST
+         /api/brain/call). Owner-session posture identical to
+         probe-legs above — these paths are NOT in the
+         scopedAuthed allowlist, so machine tokens cannot reach
+         them. The secret is minted worker-side (randHex) and
+         returned exactly once, in the provision response, over
+         the owner's session; the status route reports booleans
+         only. See ebBrainDoorProvision / ebBrainDoorStatus in
+         the Brain Service block. */
+      if (path === '/api/admin/eb/braindoor/provision' && request.method === 'POST') {
+        let bdD = null;
+        try { bdD = await request.json(); } catch (e) {}
+        const bdP = await ebBrainDoorProvision(env, (bdD && typeof bdD.consumer === 'string') ? bdD.consumer : '', !!(bdD && bdD.rotate === true));
+        return json(bdP.body, bdP.status, origin);
+      }
+      if (path === '/api/admin/eb/braindoor/status' && request.method === 'GET') {
+        return json(await ebBrainDoorStatus(env), 200, origin);
       }
       /* The owner's lint override: stamps lintOverride {reason, at,
          by} onto the referenced draft record — a mailq id, or a
