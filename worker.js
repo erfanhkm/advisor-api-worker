@@ -3967,7 +3967,7 @@ async function eb3ActOne(env, ref, action, body, ip) {
       const fx = await env.LEADS.get('eb8:fix:' + rec.fixId, { type: 'json' }).catch(function () { return null; });
       if (!fx) return done(404, false, 'refused', 'fix_not_found');
       if (!eb8FixClaimable(fx)) return done(409, false, 'refused', 'fix_' + fx.state);
-      const ex = await eb8ExecuteFix(env, fx, 'owner');
+      const ex = await eb8ExecuteFix(env, fx, 'owner', { actorIp: ip });
       rec.state = ex.executed ? 'approved-executed' : 'approve-failed';
       rec.decidedAt = new Date().toISOString();
       rec.execution = { executed: ex.executed, verified: ex.verified, reason: ex.reason || null };
@@ -7308,6 +7308,291 @@ function eb8Counted(env) { return !!(env && typeof env.__kvLeft === 'function');
 function eb8Id() { return Date.now().toString(36) + '-' + randHex(6); }
 async function eb8Emit(env, type, data) { try { await ebEmit(env, type, data || {}, { source: 'eb-itsupport' }); } catch (e) {} }
 
+const EB8_SECBLOCK_MAX_ACTIVE = 25; /* EB8-P2-L3 (01-M7): cap on concurrently active L3 IP blocks */
+/* EB8-P2-L3 (Pass 2, 01-M7): strict IP parsing + range classification for
+   the L3 IP block. The pre-pack validator accepted anything shaped like
+   an address (the IPv6 arm's regex accepted ':::'), so loopback, RFC1918,
+   link-local, ULA and unspecified addresses were all blockable — and an
+   IPv4-mapped/6to4 wrapper would have smuggled them past a naive check.
+   eb8ParseIp returns a canonical parsed form or null; eb8IpRefusal
+   returns 'ip_nonpublic_range' | 'ip_protected_source' | null.
+   The documentation ranges (192.0.2.0/24, 198.51.100.0/24,
+   203.0.113.0/24, 2001:db8::/32) are deliberately NOT refused: they are
+   unroutable, a block against them can never carry real traffic, and the
+   EB-8 suites use 203.0.113.x as the canonical public-IP fixture. */
+const EB8_IP_NEVER_BLOCK_V4 = [
+  /* Cloudflare edge ranges — cloudflare.com/ips-v4, fetched 2026-11-20.
+     Blocking the edge that serves the zone is self-harm, never security. */
+  ['173.245.48.0', 20], ['103.21.244.0', 22], ['103.22.200.0', 22], ['103.31.4.0', 22],
+  ['141.101.64.0', 18], ['108.162.192.0', 18], ['190.93.240.0', 20], ['188.114.96.0', 20],
+  ['197.234.240.0', 22], ['198.41.128.0', 17], ['162.158.0.0', 15], ['104.16.0.0', 13],
+  ['104.24.0.0', 14], ['172.64.0.0', 13], ['131.0.72.0', 22],
+  /* GitHub webhook source ranges — the COMPLETE "hooks" list from
+     api.github.com/meta, fetched 2026-11-20: all seven IPv4 ranges
+     below (the two IPv6 ranges are in EB8_IP_NEVER_BLOCK_V6). The
+     platform consumes these webhooks itself. Delta D-2 (QC F2): the
+     original build embedded only the four classic ranges — the three
+     /28s were missing. Re-verify this list whenever the cfg:itops
+     token legs are provisioned (QC S3): published ranges drift. */
+  ['192.30.252.0', 22], ['185.199.108.0', 22], ['140.82.112.0', 20], ['143.55.64.0', 20],
+  ['9.234.106.48', 28], ['9.234.98.160', 28], ['9.234.98.176', 28]
+];
+const EB8_IP_NEVER_BLOCK_V6 = [
+  /* Cloudflare — cloudflare.com/ips-v6, fetched 2026-11-20. */
+  ['2400:cb00::', 32], ['2606:4700::', 32], ['2803:f800::', 32], ['2405:b500::', 32],
+  ['2405:8100::', 32], ['2a06:98c0::', 29], ['2c0f:f248::', 32],
+  /* GitHub hooks — api.github.com/meta "hooks", fetched 2026-11-20. */
+  ['2a0a:a440::', 29], ['2606:50c0::', 32]
+];
+const EB8_IP_NONPUBLIC_V4 = [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16],
+  ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]
+];
+function eb8V4Num(octets) { return ((octets[0] * 256 + octets[1]) * 256 + octets[2]) * 256 + octets[3]; }
+function eb8V4In(num, base, bits) { const d = Math.pow(2, 32 - bits); return Math.floor(num / d) === Math.floor(base / d); }
+function eb8ParseIp6Groups(s) {
+  if (typeof s !== 'string' || !s) return null;
+  if (s.indexOf(':::') !== -1) return null;
+  const dbl = s.split('::');
+  if (dbl.length > 2) return null;
+  function side(str) {
+    if (str === '') return [];
+    const parts = str.split(':');
+    const out = [];
+    for (const p of parts) { if (!/^[0-9a-fA-F]{1,4}$/.test(p)) return null; out.push(parseInt(p, 16)); }
+    return out;
+  }
+  const head = side(dbl[0]); if (head === null) return null;
+  if (dbl.length === 1) return head.length === 8 ? head : null;
+  const tail = side(dbl[1] || ''); if (tail === null) return null;
+  if (head.length + tail.length > 7) return null;
+  const fill = new Array(8 - head.length - tail.length).fill(0);
+  return head.concat(fill, tail);
+}
+function eb8ParseIp(ip) {
+  if (typeof ip !== 'string') return null;
+  const s = ip.trim();
+  if (!s) return null;
+  if (s.indexOf(':') === -1) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+    if (!m) return null;
+    const octets = [];
+    for (let i = 1; i <= 4; i++) {
+      if (m[i].length > 1 && m[i].charAt(0) === '0') return null; /* leading zeros: octal-ambiguous to other parsers */
+      const n = Number(m[i]); if (n > 255) return null; octets.push(n);
+    }
+    return { v: 4, octets: octets, num: eb8V4Num(octets) };
+  }
+  if (!/^[0-9a-fA-F:.]+$/.test(s)) return null;
+  let body = s, embedded = null;
+  const lc = s.lastIndexOf(':');
+  const tailStr = s.slice(lc + 1);
+  if (tailStr.indexOf('.') !== -1) {
+    const em = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(tailStr);
+    if (!em) return null;
+    const octets = [];
+    for (let i = 1; i <= 4; i++) {
+      if (em[i].length > 1 && em[i].charAt(0) === '0') return null;
+      const n = Number(em[i]); if (n > 255) return null; octets.push(n);
+    }
+    embedded = octets;
+    body = s.slice(0, lc + 1) + ((octets[0] * 256 + octets[1]).toString(16)) + ':' + ((octets[2] * 256 + octets[3]).toString(16));
+  }
+  const groups = eb8ParseIp6Groups(body);
+  if (!groups) return null;
+  return { v: 6, groups: groups, embeddedV4: embedded };
+}
+function eb8V6In(groups, baseGroups, bits) {
+  const full = Math.floor(bits / 16), rem = bits % 16;
+  for (let i = 0; i < full; i++) if (groups[i] !== baseGroups[i]) return false;
+  if (rem) { const mask = (0xffff << (16 - rem)) & 0xffff; if ((groups[full] & mask) !== (baseGroups[full] & mask)) return false; }
+  return true;
+}
+function eb8Ip6Nonpublic(g) {
+  if (g.every(function (x) { return x === 0; })) return true;             /* :: unspecified */
+  if (g[7] === 1 && g.slice(0, 7).every(function (x) { return x === 0; })) return true; /* ::1 loopback */
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) return true; /* 64:ff9b::/96 NAT64 WKP */
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return true;         /* 64:ff9b:1::/48 local-use NAT64 */
+  if (g[0] === 0x0100 && g[1] === 0 && g[2] === 0 && g[3] === 0) return true; /* 100::/64 discard-only */
+  if (g[0] === 0x2001 && g[1] === 0x0002 && g[2] === 0) return true;       /* 2001:2::/48 benchmarking */
+  if (g[0] === 0x2001 && (g[1] & 0xfff0) === 0x0020) return true;          /* 2001:20::/28 ORCHIDv2 */
+  if ((g[0] & 0xfe00) === 0xfc00) return true;                             /* fc00::/7 unique-local */
+  if ((g[0] & 0xffc0) === 0xfe80) return true;                             /* fe80::/10 link-local */
+  if ((g[0] & 0xff00) === 0xff00) return true;                             /* ff00::/8 multicast */
+  return false;
+}
+function eb8IpRefusal(parsed) {
+  if (!parsed) return 'bad_ip';
+  if (parsed.v === 4) {
+    for (const c of EB8_IP_NONPUBLIC_V4) if (eb8V4In(parsed.num, eb8V4Num(c[0].split('.').map(Number)), c[1])) return 'ip_nonpublic_range';
+    for (const c of EB8_IP_NEVER_BLOCK_V4) if (eb8V4In(parsed.num, eb8V4Num(c[0].split('.').map(Number)), c[1])) return 'ip_protected_source';
+    return null;
+  }
+  const g = parsed.groups;
+  /* Teredo embeds an arbitrary IPv4 in a form this classifier does not
+     unwrap — refuse the whole /32 rather than guess. */
+  if (g[0] === 0x2001 && g[1] === 0x0000) return 'ip_nonpublic_range';
+  /* IPv4-mapped (::ffff:0:0/96) and 6to4 (2002::/16): classify by the
+     embedded IPv4 so a wrapper cannot smuggle a private address past. */
+  let embNum = null;
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) embNum = g[6] * 65536 + g[7];
+  else if (g[0] === 0x2002) embNum = g[1] * 65536 + g[2];
+  if (embNum !== null) {
+    for (const c of EB8_IP_NONPUBLIC_V4) if (eb8V4In(embNum, eb8V4Num(c[0].split('.').map(Number)), c[1])) return 'ip_nonpublic_range';
+    for (const c of EB8_IP_NEVER_BLOCK_V4) if (eb8V4In(embNum, eb8V4Num(c[0].split('.').map(Number)), c[1])) return 'ip_protected_source';
+    return null;
+  }
+  if (eb8Ip6Nonpublic(g)) return 'ip_nonpublic_range';
+  for (const c of EB8_IP_NEVER_BLOCK_V6) {
+    const bg = eb8ParseIp6Groups(c[0]); if (bg && eb8V6In(g, bg, c[1])) return 'ip_protected_source';
+  }
+  return null;
+}
+function eb8IpCanonical(parsed) {
+  if (!parsed) return '';
+  if (parsed.v === 4) return parsed.octets.join('.');
+  const g = parsed.groups;
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) {
+    return [Math.floor(g[6] / 256), g[6] % 256, Math.floor(g[7] / 256), g[7] % 256].join('.');
+  }
+  return g.map(function (x) { return x.toString(16); }).join(':');
+}
+/* EB8-P2-L3 (Pass 2, 01-H3): the patch path allow-list. Anything outside
+   source + docs is refused: dot-segments are denied outright (this kills
+   .github/ — the CI-takeover vector — plus .env and .git), deploy-config
+   and package manifests are denied by name, and the extension list has
+   no yml/yaml, so workflow/config files are unreachable by construction. */
+const EB8_PATCH_DENY_BASENAMES = ['package.json', 'package-lock.json', 'wrangler.toml', 'wrangler.json', 'wrangler.jsonc'];
+const EB8_PATCH_EXTS = ['js', 'mjs', 'cjs', 'json', 'md', 'html', 'css', 'txt'];
+function eb8PatchPathRefusal(path) {
+  if (typeof path !== 'string') return 'bad_path';
+  const p = path;
+  if (!p || p.length > 120) return 'bad_path';
+  if (p.indexOf('\\') !== -1) return 'bad_path';
+  if (/[\x00-\x1f\x7f]/.test(p)) return 'bad_path';
+  if (p.charAt(0) === '/' || p.charAt(p.length - 1) === '/') return 'bad_path';
+  const segs = p.split('/');
+  for (const seg of segs) {
+    if (!seg || seg === '.' || seg === '..') return 'bad_path';
+    if (seg.charAt(0) === '.') return 'bad_path';
+  }
+  const base = segs[segs.length - 1];
+  if (EB8_PATCH_DENY_BASENAMES.indexOf(base) !== -1) return 'bad_path';
+  const dot = base.lastIndexOf('.');
+  if (dot < 1) return 'bad_path';
+  if (EB8_PATCH_EXTS.indexOf(base.slice(dot + 1).toLowerCase()) === -1) return 'bad_path';
+  return null;
+}
+/* EB8-P2-L3 (Pass 2, 02-M8): the patch contract is a unified diff against
+   the file's real current content — never full replacement content for a
+   file the model has not read. The parser is strict (one file section,
+   header/body counts must agree, headers must name params.path); the
+   applier requires every context and removed line to match the fetched
+   base exactly, so a stale or hallucinated diff applies NOWHERE and the
+   executor refuses before any GitHub write. */
+const EB8_PATCH_MAX_CHANGED_LINES = 400;
+function eb8ParseUnifiedDiff(text, expectPath) {
+  if (typeof text !== 'string' || !text || text.length > 60000) return { ok: false };
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  let i = 0;
+  while (i < lines.length && (lines[i].indexOf('diff --git ') === 0 || lines[i].indexOf('index ') === 0)) i++;
+  function hdrPath(line, prefix) {
+    let rest = line.slice(4);
+    const tab = rest.indexOf('\t'); if (tab !== -1) rest = rest.slice(0, tab);
+    rest = rest.trim();
+    if (rest === '/dev/null') return null;
+    if (rest.indexOf(prefix) === 0) rest = rest.slice(prefix.length);
+    return rest;
+  }
+  if (i >= lines.length || lines[i].indexOf('--- ') !== 0) return { ok: false };
+  const oldPath = hdrPath(lines[i], 'a/'); i++;
+  if (i >= lines.length || lines[i].indexOf('+++ ') !== 0) return { ok: false };
+  const newPath = hdrPath(lines[i], 'b/'); i++;
+  if (newPath === null) return { ok: false };              /* file deletion is not a patch */
+  if (newPath !== expectPath) return { ok: false };
+  if (oldPath !== null && oldPath !== expectPath) return { ok: false };
+  const creation = oldPath === null;
+  const hunks = [];
+  let added = 0, removed = 0;
+  while (i < lines.length) {
+    const hm = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(lines[i]);
+    if (!hm) {
+      if (lines[i] === '' && hunks.length) { i++; continue; }  /* trailing blanks after the last hunk */
+      return { ok: false };
+    }
+    const hunk = { oldStart: Number(hm[1]), oldCount: hm[2] === undefined ? 1 : Number(hm[2]), newStart: Number(hm[3]), newCount: hm[4] === undefined ? 1 : Number(hm[4]), lines: [] };
+    i++;
+    let oc = 0, nc = 0;
+    while (i < lines.length && (oc < hunk.oldCount || nc < hunk.newCount)) {
+      const l = lines[i];
+      if (l.indexOf('--- ') === 0) return { ok: false };   /* a second file section mid-hunk: ambiguous, refuse */
+      const c = l.charAt(0);
+      if (c === ' ') { hunk.lines.push({ t: ' ', s: l.slice(1) }); oc++; nc++; }
+      else if (c === '-') { hunk.lines.push({ t: '-', s: l.slice(1) }); oc++; removed++; }
+      else if (c === '+') { hunk.lines.push({ t: '+', s: l.slice(1) }); nc++; added++; }
+      else if (c === '\\') { hunk.lines.push({ t: '\\', s: l }); }
+      else if (l === '') { hunk.lines.push({ t: ' ', s: '' }); oc++; nc++; }  /* git emits empty context lines bare */
+      else return { ok: false };
+      i++;
+    }
+    if (oc !== hunk.oldCount || nc !== hunk.newCount) return { ok: false };
+    /* EB8-P2-L3 delta D-1 (QC F1): a "\ No newline at end of file"
+       marker that follows the body line which completes the hunk
+       counts belongs to this hunk — consume any immediately
+       following marker lines into it before the outer loop
+       proceeds, or the outer loop refuses a well-formed diff. */
+    while (i < lines.length && lines[i].charAt(0) === '\\') { hunk.lines.push({ t: '\\', s: lines[i] }); i++; }
+    hunks.push(hunk);
+  }
+  if (!hunks.length) return { ok: false };
+  if (added + removed > EB8_PATCH_MAX_CHANGED_LINES) return { ok: false };
+  return { ok: true, path: expectPath, creation: creation, hunks: hunks, added: added, removed: removed };
+}
+function eb8ApplyUnifiedDiff(baseText, parsed) {
+  const baseNl = baseText === '' || /\n$/.test(baseText);
+  const baseLines = baseText === '' ? [] : baseText.replace(/\n$/, '').split('\n');
+  if (parsed.creation && baseText !== '') return { ok: false };
+  const out = [];
+  let cursor = 0;
+  let resultNl = baseNl;
+  for (const h of parsed.hunks) {
+    const startIdx = h.oldCount === 0 ? h.oldStart : h.oldStart - 1;
+    if (startIdx < cursor || startIdx > baseLines.length) return { ok: false };
+    while (cursor < startIdx) { out.push(baseLines[cursor]); cursor++; }
+    for (let li = 0; li < h.lines.length; li++) {
+      const hl = h.lines[li];
+      if (hl.t === ' ') {
+        if (cursor >= baseLines.length || baseLines[cursor] !== hl.s) return { ok: false };
+        out.push(hl.s); cursor++;
+        if (li + 1 < h.lines.length && h.lines[li + 1].t === '\\') resultNl = false;
+      } else if (hl.t === '-') {
+        if (cursor >= baseLines.length || baseLines[cursor] !== hl.s) return { ok: false };
+        cursor++;
+        /* EB8-P2-L3 delta D-1 (QC F1): a marker following a removed
+           line that was the base's last, unterminated line — the
+           surviving last line WAS terminated in the base, so the
+           result ends with a newline unless a later line rules
+           otherwise. */
+        if (li + 1 < h.lines.length && h.lines[li + 1].t === '\\' && cursor === baseLines.length) resultNl = true;
+      } else if (hl.t === '+') {
+        out.push(hl.s);
+        resultNl = true;
+        if (li + 1 < h.lines.length && h.lines[li + 1].t === '\\') resultNl = false;
+      }
+      /* '\' lines are markers consumed by the lookahead above */
+    }
+  }
+  while (cursor < baseLines.length) { out.push(baseLines[cursor]); cursor++; }
+  return { ok: true, text: out.join('\n') + (resultNl && out.length ? '\n' : '') };
+}
+function eb8B64DecodeText(b64) {
+  const bin = atob(String(b64 || '').replace(/\s+/g, ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
 /* ---------- model access: EB-8's own cap over ebModelCall ---------- */
 /* EB-8-FIXES F-04: the cap used to be a single read-modify-write counter
    (two racers read 39, both pass, both write 40 — one call over the cap on
@@ -7740,17 +8025,25 @@ function eb8ValidateFix(type, params) {
   }
   if (type === 'l3_render_restart') return { ok: true, params: {} };
   if (type === 'l3_github_patch_pr') {
+    /* EB8-P2-L3 (01-H3 + 02-M8): path allow-list, and the patch must be a
+       well-formed single-file unified diff FOR that path — full-file
+       replacement content is refused here, at proposal time. */
     const path = String(params.path || '');
-    if (!path || path.length > 120 || path.indexOf('..') !== -1) return { ok: false, reason: 'bad_path' };
+    if (eb8PatchPathRefusal(path)) return { ok: false, reason: 'bad_path' };
     const patch = String(params.patch || '');
     if (!patch || patch.length > 60000) return { ok: false, reason: 'bad_patch' };
+    if (!eb8ParseUnifiedDiff(patch, path).ok) return { ok: false, reason: 'bad_patch' };
     return { ok: true, params: { repo: String(params.repo || '').slice(0, 80), path: path, patch: patch, title: String(params.title || 'EB-8 staged patch').slice(0, 120) } };
   }
   if (type === 'l3_cf_ip_block') {
+    /* EB8-P2-L3 (01-M7): strict parse + range classification. The old
+       shape check accepted ':::' as IPv6 and every private/loopback/
+       link-local address as blockable. */
     const ip = String(params.ip || '');
-    const v4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip) && ip.split('.').every(function (o) { return parseInt(o, 10) <= 255; });
-    const v6 = /^[0-9a-fA-F:]{3,45}$/.test(ip) && ip.indexOf(':') !== -1;
-    if (!v4 && !v6) return { ok: false, reason: 'bad_ip' };
+    const parsedIp = eb8ParseIp(ip);
+    if (!parsedIp) return { ok: false, reason: 'bad_ip' };
+    const ipRefusal = eb8IpRefusal(parsedIp);
+    if (ipRefusal) return { ok: false, reason: ipRefusal };
     const hours = Math.max(1, Math.min(168, parseInt(params.hours, 10) || 24));
     return { ok: true, params: { ip: ip, hours: hours, surface: params.surface === 'academy' ? 'academy' : 'site' } };
   }
@@ -7781,10 +8074,10 @@ async function eb8DryRun(env, type, params) {
   }
   if (type === 'l3_cf_cache_purge') return 'Level 3: would POST purge_cache {purge_everything:true} to the Cloudflare zone configured for the ' + params.surface + ' surface in cfg:itops. Visitors may briefly see origin-fresh pages; no content or config changes.';
   if (type === 'l3_render_restart') return 'Level 3: would POST a restart for the Render service configured in cfg:itops (the receptionist). The service redeploys its current build; expect a short cold-start window. No env or config changes.';
-  if (type === 'l3_github_patch_pr') return 'Level 3: would create branch eb8/patch-<fixId> in the configured repo, commit the drafted replacement content for ' + params.path + ', and open a PR titled "' + params.title + '". It NEVER writes to main and there is no merge action. Suites are run externally by QC/owner before any merge (marked pending-external).';
+  if (type === 'l3_github_patch_pr') return 'Level 3: would create branch eb8/patch-<fixId> in the configured repo, apply the drafted unified diff for ' + params.path + ' to that file\'s current content on main (the executor re-fetches the base and refuses if the diff does not apply cleanly), commit the applied result, and open a PR titled "' + params.title + '". It NEVER writes to main and there is no merge action. Suites are run externally by QC/owner before any merge (marked pending-external).';
   if (type === 'l3_cf_ip_block') return 'Level 3 SECURITY (harden-only): would create a Cloudflare access rule BLOCKING ' + params.ip + ' on the ' + (params.surface || 'site') + ' zone for ' + params.hours + 'h. The block carries an AUTOMATIC EXPIRY at ' + new Date(Date.now() + params.hours * 3600000).toISOString() + ' — the hourly sweep removes it then (that removal is part of this approval). It can also be removed earlier ONLY through an approved unblock proposal. Ledger-logged.';
   if (type === 'l3_cf_ip_unblock') return 'Level 3 SECURITY: would DELETE the Cloudflare access rule created by EB-8 block ' + params.blockId + ' before its automatic expiry. This is the one-tap reversal of that block; it exists only as an approval-gated proposal (from the Security view), never as a bare chat action.';
-  if (type === 'restore_golden') return 'Would restore the EB-owned state records captured in golden snapshot ' + (params.goldenId || '(latest)') + ' (eb8:auto, eb:brainbrk:*): drifted or missing records are written back and extra ones removed, then the golden diff re-runs as verification. Config records (cfg:*) are NEVER value-restored — their values are never stored anywhere in EB-8; only their shape drift is reported.';
+  if (type === 'restore_golden') return 'Would restore the EB-owned state records captured in golden snapshot ' + (params.goldenId || '(latest)') + ' (eb8:auto, eb:brainbrk:*): drifted or missing records are written back and extra ones removed, then the golden diff re-runs as verification. Config records (cfg:*) are NEVER value-restored — their values are never stored anywhere in EB-8; only their shape drift is reported. Golden restore is TIGHTEN-ONLY for the graduated-autonomy toggles (eb8:auto): a snapshot value that would switch a toggle ON is never applied — that toggle stays OFF, is named in the result as held, and reads as residual drift until it is deliberately re-enabled (the portal graduated-autonomy toggle, or a manual KV edit). Switching a toggle OFF always applies.';
   return 'Would run ' + type + '.';
 }
 async function eb8FixStats(env) {
@@ -7847,8 +8140,16 @@ async function eb8ClaimFix(env, fix) {
   }
   return { ok: true, claim: claim };
 }
-async function eb8ExecuteFix(env, fix, via) {
-  const type = fix.type, params = fix.params || {};
+async function eb8ExecuteFix(env, fix, via, opts) {
+  opts = opts || {};
+  /* EB8-P2-L3 (01-M9): a counted env is the inert-suite discipline — the
+     executor refuses outright, before the claim. Before this pack the
+     claim and the terminal write were skipped under a counted env but
+     provider calls and KV deletes still executed (the bypass failed
+     OPEN). */
+  if (eb8Counted(env)) return { executed: false, verified: false, reason: 'counted_env', result: null };
+  const type = fix.type;
+  let params = fix.params || {};
   const startedAt = new Date().toISOString();
   const claimRes = await eb8ClaimFix(env, fix);
   if (!claimRes.ok) return { executed: false, verified: false, reason: claimRes.reason, result: null };
@@ -7869,6 +8170,34 @@ async function eb8ExecuteFix(env, fix, via) {
     if (executed) await eb8IncidentWrite(env, { symptom: fix.diagnosis || type, fixType: type, fixParams: params, outcome: verified ? 'executed + verified' : 'executed, verification inconclusive', scope: fix.scope || 'site', source: via === 'auto' ? 'proactive' : 'chat', probes: fix.probeSummary || [] });
     return { executed: executed, verified: !!verified, reason: reason || null, result: result || null };
   };
+  /* EB8-P2-L3 (01-M3): the executor is the choke point — stored params
+     are NOT trusted. (a) The auto path may only ever run EB8_FIX_TYPES;
+     the tick caller's eligibility check is no longer the only
+     enforcement (restore_golden is deliberately outside EB8_FIX_TYPES,
+     so auto-restore is refused here too). (b) L3 types re-pass the
+     itops gate HERE, before validation, so a hand-crafted or
+     judge-substituted L3 record under a partial cfg:itops fails closed
+     with zero provider calls (the branches' own itops checks become
+     backstops, and the D9/H expectation 'itops_unconfigured' is
+     preserved). (c) Every fix is re-validated against the CURRENT
+     code-side registries and the branches run on the NORMALIZED
+     params — an unclamped hours value, a raw leg string spliced into
+     a breaker key, an unvalidated repo in a stored record are never
+     used. (d) An ip_block may never target the approving actor's own
+     address (self-lockout). */
+  if (via === 'auto' && EB8_FIX_TYPES.indexOf(type) === -1) return done(false, false, 'auto_type_refused');
+  if (EB8_L3_TYPES.indexOf(type) !== -1) {
+    const gate = await eb8ItopsGateFor(env, type);
+    if (!gate.ok) return done(false, false, gate.reason);
+  }
+  const vx = eb8ValidateFix(type, params);
+  if (!vx.ok) return done(false, false, vx.reason);
+  params = vx.params;
+  if (type === 'l3_cf_ip_block' && opts.actorIp) {
+    const actorParsed = eb8ParseIp(String(opts.actorIp));
+    const targetParsed = eb8ParseIp(params.ip);
+    if (actorParsed && targetParsed && eb8IpCanonical(actorParsed) === eb8IpCanonical(targetParsed)) return done(false, false, 'self_lockout');
+  }
   try {
     if (type === 'clear_breaker') {
       const b = await ebBrainBrkGet(env, params.leg);
@@ -7928,6 +8257,24 @@ async function eb8ExecuteFix(env, fix, via) {
       const gh = async function (method, pathName, bodyObj) {
         return eb8FetchJson('https://api.github.com/repos/' + full + pathName, { method: method, headers: { 'Authorization': 'Bearer ' + String(c.githubToken), 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'eb8-itsupport' }, body: bodyObj ? JSON.stringify(bodyObj) : undefined }, 15000);
       };
+      /* EB8-P2-L3 (02-M8): re-parse the stored diff, fetch the file's
+         CURRENT content on main, and apply the diff to it. Every refusal
+         here happens before the branch POST — zero GitHub writes. The
+         blob committed below is the APPLIED RESULT, never raw model
+         text. */
+      const parsedPatch = eb8ParseUnifiedDiff(params.patch, params.path);
+      if (!parsedPatch.ok) return done(false, false, 'bad_patch');
+      const encPath = params.path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+      const contents = await gh('GET', '/contents/' + encPath + '?ref=main');
+      let baseText = '';
+      if (contents.status === 404) {
+        if (!parsedPatch.creation) return done(false, false, 'patch_base_missing');
+      } else {
+        if (!contents.json || typeof contents.json.content !== 'string') return done(false, false, 'patch_base_unreadable');
+        try { baseText = eb8B64DecodeText(contents.json.content); } catch (e) { return done(false, false, 'patch_base_unreadable'); }
+      }
+      const applied = eb8ApplyUnifiedDiff(baseText, parsedPatch);
+      if (!applied.ok) return done(false, false, 'patch_does_not_apply');
       const head = await gh('GET', '/git/ref/heads/main');
       const headSha = head.json && head.json.object && head.json.object.sha;
       if (!headSha) return done(false, false, 'github_head_unreadable');
@@ -7936,7 +8283,7 @@ async function eb8ExecuteFix(env, fix, via) {
       const branch = 'eb8/patch-' + fix.id;
       const bref = await gh('POST', '/git/refs', { ref: 'refs/heads/' + branch, sha: headSha });
       if (!bref.ok && bref.status !== 201) return done(false, false, 'github_branch_' + bref.status);
-      const blob = await gh('POST', '/git/blobs', { content: vmB64(new TextEncoder().encode(String(params.patch))), encoding: 'base64' });
+      const blob = await gh('POST', '/git/blobs', { content: vmB64(new TextEncoder().encode(applied.text)), encoding: 'base64' });
       const blobSha = blob.json && (blob.json.sha || (blob.json.object && blob.json.object.sha));
       if (!blobSha) return done(false, false, 'github_blob_failed');
       const tree = await gh('POST', '/git/trees', { base_tree: baseTree, tree: [{ path: params.path, mode: '100644', type: 'blob', sha: blobSha }] });
@@ -7949,17 +8296,38 @@ async function eb8ExecuteFix(env, fix, via) {
       const pr = await gh('POST', '/pulls', { title: params.title, head: branch, base: 'main', body: prBody });
       const prUrl = (pr.json && pr.json.html_url) || null;
       if (!prUrl && !pr.ok) return done(false, false, 'github_pr_' + pr.status);
-      return done(true, !!prUrl, null, { branch: branch, prUrl: prUrl, suites: 'pending-external' });
+      return done(true, !!prUrl, null, { branch: branch, prUrl: prUrl, suites: 'pending-external', path: params.path, changedLines: parsedPatch.added + parsedPatch.removed });
     }
     if (type === 'l3_cf_ip_block') {
       const c = await eb8Itops(env);
       const zone = c ? (params.surface === 'academy' ? c.cfZoneIdAcademy : c.cfZoneId) : null;
       if (!c || !c.cfToken || !zone) return done(false, false, 'itops_unconfigured');
+      /* EB8-P2-L3 (01-M7): cap concurrently active blocks. */
+      const activeRows = await eb7Scan(env, 'eb8:secblock:', 200);
+      const activeCount = activeRows.filter(function (r) { return r.rec && r.rec.state === 'active'; }).length;
+      if (activeCount >= EB8_SECBLOCK_MAX_ACTIVE) return done(false, false, 'too_many_active_blocks');
+      const expiresAt = new Date(Date.now() + params.hours * 3600000).toISOString();
+      const secKey = 'eb8:secblock:' + fix.id;
+      /* EB8-P2-L3 (01-H1): RECORD FIRST. The secblock record is what makes
+         the rule temporary — the hourly sweep expires only rules it can
+         see. The pending record is written BEFORE the Cloudflare call
+         and the write is NOT swallowed: if it fails, no rule is created.
+         If the finalize write fails after the rule exists, the rule is
+         deleted again; if even that fails, the fix reports
+         secblock_untracked_rule with a loud ledger event — an untracked
+         rule is never reported as a success. */
+      const pending = { id: fix.id, ruleId: null, ip: params.ip, zone: String(zone), surface: params.surface || 'site', createdAt: new Date().toISOString(), expiresAt: expiresAt, state: 'pending' };
+      try { await env.LEADS.put(secKey, JSON.stringify(pending)); } catch (e) { return done(false, false, 'secblock_record_failed'); }
       const r = await eb8FetchJson('https://api.cloudflare.com/client/v4/zones/' + encodeURIComponent(String(zone)) + '/firewall/access_rules/rules', { method: 'POST', headers: { 'Authorization': 'Bearer ' + String(c.cfToken), 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'block', configuration: { target: 'ip', value: params.ip }, notes: 'EB-8 security block (fix ' + fix.id + ') — auto-expires, see eb8:secblock record' }) }, 15000);
       const ruleId = (r.json && r.json.result && r.json.result.id) || null;
-      if (!r.ok || !ruleId) return done(false, false, 'cf_api_' + r.status);
-      const expiresAt = new Date(Date.now() + params.hours * 3600000).toISOString();
-      if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:secblock:' + fix.id, JSON.stringify({ id: fix.id, ruleId: ruleId, ip: params.ip, zone: String(zone), surface: params.surface || 'site', createdAt: new Date().toISOString(), expiresAt: expiresAt, state: 'active' })); } catch (e) {} }
+      if (!r.ok || !ruleId) { try { await env.LEADS.delete(secKey); } catch (e) {} return done(false, false, 'cf_api_' + r.status); }
+      const active = Object.assign({}, pending, { ruleId: ruleId, state: 'active' });
+      try { await env.LEADS.put(secKey, JSON.stringify(active)); } catch (e) {
+        const del = await eb8FetchJson('https://api.cloudflare.com/client/v4/zones/' + encodeURIComponent(String(zone)) + '/firewall/access_rules/rules/' + encodeURIComponent(String(ruleId)), { method: 'DELETE', headers: { 'Authorization': 'Bearer ' + String(c.cfToken) } }, 15000);
+        if (del.ok || del.status === 404) return done(false, false, 'secblock_record_failed');
+        await eb8Emit(env, 'itsupport.security.block_untracked', { fixId: fix.id, ruleId: ruleId, ip: params.ip, zone: String(zone), expiresAt: expiresAt, severity: 'high' });
+        return done(false, false, 'secblock_untracked_rule', { ruleId: ruleId, ip: params.ip, expiresAt: expiresAt, warning: 'The Cloudflare rule EXISTS but its tracking record could not be written and the rule could not be removed automatically. Remove rule ' + ruleId + ' in the Cloudflare dashboard by hand — it has NO automatic expiry.' });
+      }
       return done(true, true, null, { ruleId: ruleId, ip: params.ip, expiresAt: expiresAt });
     }
     if (type === 'l3_cf_ip_unblock') {
@@ -7978,7 +8346,7 @@ async function eb8ExecuteFix(env, fix, via) {
       if (!g) return done(false, false, 'golden_not_found');
       const res = await eb8GoldenApply(env, g);
       const diff = await eb8GoldenDiff(env, g);
-      return done(true, diff.stateDrift.length === 0, diff.stateDrift.length ? 'residual_state_drift' : null, { goldenId: g.id, restored: res.restored, removed: res.removed, refused: res.refused || [], cfgDriftResidual: diff.cfgDrift });
+      return done(true, diff.stateDrift.length === 0, diff.stateDrift.length ? 'residual_state_drift' : null, { goldenId: g.id, restored: res.restored, removed: res.removed, refused: res.refused || [], heldLoosening: res.heldLoosening || [], cfgDriftResidual: diff.cfgDrift });
     }
     return done(false, false, 'not_allowlisted');
   } catch (e) { return done(false, false, 'executor_error'); }
@@ -7998,7 +8366,7 @@ function eb8EvidenceText(probes, sources) {
   return parts.join('\n').slice(0, 7000);
 }
 async function eb8Diagnose(env, message, probes, sources) {
-  const sys = 'EB8-DIAGNOSIS. You are the diagnostic engine of an IT support system for a real-estate platform family (site worker + Academy deployment + receptionist service). Use ONLY the probe evidence and runbook sources provided — never invent state. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of clear_breaker|regen_briefing|reconcile|watchdog_tick|clear_record|l3_cf_cache_purge|l3_render_restart|l3_github_patch_pr|l3_cf_ip_block|restore_golden or null>,"params":{...},"scope":"site|academy|receptionist","confidence":"high|low"}. Set confidence "low" when the evidence is thin, stale or contradictory. Choose a fixType ONLY when the evidence proves the condition it cures; otherwise fixType null. For clear_breaker params {"leg":"groq|gemini|backup-groq|backup-gemini"}; regen_briefing {"kind":"am|pm"}; reconcile {"date":"YYYY-MM-DD"}; clear_record {"key":"<exact KV key from the evidence>"}; l3_cf_cache_purge {"surface":"site|academy"}; l3_github_patch_pr {"repo":"...","path":"...","patch":"<FULL replacement file content>","title":"..."}. The diagnosis text must state the surface (site / academy / receptionist) it concerns.';
+  const sys = 'EB8-DIAGNOSIS. You are the diagnostic engine of an IT support system for a real-estate platform family (site worker + Academy deployment + receptionist service). Use ONLY the probe evidence and runbook sources provided — never invent state. Reply with ONLY a JSON object {"diagnosis":"...","fixType":<one of clear_breaker|regen_briefing|reconcile|watchdog_tick|clear_record|l3_cf_cache_purge|l3_render_restart|l3_github_patch_pr|l3_cf_ip_block|restore_golden or null>,"params":{...},"scope":"site|academy|receptionist","confidence":"high|low"}. Set confidence "low" when the evidence is thin, stale or contradictory. Choose a fixType ONLY when the evidence proves the condition it cures; otherwise fixType null. For clear_breaker params {"leg":"groq|gemini|backup-groq|backup-gemini"}; regen_briefing {"kind":"am|pm"}; reconcile {"date":"YYYY-MM-DD"}; clear_record {"key":"<exact KV key from the evidence>"}; l3_cf_cache_purge {"surface":"site|academy"}; l3_github_patch_pr {"repo":"...","path":"...","patch":"<UNIFIED DIFF for exactly that one file, git format: --- a/<path> / +++ b/<path> headers and @@ hunks; NEVER full file content; at most 400 changed lines>","title":"..."}. The diagnosis text must state the surface (site / academy / receptionist) it concerns.';
   const ctx = await eb8DiagnosisContext(env, message).catch(function () { return ''; });
   const r = await eb8ModelCall(env, { task: 'eb8_diagnosis', system: sys, prompt: 'OWNER MESSAGE: ' + String(message || '').slice(0, 1200) + '\n\nPROBE EVIDENCE + RUNBOOK SOURCES:\n' + eb8EvidenceText(probes, sources) + ctx, maxTokens: 900 });
   if (!r || !r.ok) return { ok: false, dormant: !!(r && r.dormant), reason: (r && (r.dormantReason || r.error)) || 'model_failed' };
@@ -8475,25 +8843,38 @@ async function eb8ShadowTest(env, type, params) {
       const filtered = eb8GoldenFilterState(g.state);
       const gState = filtered.state;
       const cur = await eb8GoldenStateRead(env);
+      /* EB8-P2-L3 (01-H2): the twin applies the same tighten-only
+         projection as production apply, and drift is measured against
+         the EFFECTIVE target — a held toggle is surfaced by the
+         apply-tightening check below, never as a shadow failure that
+         would make a safe restore unproposable. */
+      const effective = {};
+      let heldToggles = [], heldKey = false;
+      for (const k of Object.keys(gState)) {
+        if (k === 'eb8:auto') { const pr = eb8GoldenTightenedAuto(cur[k], gState[k]); heldToggles = pr.held; heldKey = pr.heldKey; if (pr.value !== null && pr.value !== undefined) effective[k] = pr.value; else if (pr.heldKey && (k in cur)) effective[k] = cur[k]; }
+        else effective[k] = gState[k];
+      }
       for (const k of Object.keys(cur)) await env.LEADS.put(eb8TwinKey(k), cur[k]);
-      for (const k of Object.keys(gState)) await env.LEADS.put(eb8TwinKey(k), gState[k]);
-      for (const k of Object.keys(cur)) if (!(k in gState)) await env.LEADS.delete(eb8TwinKey(k));
+      for (const k of Object.keys(effective)) await env.LEADS.put(eb8TwinKey(k), effective[k]);
+      for (const k of Object.keys(cur)) if (!(k in effective)) await env.LEADS.delete(eb8TwinKey(k));
       let drift = 0;
-      for (const k of Object.keys(gState)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== gState[k]) drift++; }
-      for (const k of Object.keys(cur)) { if (!(k in gState)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) drift++; } }
-      ck('twin-restore', drift === 0, 'golden state applied to twin copies of the live state; post-restore twin drift = ' + drift);
+      for (const k of Object.keys(effective)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== effective[k]) drift++; }
+      for (const k of Object.keys(cur)) { if (!(k in effective)) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) drift++; } }
+      ck('twin-restore', drift === 0, 'golden state applied to twin copies of the live state (tighten-only projection for eb8:auto); post-restore twin drift = ' + drift);
+      if (heldKey) ck('apply-tightening', true, 'tighten-only: the snapshot eb8:auto value is unparseable — the restore HOLDS that key entirely and reports it as drift');
+      else ck('apply-tightening', true, heldToggles.length ? ('tighten-only: the snapshot would switch these toggles ON, the restore HOLDS them OFF and reports them as drift: ' + heldToggles.join(', ')) : 'tighten-only: no snapshot toggle needs holding for this restore');
       let leaked = 0;
       for (const k of filtered.refused) { const v = await env.LEADS.get(eb8TwinKey(k)).catch(function () { return null; }); if (v !== null) leaked++; }
       ck('apply-allowlist', leaked === 0, filtered.refused.length ? ('refused ' + filtered.refused.length + ' foreign key(s) in the snapshot: ' + filtered.refused.join(', ') + ' — none were twin-copied') : 'snapshot carries only golden-eligible keys');
       for (const k of Object.keys(cur)) { try { await env.LEADS.delete(eb8TwinKey(k)); } catch (e) {} }
-      for (const k of Object.keys(gState)) { try { await env.LEADS.delete(eb8TwinKey(k)); } catch (e) {} }
+      for (const k of Object.keys(effective)) { try { await env.LEADS.delete(eb8TwinKey(k)); } catch (e) {} }
       return done();
     }
     if (EB8_L3_TYPES.indexOf(type) !== -1) {
       const shape = eb8ItopsShape(await eb8Itops(env));
       ck('itops-shape', shape.configured, 'cfg:itops presence shape: ' + JSON.stringify(shape));
       if (type === 'l3_cf_ip_unblock') { let blk = null; try { blk = await env.LEADS.get('eb8:secblock:' + params.blockId, { type: 'json' }); } catch (e) {} ck('block-exists', !!(blk && blk.ruleId), blk ? 'block record found (ip ' + blk.ip + ', expires ' + blk.expiresAt + ')' : 'no EB-8 block record with that id'); }
-      if (type === 'l3_github_patch_pr') { const opens = (String(params.patch).match(/\{/g) || []).length, closes = (String(params.patch).match(/\}/g) || []).length; ck('patch-structure', params.patch.length > 0 && Math.abs(opens - closes) <= 2, 'patch length ' + params.patch.length + ', brace balance ' + opens + '/' + closes + ' (structural only — the node suites run externally, pending-external)'); }
+      if (type === 'l3_github_patch_pr') { const dp = eb8ParseUnifiedDiff(String(params.patch || ''), String(params.path || '')); ck('patch-structure', dp.ok, dp.ok ? ('unified diff for ' + params.path + ': ' + dp.hunks.length + ' hunk(s), +' + dp.added + '/-' + dp.removed + ' changed lines (cap 400). Structural validation only — the executor re-fetches the base from GitHub and refuses if the diff does not apply cleanly; the node suites run externally, pending-external') : ('params.patch is not a well-formed single-file unified diff for ' + params.path + ' — full-file replacement content is refused (Pass 2, 02-M8)')); }
       return done('External systems cannot be twin-copied; shadow = config-shape + structural validation only. The dry-run preview carries the exact external effect.');
     }
     ck('allowlist', false, 'unknown fix type');
@@ -8776,19 +9157,66 @@ async function eb8GoldenDiff(env, golden) {
   for (const k of Object.keys(curState)) if (!(target[k] !== undefined)) stateDrift.push({ key: k, kind: 'extra' });
   return { cfgDrift: cfgDrift, stateDrift: stateDrift, refusedKeys: filtered.refused, ok: cfgDrift.length === 0 && stateDrift.length === 0 };
 }
+/* EB8-P2-L3 (Pass 2, 01-H2): restore_golden is TIGHTEN-ONLY for the
+   graduated-autonomy toggles (key 'eb8:auto', the only member of
+   EB8_GOLDEN_STATE_KEYS). A snapshot is a point-in-time record; an owner
+   who switched a fix type OFF after the capture must never find it
+   silently re-enabled by a restore (harden-only rule). eb8GoldenTightenedAuto
+   projects the snapshot value against the LIVE value: a toggle ends ON
+   only if ON in both; snapshot-ON + live-OFF stays OFF and is reported as
+   held; snapshot-OFF always turns OFF. When nothing is held the snapshot
+   value is returned VERBATIM (byte-identical — a clean restore still
+   verifies drift-zero). An unparseable snapshot value holds the WHOLE key
+   (an unprovable direction is a held direction). */
+function eb8GoldenTightenedAuto(curRaw, targetRaw) {
+  if (targetRaw === null || targetRaw === undefined) return { value: targetRaw, held: [], heldKey: false };
+  let tgt = null, cur = null;
+  try { tgt = JSON.parse(targetRaw); } catch (e) { tgt = null; }
+  if (!tgt || typeof tgt !== 'object' || Array.isArray(tgt) || !tgt.toggles || typeof tgt.toggles !== 'object' || Array.isArray(tgt.toggles)) {
+    return { value: null, held: [], heldKey: true };
+  }
+  if (curRaw !== null && curRaw !== undefined) { try { cur = JSON.parse(curRaw); } catch (e) { cur = null; } }
+  const curToggles = (cur && typeof cur === 'object' && !Array.isArray(cur) && cur.toggles && typeof cur.toggles === 'object' && !Array.isArray(cur.toggles)) ? cur.toggles : {};
+  const merged = {}, held = [];
+  const names = {};
+  for (const k of Object.keys(tgt.toggles)) names[k] = true;
+  for (const k of Object.keys(curToggles)) names[k] = true;
+  for (const k of Object.keys(names)) {
+    const tOn = tgt.toggles[k] === true, cOn = curToggles[k] === true;
+    merged[k] = tOn && cOn;
+    if (tOn && !cOn) held.push(k);
+  }
+  if (!held.length) return { value: targetRaw, held: [], heldKey: false };
+  if (curRaw === null || curRaw === undefined) return { value: null, held: held, heldKey: false };
+  const same = Object.keys(names).every(function (k) { return (curToggles[k] === true) === merged[k]; }) && Object.keys(curToggles).every(function (k) { return names[k] === true; });
+  if (same) return { value: curRaw, held: held, heldKey: false };
+  const outRec = Object.assign({}, cur, { toggles: merged, updatedAt: new Date().toISOString() });
+  return { value: JSON.stringify(outRec), held: held, heldKey: false };
+}
 async function eb8GoldenApply(env, golden) {
   const filtered = eb8GoldenFilterState(golden.state);
   const target = filtered.state;
-  const restored = [], removed = [];
+  const restored = [], removed = [], heldLoosening = [];
   const curState = await eb8GoldenStateRead(env);
   for (const k of Object.keys(target)) {
+    if (k === 'eb8:auto') {
+      /* EB8-P2-L3 (01-H2): tighten-only projection — see
+         eb8GoldenTightenedAuto. Held toggles stay OFF and are reported
+         here; the untouched eb8GoldenDiff then reads them as residual
+         drift, which is exactly the reporting the design requires. */
+      const pr = eb8GoldenTightenedAuto(curState[k], target[k]);
+      if (pr.heldKey) heldLoosening.push({ key: k, toggles: [], heldKey: true });
+      else if (pr.held.length) heldLoosening.push({ key: k, toggles: pr.held, heldKey: false });
+      if (pr.value !== null && pr.value !== undefined && curState[k] !== pr.value) { await env.LEADS.put(k, pr.value); restored.push(k); }
+      continue;
+    }
     if (curState[k] !== target[k]) { await env.LEADS.put(k, target[k]); restored.push(k); }
   }
   for (const k of Object.keys(curState)) {
     if (!eb8GoldenKeyEligible(k)) continue;
     if (!(target[k] !== undefined)) { await env.LEADS.delete(k); removed.push(k); }
   }
-  return { restored: restored, removed: removed, refused: filtered.refused };
+  return { restored: restored, removed: removed, refused: filtered.refused, heldLoosening: heldLoosening };
 }
 
 /* ----- deploy correlation + upstream status context for diagnoses ----- */
@@ -28766,7 +29194,7 @@ async function handleRequest(request, env, ctx) {
         const fix = fid ? await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; }) : null;
         if (!fix) return json({ ok: false, error: 'not_found' }, 404, origin);
         if (!eb8FixClaimable(fix)) return json({ ok: false, error: 'not_proposed', state: fix.state }, 409, origin);
-        const res = await eb8ExecuteFix(env, fix, 'owner');
+        const res = await eb8ExecuteFix(env, fix, 'owner', { actorIp: request.headers.get('CF-Connecting-IP') || null });
         if (res && res.reason === 'already_claimed') return json({ ok: false, error: 'already_claimed', fixId: fid }, 409, origin);
         return json(Object.assign({ ok: true, fixId: fid }, res), 200, origin);
       }
