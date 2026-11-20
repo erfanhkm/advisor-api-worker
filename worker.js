@@ -1139,6 +1139,12 @@ function randHex(n) {
 async function scopedAuthed(request, env, path, method) {
   const INGEST = (method === 'POST' && path === '/api/market-leads') || (method === 'GET' && path === '/api/radar-settings') || (method === 'GET' && path === '/api/market-leads') || (path === '/api/radar-seen' && (method === 'GET' || method === 'POST')) || (path === '/api/market-pool' && (method === 'GET' || method === 'POST')) || (path === '/api/radar-coverage' && (method === 'GET' || method === 'POST'));
   const SERVICE = (path === '/api/admin/maintenance' && (method === 'GET' || method === 'POST')) ||
+    // Pack BRAIN-MIGRATION-M2 (2026-11-19): the nightly maintenance
+    // job's Brain analysis route joins the SERVICE set — the scoped
+    // credential already authorizes only the maintenance endpoints;
+    // this is one (consumer, task and maxTokens are pinned in the
+    // route handler; see the Brain Service block).
+    (method === 'POST' && path === '/api/admin/maintenance/brain-analyze') ||
     (method === 'POST' && path === '/api/admin/backup-stamp') ||
     // Pack PortalUsageLeads (2026-11-12): the hourly usage-alert
     // job reads the split usage payload headlessly (the portal
@@ -29005,6 +29011,27 @@ async function handleRequest(request, env, ctx) {
         return json({ ok: true, call: { id: call.id, transcript: String(call.transcript || ''), transcriptStatus: String(call.transcriptStatus || (call.transcript ? 'done' : '')), transcriptError: String(call.transcriptError || ''), summaryStatus: String(call.summaryStatus || ''), callSummary: (call.callSummary && typeof call.callSummary === 'object') ? call.callSummary : null, kind: String(call.kind || 'call'), summary: String(call.summary || ''), tLang: String(call.tLang || ''), tLangConf: (typeof call.tLangConf === 'number' && isFinite(call.tLangConf)) ? call.tLangConf : null, tVia: String(call.tVia || ''), voicemail: (call.voicemail && typeof call.voicemail === 'object') ? call.voicemail : null, recordingUrl: String(call.recordingUrl || '') } }, 200, origin);
       }
 
+      // Pack BRAIN-MIGRATION-M2 (2026-11-19): nightly maintenance
+      // analysis on the Executive Brain pool — a thin, pinned
+      // pass-through to the Brain Service. Consumer
+      // 'maintenance-analyst', task 'maintenance_analysis' and
+      // maxTokens 900 are fixed server-side (the caller cannot
+      // choose them); system + prompt are hard-sliced server-side
+      // (4000 + 12000 chars). Admitted via the admin gate above by
+      // the scoped SERVICE credential (this path is in the
+      // scopedAuthed SERVICE allowlist) or an owner session. Keys
+      // never leave the Worker; the brainServiceCall result is
+      // returned unchanged, and every non-success shape lands in
+      // the M-2 module's fail-closed fallback (labelled raw-summary
+      // alert — never silence).
+      if (path === '/api/admin/maintenance/brain-analyze' && request.method === 'POST') {
+        const d = await request.json().catch(function () { return null; });
+        const system = (d && typeof d.system === 'string') ? d.system.slice(0, 4000) : '';
+        const prompt = (d && typeof d.prompt === 'string') ? d.prompt.slice(0, 12000) : '';
+        if (!system || !prompt) return json({ ok: false, error: 'bad_request' }, 400, origin);
+        const r = await brainServiceCall(env, { consumer: 'maintenance-analyst', task: 'maintenance_analysis', system: system, prompt: prompt, maxTokens: 900 });
+        return json(r, 200, origin);
+      }
       // ---- admin: site maintenance (checks + safe repairs, portal Maintenance tab) ----
       if (path === '/api/admin/maintenance' && request.method === 'GET') {
         const last = await env.LEADS.get('maint:last', { type: 'json' });
