@@ -8032,6 +8032,12 @@ function eb8ValidateFix(type, params) {
   if (type === 'reconcile') {
     const d = String(params.date || '');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || isNaN(Date.parse(d))) return { ok: false, reason: 'bad_date' };
+    /* EB8-P2-GOLDEN (01-L6): round-trip the components — Date.parse rolls
+       2026-02-31 into March and passes; a constructed UTC date whose
+       components differ from the input is not a real date. */
+    const dp = d.split('-').map(Number);
+    const du = new Date(Date.UTC(dp[0], dp[1] - 1, dp[2]));
+    if (du.getUTCFullYear() !== dp[0] || du.getUTCMonth() !== dp[1] - 1 || du.getUTCDate() !== dp[2]) return { ok: false, reason: 'bad_date' };
     return { ok: true, params: { date: d } };
   }
   if (type === 'watchdog_tick') return { ok: true, params: {} };
@@ -8106,13 +8112,61 @@ async function eb8DryRun(env, type, params) {
 async function eb8FixStats(env) {
   try { const s = await env.LEADS.get('eb8:fixstats', { type: 'json' }); return (s && typeof s === 'object') ? s : {}; } catch (e) { return {}; }
 }
-async function eb8FixStatsBump(env, type, field) {
+/* EB8-P2-GOLDEN (01-M8): the stats recorder. EVERY terminal outcome is
+   recorded — executed+verified bumps the success field (approvedVerified,
+   or autoRuns on the auto path); anything else bumps failures. Counters
+   live at type level (existing readers unchanged) AND per parameter
+   class (eb8FixParamClass). Legacy adoption: a record with no classes
+   object predates class tracking, so the acting class adopts the
+   type-level counters as its starting point, once; a type WITH classes
+   starts a new class at zero. */
+async function eb8FixStatsRecord(env, type, params, outcome) {
   if (eb8Counted(env)) return;
   const s = await eb8FixStats(env);
-  if (!s[type]) s[type] = { approvedVerified: 0, autoRuns: 0 };
-  s[type][field] = (s[type][field] || 0) + 1;
-  s[type].lastAt = new Date().toISOString();
+  if (!s[type] || typeof s[type] !== 'object' || Array.isArray(s[type])) s[type] = { approvedVerified: 0, autoRuns: 0, failures: 0 };
+  const t = s[type];
+  if (typeof t.approvedVerified !== 'number') t.approvedVerified = 0;
+  if (typeof t.autoRuns !== 'number') t.autoRuns = 0;
+  if (typeof t.failures !== 'number') t.failures = 0;
+  const hadClasses = !!(t.classes && typeof t.classes === 'object' && !Array.isArray(t.classes));
+  if (!hadClasses) t.classes = {};
+  const cls = eb8FixParamClass(type, params);
+  if (!t.classes[cls] || typeof t.classes[cls] !== 'object' || Array.isArray(t.classes[cls])) t.classes[cls] = hadClasses ? { approvedVerified: 0, autoRuns: 0, failures: 0 } : { approvedVerified: t.approvedVerified, autoRuns: t.autoRuns, failures: t.failures };
+  const c = t.classes[cls];
+  if (typeof c.approvedVerified !== 'number') c.approvedVerified = 0;
+  if (typeof c.autoRuns !== 'number') c.autoRuns = 0;
+  if (typeof c.failures !== 'number') c.failures = 0;
+  if (outcome.executed && outcome.verified) {
+    const field = outcome.via === 'auto' ? 'autoRuns' : 'approvedVerified';
+    t[field] = (t[field] || 0) + 1;
+    c[field] = (c[field] || 0) + 1;
+  } else {
+    t.failures = (t.failures || 0) + 1;
+    c.failures = (c.failures || 0) + 1;
+    t.lastFailureAt = new Date().toISOString();
+    t.lastFailReason = String(outcome.reason || 'unverified').slice(0, 80);
+  }
+  t.lastAt = new Date().toISOString();
   try { await env.LEADS.put('eb8:fixstats', JSON.stringify(s)); } catch (e) {}
+}
+/* EB8-P2-GOLDEN (01-M8): auto-eligibility is judged on the fix's OWN
+   parameter class — the right population — never on type-level totals
+   alone. A type with no classes object at all is a legacy record and is
+   judged on its type-level counters (the recorder's adoption rule,
+   applied on read); a type WITH classes is judged strictly on the fix's
+   class, and an unrecorded class is not eligible. Failures are weighed:
+   a class whose failures catch up with its verified successes stops
+   graduating until successes outrun them again. */
+function eb8AutoEligible(fix, auto, stats) {
+  if (!fix || EB8_FIX_TYPES.indexOf(fix.type) === -1) return false;
+  if (!auto || !auto.toggles || auto.toggles[fix.type] !== true) return false;
+  const t = stats && stats[fix.type];
+  if (!t) return false;
+  const hasClasses = !!(t.classes && typeof t.classes === 'object' && !Array.isArray(t.classes));
+  const rec = hasClasses ? t.classes[eb8FixParamClass(fix.type, fix.params)] : t;
+  if (!rec) return false;
+  const av = rec.approvedVerified || 0;
+  return av >= EB8_AUTO_MIN_SUCCESSES && (rec.failures || 0) < av;
 }
 async function eb8AutoGet(env) {
   try { const a = await env.LEADS.get('eb8:auto', { type: 'json' }); if (a && a.toggles && typeof a.toggles === 'object') return a; } catch (e) {}
@@ -8199,14 +8253,29 @@ async function eb8ExecuteFix(env, fix, via, opts) {
     fix.verified = !!verified;
     if (reason) fix.failReason = reason;
     if (result) fix.result = result;
-    if (!eb8Counted(env)) { try { await env.LEADS.put('eb8:fix:' + fix.id, JSON.stringify(fix)); } catch (e) {} }
-    await eb8Emit(env, executed ? 'itsupport.fix.executed' : 'itsupport.fix.failed', { fixId: fix.id, type: type, scope: fix.scope || 'site', via: fix.via, verified: !!verified, reason: reason || null });
-    if (executed && verified) {
-      if (via === 'auto') await eb8FixStatsBump(env, type, 'autoRuns');
-      else await eb8FixStatsBump(env, type, 'approvedVerified');
+    /* EB8-P2-GOLDEN (01-M2): the terminal write is durable or loud. One
+       retry; on continued failure a stuck marker + alarm event name the
+       fix, its intended terminal state and its claim token, and the
+       outcome rides the return + ledger event as statePersisted. (The
+       record itself may still sit at 'executing' and become re-claimable
+       after the stale window — that window is 01-M1's bound, DESIGN §8.) */
+    let statePersisted = true;
+    if (!eb8Counted(env)) {
+      let wrote = false;
+      for (let attempt = 0; attempt < 2 && !wrote; attempt++) { try { await env.LEADS.put('eb8:fix:' + fix.id, JSON.stringify(fix)); wrote = true; } catch (e) {} }
+      if (!wrote) {
+        statePersisted = false;
+        fix.terminalWriteFailed = true;
+        try { await env.LEADS.put('eb8:fixstuck:' + fix.id, JSON.stringify({ fixId: fix.id, type: type, state: fix.state, claim: fix.claim || null, at: new Date().toISOString(), reason: 'terminal_write_failed' })); } catch (e) {}
+        await eb8Emit(env, 'itsupport.fix.terminal_write_failed', { fixId: fix.id, type: type, state: fix.state, severity: 'high' });
+      }
     }
+    await eb8Emit(env, executed ? 'itsupport.fix.executed' : 'itsupport.fix.failed', { fixId: fix.id, type: type, scope: fix.scope || 'site', via: fix.via, verified: !!verified, reason: reason || null, statePersisted: statePersisted });
+    /* EB8-P2-GOLDEN (01-M8): stats record EVERY terminal outcome —
+       successes and failures — at type level and per parameter class. */
+    await eb8FixStatsRecord(env, type, params, { executed: executed, verified: !!verified, via: via || 'owner', reason: reason || null });
     if (executed) await eb8IncidentWrite(env, { symptom: fix.diagnosis || type, fixType: type, fixParams: params, outcome: verified ? 'executed + verified' : 'executed, verification inconclusive', scope: fix.scope || 'site', source: via === 'auto' ? 'proactive' : 'chat', probes: fix.probeSummary || [] });
-    return { executed: executed, verified: !!verified, reason: reason || null, result: result || null };
+    return { executed: executed, verified: !!verified, reason: reason || null, result: result || null, statePersisted: statePersisted };
   };
   /* EB8-P2-L3 (01-M3): the executor is the choke point — stored params
      are NOT trusted. (a) The auto path may only ever run EB8_FIX_TYPES;
@@ -8255,7 +8324,12 @@ async function eb8ExecuteFix(env, fix, via, opts) {
     if (type === 'reconcile') {
       const r = await eb6Reconcile(env, params.date, {});
       const again = await eb6Reconcile(env, params.date, { emit: false });
-      return done(true, !!(again && again.status), null, { status: again ? again.status : null, gaps: again ? again.gaps : [] });
+      /* EB8-P2-GOLDEN (01-L2): verified means the re-run's status MATCHES
+         the execution run's — the outcome is reproducible, not merely
+         present. A stable mismatch verifies (the gap is real, confirmed,
+         and the marker is written); a changed or failed re-run does not. */
+      const verified = !!(r && again && again.status && again.status === r.status);
+      return done(true, verified, verified ? null : 'reconcile_unverified', { status: again ? again.status : null, firstStatus: r ? r.status : null, gaps: again ? again.gaps : [] });
     }
     if (type === 'watchdog_tick') {
       await runUsageAlertWatchdog(env);
@@ -8280,21 +8354,50 @@ async function eb8ExecuteFix(env, fix, via, opts) {
     if (type === 'l3_render_restart') {
       const c = await eb8Itops(env);
       if (!c || !c.renderToken || !c.renderServiceId) return done(false, false, 'itops_unconfigured');
-      const r = await eb8FetchJson('https://api.render.com/v1/services/' + encodeURIComponent(String(c.renderServiceId)) + '/restart', { method: 'POST', headers: { 'Authorization': 'Bearer ' + String(c.renderToken), 'Content-Type': 'application/json' }, body: '{}' }, 15000);
+      const svcUrl = 'https://api.render.com/v1/services/' + encodeURIComponent(String(c.renderServiceId));
+      const rdHeaders = { 'Authorization': 'Bearer ' + String(c.renderToken) };
+      const latestDeploy = async function () {
+        const s = await eb8FetchJson(svcUrl + '/deploys?limit=1', { method: 'GET', headers: rdHeaders }, 10000);
+        if (!s.ok || !s.json) return null;
+        let d = Array.isArray(s.json) ? s.json[0] : s.json;
+        if (d && d.deploy && typeof d.deploy === 'object') d = d.deploy;
+        if (!d || typeof d !== 'object') return null;
+        return { id: d.id != null ? String(d.id) : null, createdAt: d.createdAt || d.created_at || null };
+      };
+      /* EB8-P2-GOLDEN (01-L2): verified means a deploy was OBSERVED after
+         the restart — the deploys list merely being reachable proved
+         nothing. The latest deploy is read BEFORE the restart POST, then
+         the list is polled for a new one (a different deploy id, or one
+         created at/after the restart start). */
+      let before = null; try { before = await latestDeploy(); } catch (e) {}
+      const restartStart = new Date().toISOString();
+      const r = await eb8FetchJson(svcUrl + '/restart', { method: 'POST', headers: { 'Authorization': 'Bearer ' + String(c.renderToken), 'Content-Type': 'application/json' }, body: '{}' }, 15000);
       if (!r.ok) return done(false, false, 'render_api_' + r.status);
-      let verified = false;
-      try { const s = await eb8FetchJson('https://api.render.com/v1/services/' + encodeURIComponent(String(c.renderServiceId)) + '/deploys?limit=1', { method: 'GET', headers: { 'Authorization': 'Bearer ' + String(c.renderToken) } }, 10000); verified = s.ok || s.status === 200; } catch (e) {}
-      return done(true, verified, null, { serviceId: String(c.renderServiceId) });
+      let verified = false, after = null;
+      for (let attempt = 0; attempt < 3 && !verified; attempt++) {
+        if (attempt > 0) await new Promise(function (res) { setTimeout(res, attempt === 1 ? 400 : 900); });
+        try { after = await latestDeploy(); } catch (e) { after = null; }
+        if (after && ((before && before.id && after.id && after.id !== before.id) || (after.createdAt && after.createdAt >= restartStart))) verified = true;
+      }
+      return done(true, verified, null, { serviceId: String(c.renderServiceId), deployBefore: before ? before.id : null, deployAfter: after ? after.id : null });
     }
     if (type === 'l3_github_patch_pr') {
       const c = await eb8Itops(env);
       if (!c || !c.githubToken || !c.githubRepo) return done(false, false, 'itops_unconfigured');
       const full = String(c.githubRepo);
+      /* EB8-P2-GOLDEN (01-L6): the configured repo is concatenated into
+         API URLs — a malformed value is refused before any GitHub call. */
+      if (!eb8GithubRepoOk(full)) return done(false, false, 'repo_malformed');
       const short = full.split('/').pop();
       if (params.repo && params.repo !== full && params.repo !== short) return done(false, false, 'repo_not_configured');
       const gh = async function (method, pathName, bodyObj) {
         return eb8FetchJson('https://api.github.com/repos/' + full + pathName, { method: method, headers: { 'Authorization': 'Bearer ' + String(c.githubToken), 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'eb8-itsupport' }, body: bodyObj ? JSON.stringify(bodyObj) : undefined }, 15000);
       };
+      /* EB8-P2-GOLDEN (01-L3): every failure AFTER the branch POST first
+         attempts to delete the branch — a failed run leaves no orphan
+         eb8/patch-* branch behind. Best-effort: cleanup never masks the
+         original failure reason. */
+      const cleanupBranch = async function () { try { await gh('DELETE', '/git/refs/heads/' + branch); } catch (e) {} };
       /* EB8-P2-L3 (02-M8): re-parse the stored diff, fetch the file's
          CURRENT content on main, and apply the diff to it. Every refusal
          here happens before the branch POST — zero GitHub writes. The
@@ -8323,17 +8426,25 @@ async function eb8ExecuteFix(env, fix, via, opts) {
       if (!bref.ok && bref.status !== 201) return done(false, false, 'github_branch_' + bref.status);
       const blob = await gh('POST', '/git/blobs', { content: vmB64(new TextEncoder().encode(applied.text)), encoding: 'base64' });
       const blobSha = blob.json && (blob.json.sha || (blob.json.object && blob.json.object.sha));
-      if (!blobSha) return done(false, false, 'github_blob_failed');
+      if (!blobSha) { await cleanupBranch(); return done(false, false, 'github_blob_failed'); }
       const tree = await gh('POST', '/git/trees', { base_tree: baseTree, tree: [{ path: params.path, mode: '100644', type: 'blob', sha: blobSha }] });
-      const treeSha = (tree.json && tree.json.sha) || baseTree;
+      /* EB8-P2-GOLDEN (01-L3): no base-tree fallback — a tree creation
+         without a returned sha is a failure, not a silent degrade that
+         later surfaces as a misleading github_pr_422. */
+      const treeSha = (tree.json && (tree.json.sha || (tree.json.object && tree.json.object.sha))) || null;
+      if (!treeSha) { await cleanupBranch(); return done(false, false, 'github_tree_failed'); }
       const commit = await gh('POST', '/git/commits', { message: 'EB-8 staged patch: ' + params.title, tree: treeSha, parents: [headSha] });
       const commitSha = (commit.json && (commit.json.sha || (commit.json.object && commit.json.object.sha))) || null;
-      if (!commitSha) return done(false, false, 'github_commit_failed');
-      await gh('PATCH', '/git/refs/heads/' + branch, { sha: commitSha });
+      if (!commitSha) { await cleanupBranch(); return done(false, false, 'github_commit_failed'); }
+      const refUpd = await gh('PATCH', '/git/refs/heads/' + branch, { sha: commitSha });
+      /* EB8-P2-GOLDEN (01-L3): the ref update result is CHECKED — an
+         unchecked PATCH used to let a failed run report success against
+         a branch that never moved. */
+      if (!refUpd.ok) { await cleanupBranch(); return done(false, false, 'github_ref_failed'); }
       const prBody = 'Staged by the EB-8 IT Support Operator from the owner portal.\n\nDiagnosis: ' + String(fix.diagnosis || '').slice(0, 800) + '\n\nSuites: pending-external — the worker cannot execute the node suites; QC/owner must run the EB pin suites + the main suite against this branch and approve before any merge. Merging is a human action; the Operator has no merge capability.';
       const pr = await gh('POST', '/pulls', { title: params.title, head: branch, base: 'main', body: prBody });
       const prUrl = (pr.json && pr.json.html_url) || null;
-      if (!prUrl && !pr.ok) return done(false, false, 'github_pr_' + pr.status);
+      if (!prUrl && !pr.ok) { await cleanupBranch(); return done(false, false, 'github_pr_' + pr.status); }
       return done(true, !!prUrl, null, { branch: branch, prUrl: prUrl, suites: 'pending-external', path: params.path, changedLines: parsedPatch.added + parsedPatch.removed });
     }
     if (type === 'l3_cf_ip_block') {
@@ -8383,8 +8494,13 @@ async function eb8ExecuteFix(env, fix, via, opts) {
       const g = await eb8GoldenLoad(env, params.goldenId);
       if (!g) return done(false, false, 'golden_not_found');
       const res = await eb8GoldenApply(env, g);
+      /* EB8-P2-GOLDEN (01-M4/M6): an apply refusal IS the outcome — the
+         branch reports it instead of diffing a restore that never ran;
+         an incomplete post-restore diff is not verification. */
+      if (res.error) return done(false, false, res.error, { goldenId: g.id, refused: res.refused || [], badTypeKeys: res.badTypeKeys || [] });
       const diff = await eb8GoldenDiff(env, g);
-      return done(true, diff.stateDrift.length === 0, diff.stateDrift.length ? 'residual_state_drift' : null, { goldenId: g.id, restored: res.restored, removed: res.removed, refused: res.refused || [], heldLoosening: res.heldLoosening || [], cfgDriftResidual: diff.cfgDrift });
+      const verified = !diff.incomplete && diff.stateDrift.length === 0;
+      return done(true, verified, diff.incomplete ? 'golden_state_incomplete' : (diff.stateDrift.length ? 'residual_state_drift' : null), { goldenId: g.id, restored: res.restored, removed: res.removed, refused: res.refused || [], heldLoosening: res.heldLoosening || [], preApplyGoldenId: res.preApplyGoldenId || null, cfgDriftResidual: diff.cfgDrift });
     }
     return done(false, false, 'not_allowlisted');
   } catch (e) { return done(false, false, 'executor_error'); }
@@ -8757,7 +8873,8 @@ async function eb8ProactiveTick(env, opts) {
         card.fixId = prop.fix.id; card.fixType = prop.fix.type; card.fixParams = prop.fix.params; card.dryRun = prop.fix.dryRun; card.critic = prop.fix.critic; card.scope = prop.fix.scope;
         const auto = await eb8AutoGet(env);
         const stats = await eb8FixStats(env);
-        const eligible = EB8_FIX_TYPES.indexOf(prop.fix.type) !== -1 && auto.toggles[prop.fix.type] === true && stats[prop.fix.type] && (stats[prop.fix.type].approvedVerified || 0) >= EB8_AUTO_MIN_SUCCESSES;
+        /* EB8-P2-GOLDEN (01-M8): eligibility is per parameter class. */
+        const eligible = eb8AutoEligible(prop.fix, auto, stats);
         if (eligible) {
           const res = await eb8ExecuteFix(env, prop.fix, 'auto');
           card.state = res.executed ? 'auto-executed' : 'proposed';
@@ -8960,7 +9077,12 @@ async function eb8ShadowTest(env, type, params) {
          refused here too (and named), never twin-copied. */
       const filtered = eb8GoldenFilterState(g.state);
       const gState = filtered.state;
-      const cur = await eb8GoldenStateRead(env);
+      /* EB8-P2-GOLDEN (01-M4): the twin proves a restore against the live
+         state — a partial read must fail the state-read check, never
+         silently prove against the keys that happened to load. */
+      const readShadow = await eb8GoldenStateRead(env);
+      ck('state-read', readShadow.complete, readShadow.complete ? 'live golden-scope state read complete' : 'live golden-scope state read INCOMPLETE (error or truncated listing) — twin restore not proven');
+      const cur = readShadow.state;
       /* EB8-P2-L3 (01-H2): the twin applies the same tighten-only
          projection as production apply, and drift is measured against
          the EFFECTIVE target — a held toggle is surfaced by the
@@ -9207,6 +9329,28 @@ async function eb8SignalsExtra(env) {
 const EB8_GOLDEN_CFG = ['cfg:ebrain', 'cfg:ebrain-backup', 'cfg:itops', 'cfg:internal', 'cfg:calls', 'cfg:mail']; /* site-side only, same pool-separation rule as EB8_SECRET_CFGS */
 const EB8_GOLDEN_STATE_KEYS = ['eb8:auto']; /* eb8:fixstats is a living counter store — it changes on every executed fix (including a golden restore itself), so it is deliberately NOT golden state */
 const EB8_GOLDEN_STATE_PREFIXES = ['eb:brainbrk:'];
+/* EB8-P2-GOLDEN: golden prefix listings drain up to this many keys and
+   REPORT truncation past it (01-M4) — the old silent cap of 30 is gone. */
+const EB8_GOLDEN_PREFIX_LIST_CAP = 1000;
+/* EB8-P2-GOLDEN (01-M8): the parameter class of a fix — the population
+   its track record is scoped to. clear_record is scoped to the exact
+   allow-list prefix its key matched (the triage minimum); the other
+   multi-population types are scoped to their discriminating parameter. */
+function eb8FixParamClass(type, params) {
+  const p = params || {};
+  if (type === 'clear_record') {
+    const key = String(p.key || '');
+    for (const pre of EB8_CLEAR_PREFIXES) if (key.indexOf(pre) === 0) return 'clear_record:' + pre;
+    return 'clear_record:other';
+  }
+  if (type === 'clear_breaker') return 'clear_breaker:' + String(p.leg || '');
+  if (type === 'l3_cf_cache_purge' || type === 'l3_cf_ip_block') return type + ':' + String(p.surface || '');
+  if (type === 'l3_github_patch_pr') return 'l3_github_patch_pr:' + String(p.path || '').split('/')[0];
+  return String(type || '');
+}
+/* EB8-P2-GOLDEN (01-L6): the configured GitHub repo must be owner/name —
+   it is concatenated into API URLs, so shape is validated, not assumed. */
+function eb8GithubRepoOk(full) { return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(full || '')); }
 function eb8ShapeOf(v, depth) {
   if (v === null || v === undefined) return 'null';
   if (Array.isArray(v)) return 'array';
@@ -9217,28 +9361,66 @@ function eb8ShapeOf(v, depth) {
   for (const k of Object.keys(v).slice(0, 30)) o[k] = eb8ShapeOf(v[k], (depth || 0) + 1);
   return o;
 }
+/* EB8-P2-GOLDEN (01-M4): the read reports COMPLETENESS. Every get/list
+   failure flips complete:false, and a listing that reaches the cap
+   reports truncated:true — a read error is never again indistinguishable
+   from absence (capture/apply/diff/shadow all key off these flags).
+   stateTtl carries the list-reported expiration (epoch seconds) per key
+   when the backend provides it, so a restore can return a key with its
+   remaining TTL (01-M6); KV exposes no TTL for directly-get keys. */
 async function eb8GoldenStateRead(env) {
-  const state = {};
-  for (const k of EB8_GOLDEN_STATE_KEYS) { try { const raw = await env.LEADS.get(k); if (raw !== null && raw !== undefined) state[k] = raw; } catch (e) {} }
+  const state = {}, stateTtl = {};
+  let complete = true, truncated = false;
+  for (const k of EB8_GOLDEN_STATE_KEYS) { try { const raw = await env.LEADS.get(k); if (raw !== null && raw !== undefined) state[k] = raw; } catch (e) { complete = false; } }
   for (const p of EB8_GOLDEN_STATE_PREFIXES) {
-    let names = []; try { names = await listAllKeys(env, p, 30); } catch (e) {}
-    for (const kn of names) { const n = String((kn && kn.name) || kn); try { const raw = await env.LEADS.get(n); if (raw !== null && raw !== undefined) state[n] = raw; } catch (e) {} }
+    let listing = null;
+    try { listing = await listAllKeysC(env, p, EB8_GOLDEN_PREFIX_LIST_CAP); } catch (e) { complete = false; }
+    if (listing) {
+      if (!listing.complete) { complete = false; truncated = true; }
+      for (const kn of listing.keys) {
+        const n = String((kn && kn.name) || kn);
+        if (kn && typeof kn.expiration === 'number') stateTtl[n] = kn.expiration;
+        try { const raw = await env.LEADS.get(n); if (raw !== null && raw !== undefined) state[n] = raw; } catch (e) { complete = false; }
+      }
+    }
   }
-  return state;
+  return { state: state, stateTtl: stateTtl, complete: complete, truncated: truncated };
 }
-async function eb8GoldenCapture(env) {
-  if (eb8Counted(env)) return { skipped: 'counted-env' };
+/* EB8-P2-GOLDEN (01-M5): build a golden record WITHOUT persisting it —
+   shared by capture and by apply's pre-apply snapshot. An incomplete
+   state read (01-M4) or an unreadable cfg record refuses the build: a
+   partially-read snapshot must never be treated as a complete golden. */
+async function eb8GoldenBuildRecord(env) {
   const cfgShapes = {};
+  let cfgBad = false;
   for (const k of EB8_GOLDEN_CFG) {
-    let rec = null; try { rec = await env.LEADS.get(k, { type: 'json' }); } catch (e) {}
+    let rec = null; try { rec = await env.LEADS.get(k, { type: 'json' }); } catch (e) { cfgBad = true; }
     cfgShapes[k] = { present: !!(rec && typeof rec === 'object'), shape: (rec && typeof rec === 'object') ? eb8ShapeOf(rec) : null };
   }
-  const state = await eb8GoldenStateRead(env);
-  const id = 'g' + eb5YmdDigits() + '-' + new Date().toISOString().slice(11, 19).replace(/:/g, '');
-  const golden = { id: id, at: new Date().toISOString(), cfgShapes: cfgShapes, state: state };
-  try { await env.LEADS.put('eb8:golden:' + id, JSON.stringify(golden)); await env.LEADS.put('eb8:golden:latest', JSON.stringify({ id: id, at: golden.at })); } catch (e) {}
-  await eb8Emit(env, 'itsupport.golden.captured', { goldenId: id, cfgKeys: Object.keys(cfgShapes).length, stateKeys: Object.keys(state).length });
-  return { id: id, at: golden.at, cfgKeys: Object.keys(cfgShapes).length, stateKeys: Object.keys(state).length };
+  const read = await eb8GoldenStateRead(env);
+  if (cfgBad || !read.complete) return { error: 'golden_state_incomplete' };
+  const id = 'g' + eb5YmdDigits() + '-' + new Date().toISOString().slice(11, 19).replace(/:/g, '') + '-' + randHex(3);
+  const golden = { id: id, at: new Date().toISOString(), cfgShapes: cfgShapes, state: read.state, stateTtl: read.stateTtl };
+  return { golden: golden };
+}
+/* EB8-P2-GOLDEN (01-M5): capture VERIFIES its writes. The id carries a
+   random suffix (second-granularity ids collided for same-second
+   captures). A failed write returns golden_write_failed; the record is
+   re-read and its id compared before the captured event is emitted —
+   the event fires only for a snapshot that provably exists. */
+async function eb8GoldenCapture(env) {
+  if (eb8Counted(env)) return { skipped: 'counted-env' };
+  const built = await eb8GoldenBuildRecord(env);
+  if (built.error) return { error: built.error };
+  const golden = built.golden, id = golden.id;
+  try {
+    await env.LEADS.put('eb8:golden:' + id, JSON.stringify(golden));
+    await env.LEADS.put('eb8:golden:latest', JSON.stringify({ id: id, at: golden.at }));
+  } catch (e) { return { error: 'golden_write_failed' }; }
+  let back = null; try { back = await env.LEADS.get('eb8:golden:' + id, { type: 'json' }); } catch (e) {}
+  if (!back || back.id !== id) { try { await env.LEADS.delete('eb8:golden:' + id); } catch (e) {} return { error: 'golden_write_failed' }; }
+  await eb8Emit(env, 'itsupport.golden.captured', { goldenId: id, cfgKeys: Object.keys(golden.cfgShapes).length, stateKeys: Object.keys(golden.state).length });
+  return { id: id, at: golden.at, cfgKeys: Object.keys(golden.cfgShapes).length, stateKeys: Object.keys(golden.state).length };
 }
 async function eb8GoldenLoad(env, goldenId) {
   try {
@@ -9268,15 +9450,21 @@ function eb8GoldenFilterState(state) {
 }
 async function eb8GoldenDiff(env, golden) {
   const cfgDrift = [], stateDrift = [];
+  let cfgBad = false;
   for (const k of Object.keys(golden.cfgShapes || {})) {
-    let rec = null; try { rec = await env.LEADS.get(k, { type: 'json' }); } catch (e) {}
+    let rec = null; try { rec = await env.LEADS.get(k, { type: 'json' }); } catch (e) { cfgBad = true; }
     const cur = { present: !!(rec && typeof rec === 'object'), shape: (rec && typeof rec === 'object') ? eb8ShapeOf(rec) : null };
     if (cur.present !== golden.cfgShapes[k].present) cfgDrift.push({ key: k, kind: 'presence' });
     else if (JSON.stringify(cur.shape) !== JSON.stringify(golden.cfgShapes[k].shape)) cfgDrift.push({ key: k, kind: 'shape' });
   }
   const filtered = eb8GoldenFilterState(golden.state);
   const target = filtered.state;
-  const curState = await eb8GoldenStateRead(env);
+  const read = await eb8GoldenStateRead(env);
+  /* EB8-P2-GOLDEN (01-M4): an incomplete read proves NOTHING about drift —
+     it returns incomplete with an empty drift list and ok:false, so no
+     caller can read a failed read as "no drift". */
+  if (cfgBad || !read.complete) return { cfgDrift: cfgDrift, stateDrift: [], refusedKeys: filtered.refused, incomplete: true, ok: false };
+  const curState = read.state;
   for (const k of Object.keys(target)) {
     if (!(k in curState)) stateDrift.push({ key: k, kind: 'missing' });
     else if (curState[k] !== target[k]) stateDrift.push({ key: k, kind: 'changed' });
@@ -9323,8 +9511,33 @@ function eb8GoldenTightenedAuto(curRaw, targetRaw) {
 async function eb8GoldenApply(env, golden) {
   const filtered = eb8GoldenFilterState(golden.state);
   const target = filtered.state;
+  /* EB8-P2-GOLDEN (01-L10): refused foreign keys are a tamper signal —
+     the apply emits a named ledger event instead of passing silently. */
+  if (filtered.refused.length) { try { await eb8Emit(env, 'itsupport.golden.tamper', { goldenId: golden.id || null, refusedKeys: filtered.refused.slice(0, 20), count: filtered.refused.length }); } catch (e) {} }
+  const read = await eb8GoldenStateRead(env);
+  /* EB8-P2-GOLDEN (01-M4): never restore against a partial view of the
+     keyspace — the delete-extras pass below would delete live records
+     that were merely unread. */
+  if (!read.complete) return { restored: [], removed: [], refused: filtered.refused, heldLoosening: [], error: 'golden_state_incomplete' };
+  /* EB8-P2-GOLDEN (01-M6): every value is type-checked BEFORE any write.
+     A planted non-string used to throw mid-apply, leaving a partial
+     restore behind a generic executor_error. */
+  const badTypes = Object.keys(target).filter(function (k) { return typeof target[k] !== 'string'; });
+  if (badTypes.length) return { restored: [], removed: [], refused: filtered.refused, heldLoosening: [], error: 'golden_value_type', badTypeKeys: badTypes };
+  /* EB8-P2-GOLDEN (01-M6): the state about to be overwritten is captured
+     FIRST, as its own golden record (kind pre-apply), so a bad restore
+     is itself reversible. The snapshot does NOT move eb8:golden:latest —
+     the restore target stays the latest pointer. If the snapshot cannot
+     be built or written, the apply refuses rather than overwriting blind. */
+  const pre = await eb8GoldenBuildRecord(env);
+  if (pre.error) return { restored: [], removed: [], refused: filtered.refused, heldLoosening: [], error: 'golden_presnapshot_failed' };
+  pre.golden.kind = 'pre-apply'; pre.golden.forGoldenId = golden.id || null;
+  try { await env.LEADS.put('eb8:golden:' + pre.golden.id, JSON.stringify(pre.golden)); } catch (e) { return { restored: [], removed: [], refused: filtered.refused, heldLoosening: [], error: 'golden_presnapshot_failed' }; }
   const restored = [], removed = [], heldLoosening = [];
-  const curState = await eb8GoldenStateRead(env);
+  const curState = read.state;
+  const ttlOf = golden.stateTtl || {};
+  const nowSec = Math.floor(Date.now() / 1000);
+  const putOpts = function (k) { const exp = ttlOf[k]; return (typeof exp === 'number' && exp - nowSec > 0) ? { expirationTtl: Math.max(60, exp - nowSec) } : undefined; };
   for (const k of Object.keys(target)) {
     if (k === 'eb8:auto') {
       /* EB8-P2-L3 (01-H2): tighten-only projection — see
@@ -9334,22 +9547,22 @@ async function eb8GoldenApply(env, golden) {
       const pr = eb8GoldenTightenedAuto(curState[k], target[k]);
       if (pr.heldKey) heldLoosening.push({ key: k, toggles: [], heldKey: true });
       else if (pr.held.length) heldLoosening.push({ key: k, toggles: pr.held, heldKey: false });
-      if (pr.value !== null && pr.value !== undefined && curState[k] !== pr.value) { await env.LEADS.put(k, pr.value); restored.push(k); }
+      if (pr.value !== null && pr.value !== undefined && curState[k] !== pr.value) { await env.LEADS.put(k, pr.value, putOpts(k)); restored.push(k); }
       continue;
     }
-    if (curState[k] !== target[k]) { await env.LEADS.put(k, target[k]); restored.push(k); }
+    if (curState[k] !== target[k]) { await env.LEADS.put(k, target[k], putOpts(k)); restored.push(k); }
   }
   for (const k of Object.keys(curState)) {
     if (!eb8GoldenKeyEligible(k)) continue;
     if (!(target[k] !== undefined)) { await env.LEADS.delete(k); removed.push(k); }
   }
-  return { restored: restored, removed: removed, refused: filtered.refused, heldLoosening: heldLoosening };
+  return { restored: restored, removed: removed, refused: filtered.refused, heldLoosening: heldLoosening, preApplyGoldenId: pre.golden.id };
 }
 
 /* ----- deploy correlation + upstream status context for diagnoses ----- */
 async function eb8DeployTimeline(env) {
   const c = await eb8Itops(env);
-  if (!c || !c.githubToken || !c.githubRepo) return { available: false, commits: [] };
+  if (!c || !c.githubToken || !c.githubRepo || !eb8GithubRepoOk(c.githubRepo)) return { available: false, commits: [] };
   try {
     const r = await eb8FetchJson('https://api.github.com/repos/' + String(c.githubRepo) + '/commits?per_page=5', { method: 'GET', headers: { 'Authorization': 'Bearer ' + String(c.githubToken), 'Accept': 'application/vnd.github+json', 'User-Agent': 'eb8-itsupport' } }, 10000);
     const arr = Array.isArray(r.json) ? r.json : [];
@@ -9737,7 +9950,7 @@ async function eb8StateExtra(env) {
   out.weekly = wk ? { at: wk.at, week: wk.week, incidents: wk.incidents, fixes: wk.fixes, health: wk.health, openRisks: wk.openRisks } : null;
   out.health = await get('eb8:health:' + eb5YmdDigits());
   const g = await eb8GoldenLoad(env, null);
-  if (g) { const d = await eb8GoldenDiff(env, g).catch(function () { return null; }); out.golden = { id: g.id, at: g.at, drift: d ? { cfg: d.cfgDrift, state: d.stateDrift } : null }; } else out.golden = null;
+  if (g) { const d = await eb8GoldenDiff(env, g).catch(function () { return null; }); out.golden = { id: g.id, at: g.at, drift: (d && !d.incomplete) ? { cfg: d.cfgDrift, state: d.stateDrift } : null }; } else out.golden = null;
   const dr = await get('eb8:drills:latest'); out.drills = dr ? { at: dr.at, ok: dr.ok, failed: (dr.results || []).filter(function (r) { return !r.ok; }).map(function (r) { return r.kind; }) } : null;
   const rd = await get('eb8:restoredrill:latest'); out.restoredrill = rd ? { at: rd.at, ok: rd.ok, reason: rd.reason || null, count: rd.count || null } : null;
   const rt = await get('eb8:redteam:latest'); out.redteam = rt ? { at: rt.at, ok: rt.ok, failed: (rt.journeys || []).filter(function (j) { return !j.ok; }).map(function (j) { return j.id; }) } : null;
@@ -29317,19 +29530,29 @@ async function handleRequest(request, env, ctx) {
       if (path === '/api/admin/eb/itsupport/fix/approve' && request.method === 'POST') {
         let d = null;
         try { d = await request.json(); } catch (e) {}
-        const fid = String((d && d.fixId) || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60);
-        const fix = fid ? await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; }) : null;
+        /* EB8-P2-GOLDEN (01-L7): the id is validated, never stripped —
+           fix!123 used to silently become fix123. */
+        const fidRaw = String((d && d.fixId) || '');
+        if (!/^[A-Za-z0-9_-]{1,60}$/.test(fidRaw)) return json({ ok: false, error: 'bad_fix_id' }, 400, origin);
+        const fid = fidRaw;
+        const fix = await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; });
         if (!fix) return json({ ok: false, error: 'not_found' }, 404, origin);
         if (!eb8FixClaimable(fix)) return json({ ok: false, error: 'not_proposed', state: fix.state }, 409, origin);
         const res = await eb8ExecuteFix(env, fix, 'owner', { actorIp: request.headers.get('CF-Connecting-IP') || null });
         if (res && res.reason === 'already_claimed') return json({ ok: false, error: 'already_claimed', fixId: fid }, 409, origin);
-        return json(Object.assign({ ok: true, fixId: fid }, res), 200, origin);
+        /* EB8-P2-GOLDEN (01-M10, per EB8-P2-L3 QC ruling S1): ok reflects
+           the EXECUTION — a failed execution returns ok:false with the
+           reason visible, never a silent ok:true. */
+        return json(Object.assign({ ok: !!(res && res.executed), fixId: fid }, res), 200, origin);
       }
       if (path === '/api/admin/eb/itsupport/fix/reject' && request.method === 'POST') {
         let d = null;
         try { d = await request.json(); } catch (e) {}
-        const fid = String((d && d.fixId) || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 60);
-        const fix = fid ? await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; }) : null;
+        /* EB8-P2-GOLDEN (01-L7): validated, never stripped (see approve). */
+        const fidRaw = String((d && d.fixId) || '');
+        if (!/^[A-Za-z0-9_-]{1,60}$/.test(fidRaw)) return json({ ok: false, error: 'bad_fix_id' }, 400, origin);
+        const fid = fidRaw;
+        const fix = await env.LEADS.get('eb8:fix:' + fid, { type: 'json' }).catch(function () { return null; });
         if (!fix) return json({ ok: false, error: 'not_found' }, 404, origin);
         if (fix.state !== 'proposed') return json({ ok: false, error: 'not_proposed', state: fix.state }, 409, origin);
         fix.state = 'rejected'; fix.decidedAt = new Date().toISOString();
@@ -29446,6 +29669,9 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/admin/eb/itsupport/golden/capture' && request.method === 'POST') {
         const out = await eb8GoldenCapture(env);
+        /* EB8-P2-GOLDEN (01-M5): a failed capture surfaces as a failure —
+           the counted-env skip keeps its ok:true shape. */
+        if (out && out.error) return json({ ok: false, error: out.error }, 500, origin);
         return json(Object.assign({ ok: true }, out), 200, origin);
       }
       if (path === '/api/admin/eb/itsupport/golden/restore-propose' && request.method === 'POST') {
