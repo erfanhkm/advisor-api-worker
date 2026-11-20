@@ -7297,16 +7297,83 @@ const EB8_RUNBOOK = [
   { id: 'usage-watchdog', scope: 'site', title: 'Usage watchdog + Quota Weather', keywords: ['usage', 'quota', 'watchdog', '80%', 'snapshot', 'alert'], body: 'The native hourly watchdog (cron "7 * * * *") computes the usage split, stores usagealert:lastmetrics, and EB-2 Quota Weather (eb:quota) derives burn/ETA from consecutive snapshots. Re-running the watchdog tick is the allow-listed fix watchdog_tick. A stale eb:quota snapshot means the tick stopped — check eb:tick heartbeat age on the Systems Board first.' }
 ];
 function eb8Tokens(s) { return String(s || '').toLowerCase().split(/[^a-z0-9\u0600-\u06FF]+/).filter(function (w) { return w.length >= 3; }); }
-function eb8ScoreText(keywords, text) {
-  const t = ' ' + String(text || '').toLowerCase() + ' ';
-  let n = 0;
-  for (const k of keywords) { if (t.indexOf(String(k).toLowerCase()) !== -1) n++; }
-  return n;
+/* Pack EB-RETRIEVAL-FIX (2026-11-19): ranking hygiene for eb8Retrieve.
+   The Pass-2 review (P2-02) found the old scorer matched raw substrings
+   with no stopwords and no dedupe: incident function words ('the',
+   'and', 'was') scored against almost any English query, repeated
+   tokens scored repeatedly, and runbook keywords matched inside
+   unrelated words ('leg' in 'illegal', 'down' in 'download'). The
+   scoring below keeps the same sources, item shape and evidence
+   format; only the matching changes — distinct content tokens,
+   word-boundary/phrase matching on the query's token stream, a
+   two-hit bar for uncurated incident text, and a small bilingual map
+   so Persian owner messages retrieve the English runbook. */
+const EB8_STOPWORDS = new Set(['the', 'and', 'are', 'was', 'were', 'has', 'have', 'had', 'with', 'from', 'this', 'that', 'what', 'when', 'where', 'which', 'who', 'whom', 'whose', 'there', 'here', 'then', 'than', 'into', 'about', 'after', 'before', 'over', 'under', 'been', 'being', 'will', 'would', 'could', 'should', 'shall', 'might', 'must', 'does', 'did', 'can', 'may', 'they', 'them', 'their', 'theirs', 'your', 'yours', 'ours', 'mine', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'not', 'nor', 'only', 'own', 'same', 'too', 'very', 'just', 'once', 'again', 'why', 'how', 'per', 'via']);
+const EB8_FA_TOKENS = { 'مغز': ['brain'], 'سهمیه': ['quota'], 'پارک': ['parked'], 'بریکر': ['breaker'], 'قطع': ['down'], 'خراب': ['down'], 'پشتیبان': ['backup'], 'بکاپ': ['backup'], 'آکادمی': ['academy'], 'منشی': ['receptionist'], 'مدل': ['model'], 'کند': ['slow'], 'سکوت': ['silence'], 'انتقال': ['transfer'], 'دیپلوی': ['deploy'], 'مصرف': ['usage'], 'مانیفست': ['manifest'], 'تطبیق': ['reconcile'], 'لید': ['leads'], 'نیست': ['missing'], 'ورود': ['turnstile'] };
+/* Delta (DESIGN-ADDENDUM.md): negation-aware matching. Negators are
+   barrier tokens — retained in the stream so they break phrase
+   adjacency and protect negated keyword phrases ('not found'), but
+   excluded from the content set so they never score as content.
+   EB8_DETERMINERS backs the phrase-match veto: a phrase immediately
+   followed by a determiner is the transitive (object-taking) sense,
+   not the keyword's sense. */
+const EB8_NEGATORS = new Set(['not', 'nor', 'never', 'isn', 'aren', 'wasn', 'weren', 'don', 'doesn', 'didn', 'haven', 'hasn', 'hadn', 'couldn', 'shouldn', 'wouldn', 'mustn', 'needn', 'won', 'ain']);
+const EB8_DETERMINERS = new Set(['the', 'a', 'an', 'its', 'his', 'her', 'their', 'our', 'your', 'my']);
+function eb8NormWord(w) { return (w.length > 3 && w.charAt(w.length - 1) === 's' && w.charAt(w.length - 2) !== 's') ? w.slice(0, -1) : w; }
+function eb8PushToken(out, w) {
+  const fa = EB8_FA_TOKENS[w];
+  if (fa) { for (const t of fa) out.push(eb8NormWord(t)); return; }
+  if (EB8_NEGATORS.has(w)) { out.push(w); return; }
+  if (EB8_STOPWORDS.has(w)) return;
+  out.push(eb8NormWord(w));
 }
-async function eb8Retrieve(env, query) {
+function eb8QueryCtx(query) {
+  const raw = String(query || '').toLowerCase().split(/[^a-z0-9\u0600-\u06FF]+/).filter(function (w) { return w.length > 0; });
+  const toks = [];
+  const rawIdx = [];
+  for (let ri = 0; ri < raw.length; ri++) {
+    const w = raw[ri];
+    if (w.length < 3) continue;
+    const before = toks.length;
+    eb8PushToken(toks, w);
+    for (let k = before; k < toks.length; k++) rawIdx.push(ri);
+  }
+  const set = new Set();
+  for (const t of toks) if (!EB8_NEGATORS.has(t)) set.add(t);
+  return { set: set, toks: toks, raw: raw, rawIdx: rawIdx };
+}
+function eb8PhraseHit(parts, ctx) {
+  const toks = ctx.toks;
+  for (let i = 0; i + parts.length <= toks.length; i++) {
+    let match = true;
+    for (let j = 0; j < parts.length; j++) { if (toks[i + j] !== parts[j]) { match = false; break; } }
+    if (!match) continue;
+    const after = ctx.raw[ctx.rawIdx[i + parts.length - 1] + 1];
+    if (after !== undefined && EB8_DETERMINERS.has(after)) continue;
+    return true;
+  }
+  return false;
+}
+function eb8KeywordScore(keywords, ctx) {
+  let n = 0;
+  const seen = new Set();
+  for (const k of keywords) {
+    const parts = [];
+    for (const w of eb8Tokens(String(k || ''))) eb8PushToken(parts, w);
+    if (parts.length === 1 && EB8_NEGATORS.has(parts[0])) continue;
+    if (!parts.length) continue;
+    const key = parts.join(' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (parts.length === 1) { if (ctx.set.has(parts[0])) n++; }
+    else if (eb8PhraseHit(parts, ctx)) n++;
+  }
+  return n;
+}async function eb8Retrieve(env, query) {
   const out = [];
+  const ctx = eb8QueryCtx(query);
   for (const e of EB8_RUNBOOK) {
-    const s = eb8ScoreText(e.keywords.concat([e.title]), query);
+    const s = eb8KeywordScore(e.keywords.concat([e.title]), ctx);
     if (s > 0) out.push({ ref: 'eb8:runbook:' + e.id, scope: e.scope, title: e.title, body: e.body, score: s });
   }
   try {
@@ -7314,8 +7381,8 @@ async function eb8Retrieve(env, query) {
     for (const row of rows) {
       const rec = row.rec;
       const text = [rec.symptom, rec.title, rec.note, rec.fixType, rec.outcome].filter(Boolean).join(' ');
-      const s = eb8ScoreText(eb8Tokens(text), query);
-      if (s > 0) out.push({ ref: 'eb8:incident:' + rec.id, scope: rec.scope || 'site', title: rec.title || rec.symptom || 'incident', body: text.slice(0, 600), score: s });
+      const s = eb8KeywordScore(eb8Tokens(text), ctx);
+      if (s >= 2) out.push({ ref: 'eb8:incident:' + rec.id, scope: rec.scope || 'site', title: rec.title || rec.symptom || 'incident', body: text.slice(0, 600), score: s });
     }
   } catch (e) {}
   out.sort(function (a, b) { return b.score - a.score; });
@@ -29216,18 +29283,47 @@ async function handleRequest(request, env, ctx) {
           }
           if (!canaryLeadOk) issues.push('Canary — lead pipeline failed');
           let canaryChatOk = false;
+          // Pack CANARY-FIX (2026-11-19): the chat half used to record
+          // ONLY a boolean, so the 2026-11-18 + 2026-11-19 failures were
+          // undiagnosable — a 429 anti-abuse gate, a 502 dead cascade and
+          // a 25 s abort were indistinguishable. It now records the HTTP
+          // status, ai-chat's error class from the response body, and a
+          // coarse failure kind in the added `chat` object (the existing
+          // leadOk/chatOk/at fields are byte-stable; every consumer —
+          // the nightly cron, the M-2 analysis module, the portal usage
+          // read — keeps working unchanged). It also authenticates with
+          // the platform's shared ai-chat secret (aiSharedSecret: the
+          // cfg:brain/cfg:brief value ai-chat verifies X-Brief-Secret
+          // against — the same PROBE_SECRET) sent as X-Chat-Probe, so
+          // the canary takes the probe-exempt path like the hourly
+          // health probe instead of sharing the 'unknown'-IP anti-abuse
+          // bucket (no CF-Connecting-IP arrives over the service
+          // binding). Same URL, same body, same 25 s deadline — the full
+          // provider cascade is still exercised end-to-end; only the
+          // anonymous gates are skipped (real public traffic keeps
+          // exercising them). If no shared secret is configured, no
+          // header is sent and the canary behaves exactly as before.
+          const canaryChat = { status: null, errorClass: null, kind: null, probeExempt: false };
           try {
             const fetcher = (env.AICHAT && typeof env.AICHAT.fetch === 'function') ? env.AICHAT.fetch.bind(env.AICHAT) : fetch;
+            const chatHeaders = { 'Content-Type': 'application/json', Origin: 'https://real-estate-platform-0aei.onrender.com' };
+            try { const csecret = await aiSharedSecret(env); if (csecret) { chatHeaders['X-Chat-Probe'] = csecret; canaryChat.probeExempt = true; } } catch (e) {}
             const ctl = new AbortController();
             const tm = setTimeout(function () { ctl.abort(); }, 25000);
             try {
-              const cr = await fetcher('https://ai-chat.erfanbillion.workers.dev/', { method: 'POST', signal: ctl.signal, headers: { 'Content-Type': 'application/json', Origin: 'https://real-estate-platform-0aei.onrender.com' }, body: JSON.stringify({ message: 'Reply with the single word: ok', lang: 'en', history: [] }) });
+              const cr = await fetcher('https://ai-chat.erfanbillion.workers.dev/', { method: 'POST', signal: ctl.signal, headers: chatHeaders, body: JSON.stringify({ message: 'Reply with the single word: ok', lang: 'en', history: [] }) });
+              canaryChat.status = (typeof cr.status === 'number') ? cr.status : null;
               const cj = await cr.json().catch(function () { return null; });
+              if (cj && typeof cj.error === 'string' && cj.error) canaryChat.errorClass = String(cj.error).slice(0, 60);
               canaryChatOk = !!(cr.ok && cj && typeof cj.reply === 'string' && cj.reply.trim().length > 0);
+              if (!canaryChatOk) canaryChat.kind = canaryChat.status === 429 ? 'http-429' : (canaryChat.status === 502 ? 'http-502' : 'http-other');
             } finally { clearTimeout(tm); }
-          } catch (e) { canaryChatOk = false; }
+          } catch (e) {
+            canaryChatOk = false;
+            canaryChat.kind = (e && e.name === 'AbortError') ? 'timeout-abort' : 'network';
+          }
           if (!canaryChatOk) issues.push('Canary — site chat did not answer');
-          const canary = { leadOk: canaryLeadOk, chatOk: canaryChatOk, at: canaryAt };
+          const canary = { leadOk: canaryLeadOk, chatOk: canaryChatOk, at: canaryAt, chat: canaryChat };
           const backupLog = (await env.LEADS.get('backup:log', { type: 'json' })) || [];
           if (vancouverDay() > BACKUP_START_DAY) { const lastOkB = backupLog.filter(function (b) { return b.ok; })[0]; if (!lastOkB || !(Date.now() - Date.parse(lastOkB.at) <= 36 * 3600000)) issues.push('Auto backup — no successful backup in the last 36h'); } // NaN-safe: an unparseable timestamp fails CLOSED, matching the freshness check (cycle 30, Claude Low)
           const report = { ts: started, finished: new Date().toISOString(), checks: checks, repairs: repairs, issues: issues, counts: counts, speed: speed, usage: { listsToday: listUsage }, ai: aiUsageSnap, gcal: gcalLast, canary: canary, backups: backupLog.slice(0, 30) };
