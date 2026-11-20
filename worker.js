@@ -10508,6 +10508,70 @@ async function mailReleaseSend(env, mid, ip) {
 // expires them. The record itself holds { email, exp } — unchanged.
 async function usessKey(token) { return 'usess:' + await sha256hex(token); }
 
+// Pack DP12-P2-SERVER (03-M1): requests that presented an ehsess
+// cookie whose token resolved to NO live session. The fetch funnel
+// appends dead-cookie clearing headers to a /api/user/* 401 for
+// these requests, so a stale cookie stops shadowing the client.
+const deadCookieReqs = new WeakSet();
+// Pack DP12-P2-SERVER (03-M3): the session csrf is DERIVED, never
+// minted-and-stored as the source of truth: HMAC-SHA256(secret,
+// 'ehcsrf:' + token), first 32 hex chars (128 bits — the ehcsrf
+// cookie keeps its 32-hex shape). Deterministic derivation means
+// concurrent exchanges converge on the same value (no mint race),
+// any isolate computes it from the token alone (no cache window),
+// and nothing needs writing before it can be checked. The secret
+// resolves per call (no isolate memo — a rotation takes effect
+// everywhere at once): DP12_CSRF_SECRET, then the platform shared
+// secret (aiSharedSecret), then ADVISOR_AUTH. An empty secret
+// still derives deterministically, only without key separation.
+async function dp12CsrfSecret(env) {
+  try { if (env.DP12_CSRF_SECRET) return String(env.DP12_CSRF_SECRET); } catch (e) {}
+  const s = await aiSharedSecret(env);
+  if (s) return s;
+  return String(env.ADVISOR_AUTH || '');
+}
+async function deriveCsrf(env, token) {
+  const secret = await dp12CsrfSecret(env);
+  // The HMAC key is SHA-256('dp12-csrf-key:' + secret): always a
+  // full 32-byte key (a zero-length HMAC key is rejected by some
+  // WebCrypto implementations), still keyed entirely by the secret.
+  const keyBytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('dp12-csrf-key:' + secret));
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('ehcsrf:' + token));
+  return [...new Uint8Array(sig)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+// Resolve ONE token to a live session (or null). Both credential
+// candidates go through this identical record / expiry / cache /
+// ban logic so the cookie->Bearer fall-through (03-M1) is exact.
+async function userSessionForToken(env, token, via) {
+  const cKey = 'usess:' + token; // isolate cache key only — never a KV key any more
+  const c = sessCache.get(cKey);
+  if (c && Date.now() - c.t < SESS_CACHE_TTL && (!c.exp || Date.now() <= c.exp)) {
+    if (c.email && (await isBanned(env, c.email))) return null;
+    return c.email ? { email: c.email, token: token, via: via, exp: c.exp || 0, csrf: c.csrf || '', csrfStored: c.csrfStored || '' } : null;
+  }
+  let raw = await siteKvGet(env, await usessKey(token));
+  if (!raw) raw = await siteKvGet(env, 'usess:' + token); // legacy pre-hash session (Pack DP12-P2-SERVER, 03-M4: read through the same accessor as writes/deletes)
+  let email = null;
+  let exp = 0;
+  let csrfStored = '';
+  if (raw) {
+    let s = null;
+    try { s = JSON.parse(raw); } catch (e) {}
+    if (s && Date.now() <= s.exp) { email = s.email; exp = s.exp; csrfStored = String(s.csrf || ''); }
+  }
+  const csrf = email ? await deriveCsrf(env, token) : '';
+  // Pack DP12-P2-SERVER (03-L4): negative results are NOT cached —
+  // a just-created session must not look logged out on a lagging
+  // isolate for 60 s, and unknown-token spray must not churn the
+  // cache eviction. Positives keep the 60 s cache unchanged.
+  if (email) {
+    if (sessCache.size > 5000) { let nEv = 0; for (const kk of sessCache.keys()) { sessCache.delete(kk); if (++nEv >= 1000) break; } }
+    sessCache.set(cKey, { t: Date.now(), email: email, exp: exp, csrf: csrf, csrfStored: csrfStored });
+  }
+  if (email && (await isBanned(env, email))) return null;
+  return email ? { email: email, token: token, via: via, exp: exp, csrf: csrf, csrfStored: csrfStored } : null;
+}
 async function userSession(request, env) {
   // Pack DP12 (F-048): the session token is resolved from the httpOnly
   // ehsess cookie first, then from the Bearer header. Bearer is the
@@ -10515,52 +10579,59 @@ async function userSession(request, env) {
   // not-yet-updated site bundles still present it); it is removed by a
   // follow-up pack once every client is on cookies — see
   // packs/FIX-DP12/DESIGN.md ("Transition call").
-  let token = '';
-  let via = '';
+  // Pack DP12-P2-SERVER (03-M1): a cookie token that resolves to no
+  // live session no longer shadows a valid Bearer — the Bearer
+  // candidate is tried next, and the dead cookie is marked so the
+  // fetch funnel can clear it on the 401.
   const cm = /(?:^|; )ehsess=(u_[0-9a-f]{32})/.exec(request.headers.get('Cookie') || '');
-  if (cm) { token = cm[1]; via = 'cookie'; }
-  if (!token) {
-    const h = request.headers.get('Authorization') || '';
-    const m = h.match(/^Bearer (u_[0-9a-f]{32})$/);
-    if (m) { token = m[1]; via = 'bearer'; }
+  const bh = request.headers.get('Authorization') || '';
+  const bm = bh.match(/^Bearer (u_[0-9a-f]{32})$/);
+  const candidates = [];
+  if (cm) candidates.push({ token: cm[1], via: 'cookie' });
+  if (bm && (!cm || bm[1] !== cm[1])) candidates.push({ token: bm[1], via: 'bearer' });
+  for (const cand of candidates) {
+    const s = await userSessionForToken(env, cand.token, cand.via);
+    if (s) return s;
+    if (cand.via === 'cookie') { try { deadCookieReqs.add(request); } catch (e) {} }
   }
-  if (!token) return null;
-  const cKey = 'usess:' + token; // isolate cache key only — never a KV key any more
-  const c = sessCache.get(cKey);
-  if (c && Date.now() - c.t < SESS_CACHE_TTL && (!c.exp || Date.now() <= c.exp)) {
-    if (c.email && (await isBanned(env, c.email))) return null;
-    return c.email ? { email: c.email, token: token, via: via, csrf: c.csrf || '' } : null;
-  }
-  let raw = await siteKvGet(env, await usessKey(token));
-  if (!raw) raw = await env.LEADS.get('usess:' + token); // legacy pre-hash session
-  let email = null;
-  let exp = 0;
-  let csrf = '';
-  if (raw) {
-    let s = null;
-    try { s = JSON.parse(raw); } catch (e) {}
-    if (s && Date.now() <= s.exp) { email = s.email; exp = s.exp; csrf = String(s.csrf || ''); }
-  }
-  if (sessCache.size > 5000) { let nEv = 0; for (const kk of sessCache.keys()) { sessCache.delete(kk); if (++nEv >= 1000) break; } }
-  sessCache.set(cKey, { t: Date.now(), email: email, exp: exp, csrf: csrf });
-  if (email && (await isBanned(env, email))) return null;
-  return email ? { email: email, token: token, via: via, csrf: csrf } : null;
+  return null;
 }
 async function userAuth(request, env) {
   const s = await userSession(request, env);
-  return s ? s.email : null;
+  if (!s) return null;
+  // Pack DP12-P2-SERVER (03-H3): default-deny by construction. A
+  // cookie session is ambient authority, so a non-safe method that
+  // reaches userAuth without a passing csrfOk is denied HERE, not
+  // by per-route convention. Today's only callers are GET routes
+  // (GET /api/user/viewings; /api/user/me now resolves userSession
+  // directly), so no live route changes behaviour; the per-route
+  // csrfOk checks on the mutating routes stay as belt-and-braces.
+  if (s.via === 'cookie' && !/^(GET|HEAD|OPTIONS)$/.test(request.method || 'GET')) {
+    if (!csrfOk(request, s)) return null;
+  }
+  return s.email;
 }
 // Pack DP12 (F-048): session cookies. ehsess is httpOnly — no client
 // script can read the session token (the F-048 fix). ehcsrf is the
 // readable double-submit companion; its value is ALSO stored in the
 // session record, so csrfOk compares header, cookie and record.
+// Pack DP12-P2-SERVER: the csrf is now DERIVED (HMAC over the
+// token — see deriveCsrf) and csrfOk checks the header against
+// the derived value, the cookie leg being optional; the record
+// copy is a stored cache of the same value, backfilled at
+// session-exchange when it differs.
 // SameSite=None because the API is cross-origin (advisor-api.* vs the
 // site / Academy hosts); Secure always; Max-Age mirrors the 30-day exp.
 const USESS_COOKIE = 'ehsess';
 const CSRF_COOKIE = 'ehcsrf';
 const SESSION_COOKIE_MAXAGE = 30 * 86400;
-function sessionCookieStrings(token, csrf) {
-  const base = '; Max-Age=' + SESSION_COOKIE_MAXAGE + '; Path=/; Secure; SameSite=None';
+function sessionCookieStrings(token, csrf, expMs) {
+  // Pack DP12-P2-SERVER (03-L3): Max-Age is the session's REMAINING
+  // lifetime, not a blanket 30 days — a cookie must not outlive
+  // the record it names. Callers without an exp keep the cap.
+  let maxAge = SESSION_COOKIE_MAXAGE;
+  if (expMs) maxAge = Math.max(0, Math.min(SESSION_COOKIE_MAXAGE, Math.floor((expMs - Date.now()) / 1000)));
+  const base = '; Max-Age=' + maxAge + '; Path=/; Secure; SameSite=None';
   return [USESS_COOKIE + '=' + token + '; HttpOnly' + base, CSRF_COOKIE + '=' + csrf + base];
 }
 function clearSessionCookieStrings() {
@@ -10574,8 +10645,19 @@ function csrfCookieValue(request) {
 function csrfOk(request, sess) {
   if (!sess || sess.via !== 'cookie') return true; // a Bearer header is not ambient authority; issuance + logout are exempt by design
   const h = request.headers.get('X-CSRF-Token') || '';
-  if (!h || !sess.csrf) return false;
-  return h === sess.csrf && h === csrfCookieValue(request);
+  if (!h) return false;
+  // Pack DP12-P2-SERVER (03-H1 / 03-L1): the real check is the
+  // header against the session's DERIVED csrf, compared
+  // timing-safe. The ehcsrf cookie-equality leg is gone: a
+  // cross-origin client cannot read that cookie (03-H1), and the
+  // header value is unguessable (HMAC) and never ambient, so the
+  // cookie leg added no defence — only breakage. Transition: the
+  // record's pre-pack stored csrf is also accepted (csrfStored)
+  // until session-exchange backfills the record to the derived
+  // value or the record expires (<= 30 days).
+  if (sess.csrf && timingSafeEqual(h, sess.csrf)) return true;
+  if (sess.csrfStored && sess.csrfStored !== sess.csrf && timingSafeEqual(h, sess.csrfStored)) return true;
+  return false;
 }
 async function userSaved(env, email) {
   return (await env.LEADS.get('usaved:' + email, { type: 'json' })) || [];
@@ -22560,11 +22642,12 @@ async function handleRequest(request, env, ctx) {
         if (await isBanned(env, gEmail)) return json({ ok: false, error: 'banned' }, 403, origin);
         if (!(await siteKvGet(env, 'user:' + gEmail))) return json({ ok: false, error: 'code' }, 401, origin);
         const gtok = 'u_' + randHex(16);
-        const gcsrf = randHex(16);
-        await siteKvPut(env, await usessKey(gtok), JSON.stringify({ email: gEmail, exp: Date.now() + 30 * 86400000, csrf: gcsrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
-        const grr = json({ ok: true, token: gtok }, 200, origin);
+        const gexp = Date.now() + 30 * 86400000;
+        const gcsrf = await deriveCsrf(env, gtok); // Pack DP12-P2-SERVER (03-M3): derived, not minted
+        await siteKvPut(env, await usessKey(gtok), JSON.stringify({ email: gEmail, exp: gexp, csrf: gcsrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const grr = json({ ok: true, token: gtok, csrf: gcsrf }, 200, origin); // Pack DP12-P2-SERVER (03-H1): csrf in the body
         grr.headers.set('Cache-Control', 'no-store');
-        appendSetCookies(grr.headers, sessionCookieStrings(gtok, gcsrf)); // Pack DP12: httpOnly session cookie
+        appendSetCookies(grr.headers, sessionCookieStrings(gtok, gcsrf, gexp)); // Pack DP12: httpOnly session cookie
         return grr;
       }
       // ---- visitor accounts (public) ----
@@ -22589,10 +22672,11 @@ async function handleRequest(request, env, ctx) {
         await env.LEADS.put('uverify:' + vt, email, { expirationTtl: 7 * 86400 });
         await queueMail(env, { kind: 'verify', to: email, lang: ulang, name: name, token: vt });
         const token = 'u_' + randHex(16);
-        const csrf = randHex(16);
-        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
-        const rr = json({ ok: true, token: token, user: { name: name, email: email, lang: ulang } }, 200, origin);
-        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf)); // Pack DP12: httpOnly session cookie
+        const rexp = Date.now() + 30 * 86400000;
+        const csrf = await deriveCsrf(env, token); // Pack DP12-P2-SERVER (03-M3): derived, not minted
+        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: rexp, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const rr = json({ ok: true, token: token, csrf: csrf, user: { name: name, email: email, lang: ulang } }, 200, origin); // Pack DP12-P2-SERVER (03-H1): csrf in the body
+        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf, rexp)); // Pack DP12: httpOnly session cookie
         return rr;
       }
       if (path === '/api/user/verify' && request.method === 'GET') {
@@ -22636,10 +22720,11 @@ async function handleRequest(request, env, ctx) {
         user.lastLogin = new Date().toISOString();
         if (hashUpgraded || loginStale) await siteKvPut(env, 'user:' + email, JSON.stringify(user)); // write only on hash upgrade or a >24h-stale lastLogin (cycle 26: fewer writes, narrower verify race)
         const token = 'u_' + randHex(16);
-        const csrf = randHex(16);
-        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: Date.now() + 30 * 86400000, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
-        const rr = json({ ok: true, token: token, user: { name: user.name, email: user.email, lang: user.lang } }, 200, origin);
-        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf)); // Pack DP12: httpOnly session cookie
+        const lexp = Date.now() + 30 * 86400000;
+        const csrf = await deriveCsrf(env, token); // Pack DP12-P2-SERVER (03-M3): derived, not minted
+        await siteKvPut(env, await usessKey(token), JSON.stringify({ email: email, exp: lexp, csrf: csrf }), { expirationTtl: 30 * 86400 }); // Pack PMV1: hashed key
+        const rr = json({ ok: true, token: token, csrf: csrf, user: { name: user.name, email: user.email, lang: user.lang } }, 200, origin); // Pack DP12-P2-SERVER (03-H1): csrf in the body
+        appendSetCookies(rr.headers, sessionCookieStrings(token, csrf, lexp)); // Pack DP12: httpOnly session cookie
         return rr;
       }
       // ---- Pack DP12 (F-048): cookie migration endpoints ----
@@ -22647,23 +22732,30 @@ async function handleRequest(request, env, ctx) {
         if (limited('sx:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
         // Bearer ONLY: this endpoint migrates a legacy localStorage session
         // onto the httpOnly cookie. The session itself (token + exp) is
-        // unchanged; a csrf is minted onto the record when it has none.
+        // unchanged; the derived csrf is backfilled onto the record
+        // when it differs (Pack DP12-P2-SERVER, 03-M3).
         const bh = request.headers.get('Authorization') || '';
         if (!/^Bearer (u_[0-9a-f]{32})$/.test(bh)) return json({ ok: false, error: 'auth' }, 401, origin);
         const sess = await userSession(request, env);
         if (!sess || sess.via !== 'bearer') return json({ ok: false, error: 'auth' }, 401, origin);
-        let csrf = sess.csrf;
-        if (!csrf) {
-          csrf = randHex(16);
+        // Pack DP12-P2-SERVER (03-M3): sess.csrf is DERIVED from
+        // the token — there is no mint race and no cache window.
+        // A record still carrying a pre-pack (random) or missing
+        // csrf is backfilled with the SAME derived value:
+        // concurrent exchanges write identical bytes, so the
+        // write converges instead of racing. (03-M2 rotation is
+        // NOT done here — OWNER DECISION PENDING, DESIGN S8.)
+        const csrf = sess.csrf;
+        if (sess.csrfStored !== csrf) {
           let rec = null;
           const rraw = await siteKvGet(env, await usessKey(sess.token));
           if (rraw) { try { rec = JSON.parse(rraw); } catch (e) {} }
-          if (!rec) { const lraw = await env.LEADS.get('usess:' + sess.token); if (lraw) { try { rec = JSON.parse(lraw); } catch (e) {} } }
+          if (!rec) { const lraw = await siteKvGet(env, 'usess:' + sess.token); if (lraw) { try { rec = JSON.parse(lraw); } catch (e) {} } }
           if (rec && rec.email) { rec.csrf = csrf; await siteKvPut(env, await usessKey(sess.token), JSON.stringify(rec), { expirationTtl: Math.max(60, Math.floor((rec.exp - Date.now()) / 1000)) }); }
           sessCache.delete('usess:' + sess.token); // next read sees the record's csrf
         }
-        const xr = json({ ok: true }, 200, origin);
-        appendSetCookies(xr.headers, sessionCookieStrings(sess.token, csrf));
+        const xr = json({ ok: true, csrf: csrf }, 200, origin); // Pack DP12-P2-SERVER (03-H1): csrf in the body
+        appendSetCookies(xr.headers, sessionCookieStrings(sess.token, csrf, sess.exp));
         return xr;
       }
       if (path === '/api/user/logout' && request.method === 'POST') {
@@ -22673,8 +22765,8 @@ async function handleRequest(request, env, ctx) {
         // a forged call achieves is signing someone out.
         const sess = await userSession(request, env);
         if (sess) {
-          try { await env.LEADS.delete(await usessKey(sess.token)); } catch (e) {}
-          try { await env.LEADS.delete('usess:' + sess.token); } catch (e) {} // legacy raw key, if any
+          try { await siteKvDelete(env, await usessKey(sess.token)); } catch (e) {} // Pack DP12-P2-SERVER (03-M4): delete through the spill-aware accessor
+          try { await siteKvDelete(env, 'usess:' + sess.token); } catch (e) {} // legacy raw key, if any
           sessCache.delete('usess:' + sess.token);
         }
         const lr = json({ ok: true }, 200, origin);
@@ -22683,8 +22775,9 @@ async function handleRequest(request, env, ctx) {
       }
       if (path === '/api/user/me' && request.method === 'GET') {
         if (limited(ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-        const email = await userAuth(request, env);
-        if (!email) return json({ ok: false, error: 'auth' }, 401, origin);
+        const sess = await userSession(request, env); // Pack DP12-P2-SERVER (03-H1): session resolved directly so /me can carry the csrf
+        if (!sess) return json({ ok: false, error: 'auth' }, 401, origin);
+        const email = sess.email;
         const raw = await siteKvGet(env, 'user:' + email);
         let user = { name: '', email: email, lang: 'en' };
         if (raw) { try { user = JSON.parse(raw); } catch (e) {} }
@@ -22700,7 +22793,7 @@ async function handleRequest(request, env, ctx) {
         // verified mirrors emailVerified() exactly (same record logic),
         // so the site's verify-email hint renders off the same truth.
         const verified = await emailVerified(env, email);
-        return json({ ok: true, user: { name: user.name, email: user.email, lang: user.lang }, verified: verified, profile: user.profile || {}, saved: savedList, savedPrices: savePrices, priceDrops: drops, recent: recent, searches: await userSearches(env, email) }, 200, origin);
+        return json({ ok: true, csrf: sess.csrf, user: { name: user.name, email: user.email, lang: user.lang }, verified: verified, profile: user.profile || {}, saved: savedList, savedPrices: savePrices, priceDrops: drops, recent: recent, searches: await userSearches(env, email) }, 200, origin); // Pack DP12-P2-SERVER (03-H1): csrf in the body
       }
       if (path === '/api/user/save' && request.method === 'POST') {
         if (limited('sv:' + ip, 60, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
@@ -30675,6 +30768,10 @@ export default {
   async fetch(request, env, ctx) {
     let resp;
     try { resp = await handleRequest(request, env, ctx); } catch (e) { console.error(e); resp = new Response(JSON.stringify({ ok: false, error: 'server' }), { status: 500, headers: { 'Content-Type': 'application/json' } }); } // a preamble throw must not surface as a raw platform error (cycle 30, Claude M8)
+    // Pack DP12-P2-SERVER (03-M1): a /api/user/* 401 for a request
+    // that presented a dead ehsess cookie clears both session
+    // cookies, so the stale cookie stops shadowing the client.
+    try { if (resp && resp.status === 401 && deadCookieReqs.has(request) && new URL(request.url).pathname.startsWith('/api/user/')) appendSetCookies(resp.headers, clearSessionCookieStrings()); } catch (e) {}
     // Cycle 26 (Claude H1): this bump used to run pre-routing on EVERY
     // non-GET request, so an unauthenticated junk POST burned a KV write and
     // cold-cleared every admin cache. It now fires only after a mutating
