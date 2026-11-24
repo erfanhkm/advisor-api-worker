@@ -20,6 +20,14 @@ workers_dev = true
 # when SITE_API_BASE or the secret is absent.
 SCOPE = "academy"
 SITE_API_BASE = "https://advisor-api.erfanbillion.workers.dev"
+# Pack AcademyD1Migration (Stage 1, 2026-11-24): academy storage
+# switch. 'kv' = today's behaviour (KV + spillway). The cutover is
+# flipping this ONE var to 'd1' AFTER the migration tool's verify
+# phase passes (packs/ACADEMY-D1-MIGRATION/DESIGN.md §8); rollback is
+# flipping it back — KV data is never deleted. The data layer also
+# requires SCOPE='academy' (above) and the ACAD_DB binding (below),
+# so this var alone can never affect the site deployment.
+ACADEMY_STORE = "kv"
 
 # The business account's ACADEMY namespace, bound under the SAME name
 # the code expects (env.LEADS). Academy data only: academy:* student
@@ -28,6 +36,18 @@ SITE_API_BASE = "https://advisor-api.erfanbillion.workers.dev"
 [[kv_namespaces]]
 binding = "LEADS"
 id = "4b95ef2b634b49319ada09aefe5fb9c1"
+
+# Pack AcademyD1Migration (Stage 1, 2026-11-24): the academy's D1
+# database on THIS (business) account. Binding name ACAD_DB is what
+# the data layer gates on (acadD1() in worker.js) — a short, stable,
+# family-scoped name in the same style as the existing LEADS /
+# ACADEMY_VIDEO bindings; the database itself is named eh-academy.
+# The KV binding above STAYS bound after cutover: cfg:* keys remain
+# in KV by design, and KV is the rollback store.
+[[d1_databases]]
+binding = "ACAD_DB"
+database_name = "eh-academy"
+database_id = "ffc77642-e040-4024-821d-12c8ec30d783"
 
 # NO [triggers] section on purpose: no cron is registered on the
 # business account (the personal deployment keeps the nightly one;

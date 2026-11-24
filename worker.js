@@ -3835,7 +3835,7 @@ async function eb3ActOne(env, ref, action, body, ip) {
       if (rec.sent) return done(409, false, 'refused', 'already_sent');
       await env.LEADS.delete('mailq:' + id);
       await idxRemove(env, 'mailq', id);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mailq_discard_eb3', target: id, ip: ip || '', at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await acadAuditPut(env, JSON.stringify({ action: 'mailq_discard_eb3', target: id, ip: ip || '', at: new Date().toISOString() })); } catch (e) {}
       return done(200, true, 'rejected', '', { via: 'native-delete' });
     }
     if (action === 'edit') {
@@ -9436,7 +9436,7 @@ const EB8_ACADEMY_PROBES = {
   academy_counts: async function (env) {
     let students = 0, contentUpdatedAt = null;
     try { const ks = await listAllKeys(env, 'academy:', 2000); students = ks.length; } catch (e) {}
-    try { contentUpdatedAt = await env.LEADS.get('academy:contentUpdatedAt'); } catch (e) {}
+    try { contentUpdatedAt = await acadRawGet(env, 'academy:contentUpdatedAt'); } catch (e) {}
     return { students: students, contentUpdatedAt: contentUpdatedAt || null };
   },
   academy_cfg: async function (env) {
@@ -10854,7 +10854,7 @@ async function mailReleaseSend(env, mid, ip) {
   if (!out.ok) {
     rec.sendState = { state: 'failed', at: new Date().toISOString(), errorClass: out.errorClass || 'unknown', attempts: attempts };
     await siteKvPut(env, 'mailq:' + mid, JSON.stringify(rec));
-    try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_release_failed', target: mid, ip: ip, at: new Date().toISOString(), detail: { errorClass: rec.sendState.errorClass, attempts: attempts } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+    try { await acadAuditPut(env, JSON.stringify({ action: 'mail_release_failed', target: mid, ip: ip, at: new Date().toISOString(), detail: { errorClass: rec.sendState.errorClass, attempts: attempts } })); } catch (e) {}
     return { status: 502, body: { ok: false, error: 'send_failed', errorClass: rec.sendState.errorClass, attempts: attempts } };
   }
   rec.sent = true;
@@ -10862,7 +10862,7 @@ async function mailReleaseSend(env, mid, ip) {
   rec.providerId = out.id;
   rec.sendState = { state: 'sent', at: rec.sent_at, attempts: attempts, providerId: out.id };
   await siteKvPut(env, 'mailq:' + mid, JSON.stringify(rec), { expirationTtl: 90 * 86400 }); // the PU-04F convention: sent records age out
-  try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_release_sent', target: mid, ip: ip, at: rec.sent_at, detail: { provider: 'resend', providerId: out.id, kind: rec.kind || '' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+  try { await acadAuditPut(env, JSON.stringify({ action: 'mail_release_sent', target: mid, ip: ip, at: rec.sent_at, detail: { provider: 'resend', providerId: out.id, kind: rec.kind || '' } })); } catch (e) {}
   if (rec.aiText) { try { await brainOutcome(env, { type: 'draft_approved', ref: rec.ref || '', edited: !!rec.aiEdited }); } catch (e) {} } // the PU-04F feedback-loop hook, preserved
   return { status: 200, body: { ok: true, sent: true, providerId: out.id } };
 }
@@ -13580,6 +13580,8 @@ async function catalogSnapRebuild(env) {
   } catch (e) { console.error('catalog snapshot rebuild failed: ' + (e && e.message || e)); return false; }
 }
 async function listAllKeys(env, prefix, cap) {
+  const d1k = await acadListKeys(env, prefix, cap);
+  if (d1k !== null) return d1k;
   const keys = [];
   let cursor;
   do {
@@ -13593,6 +13595,8 @@ async function listAllKeys(env, prefix, cap) {
 // actually drained (list_complete) before the cap — a capped result
 // must never be treated as the full keyspace (R-03 N5).
 async function listAllKeysC(env, prefix, cap) {
+  const d1k = await acadListKeysC(env, prefix, cap);
+  if (d1k !== null) return d1k;
   const keys = [];
   let cursor;
   do {
@@ -13685,10 +13689,10 @@ function scopeOf(env) { const s = env && env.SCOPE ? String(env.SCOPE) : ''; ret
 // its own errors: a stamp failure must never fail the content write
 // it rides on.
 async function bumpAcademyContent(env) {
-  try { await env.LEADS.put('academy:contentUpdatedAt', new Date().toISOString()); } catch (e) {}
+  try { await acadRawPut(env, 'academy:contentUpdatedAt', new Date().toISOString()); } catch (e) {}
 }
 async function academyContentUpdatedAt(env) {
-  try { const v = await env.LEADS.get('academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
+  try { const v = await acadRawGet(env, 'academy:contentUpdatedAt'); return (typeof v === 'string' && v) ? v : null; } catch (e) { return null; }
 }
 /* Pack KvWriteDiscipline (2026-11-12): seed write budget.
    Incident #3 (2026-11-12) burned the ACADEMY KV daily put
@@ -13713,9 +13717,9 @@ async function academyContentUpdatedAt(env) {
    absorbs both. */
 const SEED_PUT_BUDGET = 400;
 function seedRunIdOf(d) { const r = (d && typeof d.runId === 'string') ? d.runId : ''; return /^[A-Za-z0-9._-]{1,64}$/.test(r) ? r : ''; }
-async function seedRunUsed(env, runId) { if (!runId) return 0; try { const c = await env.LEADS.get('seedrun:' + runId, { type: 'json' }); return (c && typeof c.puts === 'number' && isFinite(c.puts) && c.puts > 0) ? Math.floor(c.puts) : 0; } catch (e) { return 0; } }
+async function seedRunUsed(env, runId) { if (!runId) return 0; try { const c = await acadRawGet(env, 'seedrun:' + runId, { type: 'json' }); return (c && typeof c.puts === 'number' && isFinite(c.puts) && c.puts > 0) ? Math.floor(c.puts) : 0; } catch (e) { return 0; } }
 async function seedRunGuard(env, runId, projected) { const used = await seedRunUsed(env, runId); return (used + projected > SEED_PUT_BUDGET) ? { ok: false, used: used } : { ok: true, used: used }; }
-async function seedRunCommit(env, runId, used, puts) { if (!runId) return; try { await env.LEADS.put('seedrun:' + runId, JSON.stringify({ puts: used + puts, updatedAt: new Date().toISOString() }), { expirationTtl: 7 * 86400 }); } catch (e) {} }
+async function seedRunCommit(env, runId, used, puts) { if (!runId) return; try { await acadRawPut(env, 'seedrun:' + runId, JSON.stringify({ puts: used + puts, updatedAt: new Date().toISOString() }), 7 * 86400); } catch (e) {} }
 function scopeIsAcademyPath(path) { return path === '/api/academy' || path.indexOf('/api/academy/') === 0 || path === '/api/admin/academy' || path.indexOf('/api/admin/academy/') === 0 || path === '/api/health'; }
 function scopeAllows(env, path) { const sc = scopeOf(env); if (!sc) return true; if (path === '/api/internal/session-check') return sc === 'site'; if (path === '/api/internal/academy/student-delete') return sc === 'academy'; if (path === '/api/admin/academy/purge-student') return sc === 'site'; if (path === '/api/internal/academy/booklet-seed') return sc === 'academy'; if (path === '/api/admin/academy/booklet-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/tutor-seed') return sc === 'academy'; if (path === '/api/admin/academy/tutor-seed-proxy') return sc === 'site'; if (path === '/api/internal/academy/r2-mig') return sc === 'academy'; if (path === '/api/admin/academy/r2-mig-proxy') return sc === 'site'; if (path === '/api/internal/academy/itsupport') return sc === 'academy'; if (path === '/api/internal/academy/usage') return sc === 'academy'; if (path === '/api/internal/academy/kv-drain') return sc === 'academy'; if (path === '/api/internal/site/kv-spill') return sc === 'academy'; if (path === '/api/internal/site/kv-drain') return sc === 'site'; return sc === 'academy' ? scopeIsAcademyPath(path) : !scopeIsAcademyPath(path) || path === '/api/health'; }
 /* Bridge positive cache (per isolate, 60 s): a validated admin token
@@ -14146,6 +14150,7 @@ function spillBucket(env) {
 }
 async function spillObjKey(key) { return SPILL_PREFIX + (await sha256hex(key)) + '.json'; }
 async function acadKvPut(env, key, value, ttlSeconds) {
+  if (acadD1(env)) { const rD = await acadStorePut(env, key, value, ttlSeconds); if (rD !== ACAD_STORE_MISS) return; }
   const opts = (typeof ttlSeconds === 'number' && ttlSeconds > 0) ? { expirationTtl: ttlSeconds } : undefined;
   try { await env.LEADS.put(key, value, opts); return; }
   catch (kvErr) {
@@ -14157,6 +14162,7 @@ async function acadKvPut(env, key, value, ttlSeconds) {
   }
 }
 async function acadKvGet(env, key, opts) {
+  if (acadD1(env)) { const rD = await acadStoreGet(env, key, opts); if (rD !== ACAD_STORE_MISS) return rD; }
   const bucket = spillBucket(env);
   if (bucket) {
     // Pack Line1FixA (F5, 2026-11-12): the KV read starts
@@ -14183,6 +14189,7 @@ async function acadKvGet(env, key, opts) {
   return await env.LEADS.get(key, opts);
 }
 async function acadKvDelete(env, key) {
+  if (acadD1(env)) { const rD = await acadStoreDelete(env, key); if (rD !== ACAD_STORE_MISS) return; }
   let kvErr = null;
   try { await env.LEADS.delete(key); } catch (e) { kvErr = e; }
   const bucket = spillBucket(env);
@@ -14210,6 +14217,631 @@ async function spillEach(env, fn) {
     cursor = lr.cursor;
   }
 }
+
+/* ================= Pack AcademyD1Migration (Stage 1, 2026-11-24) ====
+   ACADEMY-D1-LAYER-BEGIN
+   Storage switch for the ACADEMY deployment: the academy's KV
+   families move to the D1 database `eh-academy` (binding ACAD_DB),
+   booklet binaries to R2 objects (booklets/ prefix in the existing
+   ACADEMY_VIDEO bucket, indexed in D1). cfg:* keys STAY in KV
+   (config, not data). Design: packs/ACADEMY-D1-MIGRATION/DESIGN.md.
+
+   The switch is gated THREE ways, all required:
+     1. scopeOf(env) === 'academy'  — the SITE deployment (same file)
+        can never enter: its behaviour stays byte-identical.
+     2. env.ACADEMY_STORE === 'd1'  — a var that exists ONLY in
+        wrangler.academy.toml; the cutover is flipping it from 'kv'.
+     3. env.ACAD_DB is a D1 binding — absent on every other config.
+   With any gate closed, every helper below reduces to the exact
+   pre-migration KV behaviour (the KV binding stays bound as the
+   fallback store; KV data is never deleted by the cutover).
+
+   Semantics mirrored from KV:
+   - TTLs become an expires_at column (epoch-ms); every read filters
+     expired rows out (expired = absent) and deletes them
+     opportunistically. There is NO reaper cron (account trigger
+     budget) — lazy expiry is the only enforcement, by design.
+   - Whole-doc RMW families (progress, attempts, quiz sessions,
+     corpus/bank docs) keep their document shape in a doc_json
+     column, byte-verbatim. Structured families (students, sessions,
+     mistakes, readiness, counters, acsec, audit) map to columns.
+   - Tutor usage counters become ATOMIC upserts (the KV RMW race
+     documented at tutorUsageBump is fixed by the store, on purpose).
+   - Prefix scans are served by acadListKeys(), which synthesises
+     KV-shaped key names from indexed queries.
+   Unmapped keys return the ACAD_STORE_MISS sentinel and callers fall
+   back to the raw KV path — a key family can never be silently
+   redirected to the wrong store. */
+const ACAD_STORE_MISS = { acadStoreMiss: true };
+function acadD1(env) {
+  if (!env || scopeOf(env) !== 'academy') return null;
+  if (String(env.ACADEMY_STORE || '') !== 'd1') return null;
+  const db = env.ACAD_DB;
+  return (db && typeof db.prepare === 'function') ? db : null;
+}
+function acadD1Exp(ttlSeconds) { return (typeof ttlSeconds === 'number' && ttlSeconds > 0) ? Date.now() + Math.round(ttlSeconds * 1000) : null; }
+function acadJParse(s) { if (typeof s !== 'string') return null; try { return JSON.parse(s); } catch (e) { return null; } }
+function acadExpired(row, now) { return !!row && row.expires_at !== null && row.expires_at !== undefined && Number(row.expires_at) <= now; }
+
+/* Key router: KV key -> family descriptor. Order matters (specific
+   prefixes before their parents). Returns null for unmapped keys. */
+function acadParseKey(key) {
+  if (typeof key !== 'string' || !key) return null;
+  if (key === 'academy:contentUpdatedAt') return { fam: 'content_meta' };
+  let rest, i;
+  if (key.indexOf('academy:snap:') === 0) return { fam: 'snap', email: key.slice(13) };
+  if (key.indexOf('academy:') === 0) return { fam: 'student', email: key.slice(8) };
+  if (key.indexOf('stok:') === 0) return { fam: 'session', hash: key.slice(5) };
+  if (key.indexOf('acsetpw:') === 0) return { fam: 'setpw', hash: key.slice(8) };
+  if (key.indexOf('acloginlock:') === 0) return { fam: 'lock', email: key.slice(12) };
+  if (key.indexOf('acprogress:') === 0) return { fam: 'progress', email: key.slice(11) };
+  if (key.indexOf('acattempt:') === 0) { rest = key.slice(10); i = rest.indexOf(':'); if (i < 1) return null; return { fam: 'attempt', email: rest.slice(0, i), lesson: rest.slice(i + 1) }; }
+  if (key.indexOf('acmistakes:') === 0) return { fam: 'mistakes', email: key.slice(11) };
+  if (key.indexOf('acready:') === 0) return { fam: 'ready', email: key.slice(8) };
+  if (key.indexOf('acquiz:') === 0) { rest = key.slice(7); i = rest.indexOf(':'); if (i < 1) return null; return { fam: 'quiz', email: rest.slice(0, i), attempt: rest.slice(i + 1) }; }
+  if (key.indexOf('acsec:count:') === 0) { rest = key.slice(12); if (rest.charAt(10) !== ':') return null; return { fam: 'acsec_count', day: rest.slice(0, 10), email: rest.slice(11) }; }
+  if (key.indexOf('acsec:flag:') === 0) { rest = key.slice(11); if (rest.charAt(10) !== ':') return null; return { fam: 'acsec_flag', day: rest.slice(0, 10), email: rest.slice(11) }; }
+  if (key.indexOf('tutor:thread:') === 0) return { fam: 'thread', email: key.slice(13) };
+  if (key.indexOf('tutor:miscon:') === 0) return { fam: 'miscon', email: key.slice(13) };
+  if (key.indexOf('tutor:usage:') === 0) { rest = key.slice(12); if (rest.charAt(10) !== ':') return null; return { fam: 'counter', kind: 'usage', day: rest.slice(0, 10), scope: rest.slice(11) }; }
+  if (key.indexOf('tutor:voiceusage:') === 0) { rest = key.slice(17); if (rest.charAt(10) !== ':') return null; return { fam: 'counter', kind: 'voice', day: rest.slice(0, 10), scope: rest.slice(11) }; }
+  if (key.indexOf('tutor:verify:') === 0) return { fam: 'verify', day: key.slice(13) };
+  if (key.indexOf('tutor:gaps:') === 0) return { fam: 'gaps', day: key.slice(11) };
+  if (key.indexOf('tutor:feedback-down:') === 0) return { fam: 'fbdown', day: key.slice(20) };
+  if (key.indexOf('tutor:feedback:') === 0) return { fam: 'feedback', day: key.slice(15) };
+  if (key === 'tutor:corpus:v2:glossary') return { fam: 'corpus', family: 'corpus_v2', lang: '', module: 'glossary' };
+  if (key.indexOf('tutor:corpus:v2:') === 0) { rest = key.slice(16); i = rest.indexOf(':'); if (i < 0) return null; return { fam: 'corpus', family: 'corpus_v2', lang: rest.slice(0, i), module: rest.slice(i + 1) }; }
+  if (key.indexOf('tutor:corpus:') === 0) { rest = key.slice(13); i = rest.indexOf(':'); if (i < 0) return null; return { fam: 'corpus', family: 'corpus_v1', lang: rest.slice(0, i), module: rest.slice(i + 1) }; }
+  if (key.indexOf('tutor:bank:') === 0) { rest = key.slice(11); i = rest.indexOf(':'); if (i < 0) return null; return { fam: 'bank', lang: rest.slice(0, i), module: rest.slice(i + 1) }; }
+  if (key.indexOf('stripe:evt:') === 0) return { fam: 'stripe', id: key.slice(11) };
+  if (key.indexOf('audit:') === 0) { rest = key.slice(6); i = rest.indexOf(':'); if (i < 1) return null; const ms = Number(rest.slice(0, i)); if (!isFinite(ms)) return null; return { fam: 'audit', atMs: ms, rand: rest.slice(i + 1) }; }
+  if (key.indexOf('seedrun:') === 0) return { fam: 'seedrun', id: key.slice(8) };
+  if (key.indexOf('booklet:') === 0) { const m = /^booklet:(module|lesson):([^:]+):([a-z]{2})$/.exec(key); if (m) return { fam: 'booklet', kind: m[1], id: m[2], lang: m[3] }; return null; }
+  return null;
+}
+
+/* ---- students: profile split (pw into columns; profile_json holds
+   the doc minus pw, verbatim field set incl. explicit nulls) ---- */
+const ACAD_STUDENT_COLS = [['name', 'name'], ['product', 'product'], ['status', 'status'], ['accessMonths', 'access_months'], ['activatedAt', 'activated_at'], ['expiresAt', 'expires_at'], ['source', 'source'], ['createdBy', 'created_by'], ['createdAt', 'created_at'], ['updatedAt', 'updated_at'], ['blockedAt', 'blocked_at'], ['blockReason', 'block_reason'], ['note', 'note']];
+function acadStudentEncode(doc) {
+  const cols = {};
+  for (const pair of ACAD_STUDENT_COLS) { const v = doc[pair[0]]; cols[pair[1]] = (v === undefined ? null : v); }
+  const pw = (doc.pw && typeof doc.pw === 'object') ? doc.pw : null;
+  return {
+    cols: cols,
+    pw: pw ? { algo: pw.algo || null, iter: (typeof pw.iter === 'number' ? pw.iter : null), salt: pw.salt || null, hash: pw.hash || null, setAt: pw.setAt || null } : null
+  };
+}
+function acadStudentDecode(row) {
+  // profile_json is the authoritative field set (it is the KV doc
+  // minus pw, so explicit nulls and unknown fields survive verbatim);
+  // the split columns are mirrors for indexing/admin queries only and
+  // are never read back into the doc.
+  let doc = acadJParse(row.profile_json) || {};
+  doc.email = row.email;
+  if (row.pw_hash) {
+    const pw = {};
+    if (row.pw_algo) pw.algo = row.pw_algo;
+    if (row.pw_iter !== null && row.pw_iter !== undefined) pw.iter = row.pw_iter;
+    if (row.pw_salt) pw.salt = row.pw_salt;
+    pw.hash = row.pw_hash;
+    if (row.pw_set_at) pw.setAt = row.pw_set_at;
+    doc.pw = pw;
+  }
+  return doc;
+}
+
+/* ---- generic store: get ------------------------------------------------
+   Returns the KV value STRING (or its {type:'json'} parse), null when
+   absent/expired, ACAD_STORE_MISS when the key family is unmapped or
+   the switch is off. D1 errors throw, mirroring KV error posture. */
+async function acadStoreGet(env, key, opts) {
+  const db = acadD1(env);
+  if (!db) return ACAD_STORE_MISS;
+  const p = acadParseKey(key);
+  if (!p || p.fam === 'booklet') return ACAD_STORE_MISS;
+  const now = Date.now();
+  let str = null;
+  let expiredStmt = null;
+  if (p.fam === 'content_meta') {
+    const row = await db.prepare('SELECT content_updated_at FROM content_meta WHERE id = 1').first();
+    str = (row && row.content_updated_at) ? String(row.content_updated_at) : null;
+  } else if (p.fam === 'student') {
+    const row = await db.prepare('SELECT * FROM students WHERE email = ?').bind(p.email).first();
+    if (row) str = JSON.stringify(acadStudentDecode(row));
+  } else if (p.fam === 'snap') {
+    const row = await db.prepare('SELECT per_module_mastery_json, ts FROM cohort_snapshots WHERE email = ?').bind(p.email).first();
+    if (row) str = JSON.stringify({ perModuleMastery: acadJParse(row.per_module_mastery_json) || {}, ts: row.ts });
+  } else if (p.fam === 'session') {
+    const row = await db.prepare('SELECT email, exp_ms, remember, renewed_day, expires_at FROM student_sessions WHERE token_hash = ?').bind(p.hash).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ email: row.email, exp: row.exp_ms, remember: !!row.remember, renewedDay: row.renewed_day });
+    else if (row) expiredStmt = db.prepare('DELETE FROM student_sessions WHERE token_hash = ?').bind(p.hash);
+  } else if (p.fam === 'setpw') {
+    const row = await db.prepare('SELECT email, exp_ms, expires_at FROM setpw_tokens WHERE token_hash = ?').bind(p.hash).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ email: row.email, exp: row.exp_ms });
+    else if (row) expiredStmt = db.prepare('DELETE FROM setpw_tokens WHERE token_hash = ?').bind(p.hash);
+  } else if (p.fam === 'lock') {
+    const row = await db.prepare('SELECT fails, locked_until, expires_at FROM login_locks WHERE email = ?').bind(p.email).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ fails: row.fails, lockedUntil: row.locked_until });
+    else if (row) expiredStmt = db.prepare('DELETE FROM login_locks WHERE email = ?').bind(p.email);
+  } else if (p.fam === 'progress') {
+    const row = await db.prepare('SELECT doc_json FROM progress WHERE email = ?').bind(p.email).first();
+    if (row) str = row.doc_json;
+  } else if (p.fam === 'attempt') {
+    const row = await db.prepare('SELECT doc_json FROM attempts WHERE email = ? AND lesson_id = ?').bind(p.email, p.lesson).first();
+    if (row) str = row.doc_json;
+  } else if (p.fam === 'mistakes') {
+    const roll = await db.prepare('SELECT total_ever, resolved_ever FROM mistakes_rollup WHERE email = ?').bind(p.email).first();
+    if (roll) {
+      const items = await db.prepare('SELECT item_json FROM mistake_items WHERE email = ? ORDER BY idx ASC').bind(p.email).all();
+      const arr = ((items && items.results) || []).map(function (r) { return acadJParse(r.item_json); });
+      str = JSON.stringify({ items: arr, totalEver: roll.total_ever, resolvedEver: roll.resolved_ever });
+    }
+  } else if (p.fam === 'ready') {
+    const row = await db.prepare('SELECT score, components_json, gate_json, updated_at FROM readiness WHERE email = ?').bind(p.email).first();
+    if (row) {
+      const hist = await db.prepare('SELECT at_ms, score FROM readiness_snapshots WHERE email = ? ORDER BY idx ASC').bind(p.email).all();
+      const doc = { history: ((hist && hist.results) || []).map(function (r) { return { score: r.score, at: r.at_ms }; }) };
+      if (row.score !== null && row.score !== undefined) doc.score = row.score;
+      if (row.components_json) doc.components = acadJParse(row.components_json);
+      if (row.gate_json) doc.gate = acadJParse(row.gate_json);
+      if (row.updated_at) doc.updatedAt = row.updated_at;
+      str = JSON.stringify(doc);
+    }
+  } else if (p.fam === 'quiz') {
+    const row = await db.prepare('SELECT doc_json, expires_at FROM quiz_sessions WHERE email = ? AND attempt_id = ?').bind(p.email, p.attempt).first();
+    if (row && !acadExpired(row, now)) str = row.doc_json;
+    else if (row) expiredStmt = db.prepare('DELETE FROM quiz_sessions WHERE email = ? AND attempt_id = ?').bind(p.email, p.attempt);
+  } else if (p.fam === 'acsec_count' || p.fam === 'acsec_flag') {
+    const row = await db.prepare('SELECT * FROM acsec_daily WHERE day = ? AND email = ?').bind(p.day, p.email).first();
+    if (row && !acadExpired(row, now)) {
+      if (p.fam === 'acsec_count' && row.booklet_gets !== null && row.booklet_gets !== undefined) {
+        str = JSON.stringify({ email: p.email, day: p.day, bookletGets: row.booklet_gets, booklets: acadJParse(row.booklets_json) || [], quizServes: row.quiz_serves, videoTokens: row.video_tokens, updatedAt: row.count_updated_at });
+      } else if (p.fam === 'acsec_flag' && row.flag_reasons_json) {
+        str = JSON.stringify({ email: p.email, day: p.day, reasons: acadJParse(row.flag_reasons_json) || [], flaggedAt: row.flagged_at });
+      }
+    } else if (row) expiredStmt = db.prepare('DELETE FROM acsec_daily WHERE day = ? AND email = ?').bind(p.day, p.email);
+  } else if (p.fam === 'thread') {
+    const row = await db.prepare('SELECT messages_json, state_json, updated_at, expires_at FROM tutor_threads WHERE email = ?').bind(p.email).first();
+    if (row && !acadExpired(row, now)) {
+      const doc = { messages: acadJParse(row.messages_json) || [], updatedAt: row.updated_at };
+      if (row.state_json) doc.state = acadJParse(row.state_json);
+      str = JSON.stringify(doc);
+    } else if (row) expiredStmt = db.prepare('DELETE FROM tutor_threads WHERE email = ?').bind(p.email);
+  } else if (p.fam === 'miscon') {
+    const row = await db.prepare('SELECT items_json FROM tutor_misconceptions WHERE email = ?').bind(p.email).first();
+    if (row) str = JSON.stringify({ items: acadJParse(row.items_json) || [] });
+  } else if (p.fam === 'counter') {
+    const row = await db.prepare('SELECT count, expires_at FROM tutor_counters WHERE kind = ? AND day = ? AND scope = ?').bind(p.kind, p.day, p.scope).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ count: row.count });
+    else if (row) expiredStmt = db.prepare('DELETE FROM tutor_counters WHERE kind = ? AND day = ? AND scope = ?').bind(p.kind, p.day, p.scope);
+  } else if (p.fam === 'verify') {
+    const row = await db.prepare('SELECT drafts, clean, regenerated, trimmed, inconclusive, skipped_budget, expires_at FROM tutor_verify_days WHERE day = ?').bind(p.day).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ drafts: row.drafts, clean: row.clean, regenerated: row.regenerated, trimmed: row.trimmed, inconclusive: row.inconclusive, skippedBudget: row.skipped_budget });
+    else if (row) expiredStmt = db.prepare('DELETE FROM tutor_verify_days WHERE day = ?').bind(p.day);
+  } else if (p.fam === 'gaps') {
+    const res = await db.prepare('SELECT q, lang, lesson_id, reason, at, expires_at FROM tutor_gap_items WHERE day = ? ORDER BY idx ASC').bind(p.day).all();
+    const rows = (res && res.results) || [];
+    if (rows.length && !acadExpired(rows[0], now)) str = JSON.stringify({ items: rows.map(function (r) { return { q: r.q, lang: r.lang, lessonId: r.lesson_id, reason: r.reason, at: r.at }; }) });
+    else if (rows.length) expiredStmt = db.prepare('DELETE FROM tutor_gap_items WHERE day = ?').bind(p.day);
+  } else if (p.fam === 'feedback') {
+    const row = await db.prepare('SELECT up_count, down_count, expires_at FROM tutor_feedback_days WHERE day = ?').bind(p.day).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ up: row.up_count, down: row.down_count });
+    else if (row) expiredStmt = db.prepare('DELETE FROM tutor_feedback_days WHERE day = ?').bind(p.day);
+  } else if (p.fam === 'fbdown') {
+    const res = await db.prepare('SELECT excerpt, lang, at, expires_at FROM tutor_feedback_down_items WHERE day = ? ORDER BY idx ASC').bind(p.day).all();
+    const rows = (res && res.results) || [];
+    if (rows.length && !acadExpired(rows[0], now)) str = JSON.stringify({ items: rows.map(function (r) { return { excerpt: r.excerpt, lang: r.lang, at: r.at }; }) });
+    else if (rows.length) expiredStmt = db.prepare('DELETE FROM tutor_feedback_down_items WHERE day = ?').bind(p.day);
+  } else if (p.fam === 'corpus') {
+    const row = await db.prepare('SELECT doc_json FROM corpus_docs WHERE family = ? AND lang = ? AND module = ?').bind(p.family, p.lang, p.module).first();
+    if (row) str = row.doc_json;
+  } else if (p.fam === 'bank') {
+    const row = await db.prepare('SELECT doc_json FROM bank_docs WHERE lang = ? AND module = ?').bind(p.lang, p.module).first();
+    if (row) str = row.doc_json;
+  } else if (p.fam === 'stripe') {
+    const row = await db.prepare('SELECT claimed_at, session, expires_at FROM stripe_events WHERE event_id = ?').bind(p.id).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ at: row.claimed_at, session: row.session });
+    else if (row) expiredStmt = db.prepare('DELETE FROM stripe_events WHERE event_id = ?').bind(p.id);
+  } else if (p.fam === 'audit') {
+    const row = await db.prepare('SELECT value_json, expires_at FROM audit_log WHERE at_ms = ? AND rand = ?').bind(p.atMs, p.rand).first();
+    if (row && !acadExpired(row, now)) str = row.value_json;
+    else if (row) expiredStmt = db.prepare('DELETE FROM audit_log WHERE at_ms = ? AND rand = ?').bind(p.atMs, p.rand);
+  } else if (p.fam === 'seedrun') {
+    const row = await db.prepare('SELECT puts, updated_at, expires_at FROM seed_runs WHERE run_id = ?').bind(p.id).first();
+    if (row && !acadExpired(row, now)) str = JSON.stringify({ puts: row.puts, updatedAt: row.updated_at });
+    else if (row) expiredStmt = db.prepare('DELETE FROM seed_runs WHERE run_id = ?').bind(p.id);
+  }
+  if (expiredStmt) { try { await expiredStmt.run(); } catch (e) {} }
+  if (str === null || str === undefined) return null;
+  if (opts && opts.type === 'json') { try { return JSON.parse(str); } catch (e) { return null; } }
+  return str;
+}
+
+/* ---- generic store: put -------------------------------------------------
+   value is the exact KV value string. Returns true, or ACAD_STORE_MISS
+   for unmapped keys (caller falls back to KV). Throws on D1 errors,
+   mirroring KV put error posture (e.g. the Stripe claim path). */
+async function acadStorePut(env, key, value, ttlSeconds) {
+  const db = acadD1(env);
+  if (!db) return ACAD_STORE_MISS;
+  const p = acadParseKey(key);
+  if (!p || p.fam === 'booklet' || typeof value !== 'string') return ACAD_STORE_MISS;
+  const exp = acadD1Exp(ttlSeconds);
+  if (p.fam === 'content_meta') {
+    await db.prepare('INSERT INTO content_meta (id, content_updated_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET content_updated_at = excluded.content_updated_at').bind(value).run();
+    return true;
+  }
+  const doc = acadJParse(value);
+  if (p.fam === 'student') {
+    if (!doc || typeof doc !== 'object') return ACAD_STORE_MISS;
+    const enc = acadStudentEncode(doc);
+    const restDoc = {};
+    for (const k of Object.keys(doc)) if (k !== 'pw') restDoc[k] = doc[k];
+    const c = enc.cols;
+    await db.prepare('INSERT INTO students (email, name, product, status, access_months, activated_at, expires_at, source, created_by, created_at, updated_at, blocked_at, block_reason, note, pw_algo, pw_iter, pw_salt, pw_hash, pw_set_at, profile_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (email) DO UPDATE SET name=excluded.name, product=excluded.product, status=excluded.status, access_months=excluded.access_months, activated_at=excluded.activated_at, expires_at=excluded.expires_at, source=excluded.source, created_by=excluded.created_by, created_at=excluded.created_at, updated_at=excluded.updated_at, blocked_at=excluded.blocked_at, block_reason=excluded.block_reason, note=excluded.note, pw_algo=excluded.pw_algo, pw_iter=excluded.pw_iter, pw_salt=excluded.pw_salt, pw_hash=excluded.pw_hash, pw_set_at=excluded.pw_set_at, profile_json=excluded.profile_json')
+      .bind(p.email, c.name, c.product, c.status, (typeof c.access_months === 'number' ? c.access_months : null), c.activated_at, c.expires_at, c.source, c.created_by, c.created_at, c.updated_at, c.blocked_at, c.block_reason, c.note, enc.pw ? enc.pw.algo : null, enc.pw ? enc.pw.iter : null, enc.pw ? enc.pw.salt : null, enc.pw ? enc.pw.hash : null, enc.pw ? enc.pw.setAt : null, JSON.stringify(restDoc)).run();
+    return true;
+  }
+  if (!doc || typeof doc !== 'object') return ACAD_STORE_MISS;
+  if (p.fam === 'snap') {
+    await db.prepare('INSERT INTO cohort_snapshots (email, per_module_mastery_json, ts) VALUES (?,?,?) ON CONFLICT (email) DO UPDATE SET per_module_mastery_json = excluded.per_module_mastery_json, ts = excluded.ts')
+      .bind(p.email, JSON.stringify(doc.perModuleMastery || {}), (typeof doc.ts === 'number' ? doc.ts : null)).run();
+    return true;
+  }
+  if (p.fam === 'session') {
+    await db.prepare('INSERT INTO student_sessions (token_hash, email, exp_ms, remember, renewed_day, expires_at) VALUES (?,?,?,?,?,?) ON CONFLICT (token_hash) DO UPDATE SET email = excluded.email, exp_ms = excluded.exp_ms, remember = excluded.remember, renewed_day = excluded.renewed_day, expires_at = excluded.expires_at')
+      .bind(p.hash, String(doc.email || ''), Number(doc.exp) || 0, doc.remember ? 1 : 0, (doc.renewedDay === undefined ? null : doc.renewedDay), exp).run();
+    return true;
+  }
+  if (p.fam === 'setpw') {
+    await db.prepare('INSERT INTO setpw_tokens (token_hash, email, exp_ms, expires_at) VALUES (?,?,?,?) ON CONFLICT (token_hash) DO UPDATE SET email = excluded.email, exp_ms = excluded.exp_ms, expires_at = excluded.expires_at')
+      .bind(p.hash, String(doc.email || ''), Number(doc.exp) || 0, exp).run();
+    return true;
+  }
+  if (p.fam === 'lock') {
+    await db.prepare('INSERT INTO login_locks (email, fails, locked_until, expires_at) VALUES (?,?,?,?) ON CONFLICT (email) DO UPDATE SET fails = excluded.fails, locked_until = excluded.locked_until, expires_at = excluded.expires_at')
+      .bind(p.email, Number(doc.fails) || 0, Number(doc.lockedUntil) || 0, exp).run();
+    return true;
+  }
+  if (p.fam === 'progress') {
+    await db.prepare('INSERT INTO progress (email, doc_json) VALUES (?,?) ON CONFLICT (email) DO UPDATE SET doc_json = excluded.doc_json').bind(p.email, value).run();
+    return true;
+  }
+  if (p.fam === 'attempt') {
+    await db.prepare('INSERT INTO attempts (email, lesson_id, doc_json, count, best, last) VALUES (?,?,?,?,?,?) ON CONFLICT (email, lesson_id) DO UPDATE SET doc_json = excluded.doc_json, count = excluded.count, best = excluded.best, last = excluded.last')
+      .bind(p.email, p.lesson, value, (typeof doc.count === 'number' ? doc.count : null), (typeof doc.best === 'number' ? doc.best : null), (typeof doc.last === 'number' ? doc.last : null)).run();
+    return true;
+  }
+  if (p.fam === 'mistakes') {
+    const items = Array.isArray(doc.items) ? doc.items : [];
+    const stmts = [db.prepare('DELETE FROM mistake_items WHERE email = ?').bind(p.email)];
+    for (let ix = 0; ix < items.length; ix++) {
+      const it = items[ix] || {};
+      stmts.push(db.prepare('INSERT INTO mistake_items (email, idx, qid, lesson_id, module_id, concept, trap, chosen, at_ms, stage, due_at_ms, streak, resolved, resolved_at_ms, reviews, item_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .bind(p.email, ix, it.qid || null, it.lessonId || null, it.moduleId || null, it.concept || null, (it.trap === undefined ? null : it.trap), (it.chosen === undefined ? null : it.chosen), (typeof it.at === 'number' ? it.at : null), (typeof it.stage === 'number' ? it.stage : null), (typeof it.dueAt === 'number' ? it.dueAt : null), (typeof it.streak === 'number' ? it.streak : null), (typeof it.resolved === 'boolean' ? (it.resolved ? 1 : 0) : null), (typeof it.resolvedAt === 'number' ? it.resolvedAt : null), (typeof it.reviews === 'number' ? it.reviews : null), JSON.stringify(it)));
+    }
+    stmts.push(db.prepare('INSERT INTO mistakes_rollup (email, total_ever, resolved_ever) VALUES (?,?,?) ON CONFLICT (email) DO UPDATE SET total_ever = excluded.total_ever, resolved_ever = excluded.resolved_ever')
+      .bind(p.email, Number(doc.totalEver) || 0, Number(doc.resolvedEver) || 0));
+    await db.batch(stmts);
+    return true;
+  }
+  if (p.fam === 'ready') {
+    const hist = Array.isArray(doc.history) ? doc.history : [];
+    const stmts = [
+      db.prepare('INSERT INTO readiness (email, score, components_json, gate_json, updated_at) VALUES (?,?,?,?,?) ON CONFLICT (email) DO UPDATE SET score = excluded.score, components_json = excluded.components_json, gate_json = excluded.gate_json, updated_at = excluded.updated_at')
+        .bind(p.email, (typeof doc.score === 'number' ? doc.score : null), (doc.components ? JSON.stringify(doc.components) : null), (doc.gate ? JSON.stringify(doc.gate) : null), doc.updatedAt || null),
+      db.prepare('DELETE FROM readiness_snapshots WHERE email = ?').bind(p.email)
+    ];
+    for (let ix = 0; ix < hist.length; ix++) {
+      const h = hist[ix] || {};
+      stmts.push(db.prepare('INSERT INTO readiness_snapshots (email, idx, at_ms, score) VALUES (?,?,?,?)').bind(p.email, ix, (typeof h.at === 'number' ? h.at : null), (typeof h.score === 'number' ? h.score : null)));
+    }
+    await db.batch(stmts);
+    return true;
+  }
+  if (p.fam === 'quiz') {
+    await db.prepare('INSERT INTO quiz_sessions (email, attempt_id, lesson_id, lang, doc_json, expires_at) VALUES (?,?,?,?,?,?) ON CONFLICT (email, attempt_id) DO UPDATE SET lesson_id = excluded.lesson_id, lang = excluded.lang, doc_json = excluded.doc_json, expires_at = excluded.expires_at')
+      .bind(p.email, p.attempt, doc.lessonId || null, doc.lang || null, value, exp).run();
+    return true;
+  }
+  if (p.fam === 'acsec_count') {
+    await db.prepare('INSERT INTO acsec_daily (day, email, booklet_gets, booklets_json, quiz_serves, video_tokens, count_updated_at, expires_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (day, email) DO UPDATE SET booklet_gets = excluded.booklet_gets, booklets_json = excluded.booklets_json, quiz_serves = excluded.quiz_serves, video_tokens = excluded.video_tokens, count_updated_at = excluded.count_updated_at, expires_at = excluded.expires_at')
+      .bind(p.day, p.email, Number(doc.bookletGets) || 0, JSON.stringify(Array.isArray(doc.booklets) ? doc.booklets : []), Number(doc.quizServes) || 0, Number(doc.videoTokens) || 0, doc.updatedAt || null, exp).run();
+    return true;
+  }
+  if (p.fam === 'acsec_flag') {
+    await db.prepare('INSERT INTO acsec_daily (day, email, flag_reasons_json, flagged_at, expires_at) VALUES (?,?,?,?,?) ON CONFLICT (day, email) DO UPDATE SET flag_reasons_json = excluded.flag_reasons_json, flagged_at = excluded.flagged_at, expires_at = excluded.expires_at')
+      .bind(p.day, p.email, JSON.stringify(Array.isArray(doc.reasons) ? doc.reasons : []), doc.flaggedAt || null, exp).run();
+    return true;
+  }
+  if (p.fam === 'thread') {
+    await db.prepare('INSERT INTO tutor_threads (email, messages_json, state_json, updated_at, expires_at) VALUES (?,?,?,?,?) ON CONFLICT (email) DO UPDATE SET messages_json = excluded.messages_json, state_json = excluded.state_json, updated_at = excluded.updated_at, expires_at = excluded.expires_at')
+      .bind(p.email, JSON.stringify(Array.isArray(doc.messages) ? doc.messages : []), (doc.state && typeof doc.state === 'object' ? JSON.stringify(doc.state) : null), doc.updatedAt || null, exp).run();
+    return true;
+  }
+  if (p.fam === 'miscon') {
+    await db.prepare('INSERT INTO tutor_misconceptions (email, items_json) VALUES (?,?) ON CONFLICT (email) DO UPDATE SET items_json = excluded.items_json')
+      .bind(p.email, JSON.stringify(Array.isArray(doc.items) ? doc.items : [])).run();
+    return true;
+  }
+  if (p.fam === 'counter') {
+    await db.prepare('INSERT INTO tutor_counters (kind, day, scope, count, expires_at) VALUES (?,?,?,?,?) ON CONFLICT (kind, day, scope) DO UPDATE SET count = excluded.count, expires_at = excluded.expires_at')
+      .bind(p.kind, p.day, p.scope, Number(doc.count) || 0, exp).run();
+    return true;
+  }
+  if (p.fam === 'verify') {
+    await db.prepare('INSERT INTO tutor_verify_days (day, drafts, clean, regenerated, trimmed, inconclusive, skipped_budget, expires_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (day) DO UPDATE SET drafts = excluded.drafts, clean = excluded.clean, regenerated = excluded.regenerated, trimmed = excluded.trimmed, inconclusive = excluded.inconclusive, skipped_budget = excluded.skipped_budget, expires_at = excluded.expires_at')
+      .bind(p.day, Number(doc.drafts) || 0, Number(doc.clean) || 0, Number(doc.regenerated) || 0, Number(doc.trimmed) || 0, Number(doc.inconclusive) || 0, Number(doc.skippedBudget) || 0, exp).run();
+    return true;
+  }
+  if (p.fam === 'gaps') {
+    const items = Array.isArray(doc.items) ? doc.items : [];
+    const stmts = [db.prepare('DELETE FROM tutor_gap_items WHERE day = ?').bind(p.day)];
+    for (let ix = 0; ix < items.length; ix++) {
+      const it = items[ix] || {};
+      stmts.push(db.prepare('INSERT INTO tutor_gap_items (day, idx, q, lang, lesson_id, reason, at, expires_at) VALUES (?,?,?,?,?,?,?,?)')
+        .bind(p.day, ix, (it.q === undefined ? null : it.q), it.lang || null, (it.lessonId === undefined ? null : it.lessonId), it.reason || null, it.at || null, exp));
+    }
+    await db.batch(stmts);
+    return true;
+  }
+  if (p.fam === 'feedback') {
+    await db.prepare('INSERT INTO tutor_feedback_days (day, up_count, down_count, expires_at) VALUES (?,?,?,?) ON CONFLICT (day) DO UPDATE SET up_count = excluded.up_count, down_count = excluded.down_count, expires_at = excluded.expires_at')
+      .bind(p.day, Number(doc.up) || 0, Number(doc.down) || 0, exp).run();
+    return true;
+  }
+  if (p.fam === 'fbdown') {
+    const items = Array.isArray(doc.items) ? doc.items : [];
+    const stmts = [db.prepare('DELETE FROM tutor_feedback_down_items WHERE day = ?').bind(p.day)];
+    for (let ix = 0; ix < items.length; ix++) {
+      const it = items[ix] || {};
+      stmts.push(db.prepare('INSERT INTO tutor_feedback_down_items (day, idx, excerpt, lang, at, expires_at) VALUES (?,?,?,?,?,?)')
+        .bind(p.day, ix, (it.excerpt === undefined ? null : it.excerpt), it.lang || null, it.at || null, exp));
+    }
+    await db.batch(stmts);
+    return true;
+  }
+  if (p.fam === 'corpus') {
+    await db.prepare('INSERT INTO corpus_docs (family, lang, module, doc_json) VALUES (?,?,?,?) ON CONFLICT (family, lang, module) DO UPDATE SET doc_json = excluded.doc_json')
+      .bind(p.family, p.lang, p.module, value).run();
+    return true;
+  }
+  if (p.fam === 'bank') {
+    await db.prepare('INSERT INTO bank_docs (lang, module, doc_json) VALUES (?,?,?) ON CONFLICT (lang, module) DO UPDATE SET doc_json = excluded.doc_json')
+      .bind(p.lang, p.module, value).run();
+    return true;
+  }
+  if (p.fam === 'stripe') {
+    await db.prepare('INSERT INTO stripe_events (event_id, claimed_at, session, expires_at) VALUES (?,?,?,?) ON CONFLICT (event_id) DO UPDATE SET claimed_at = excluded.claimed_at, session = excluded.session, expires_at = excluded.expires_at')
+      .bind(p.id, doc.at || null, (doc.session === undefined ? null : doc.session), exp).run();
+    return true;
+  }
+  if (p.fam === 'audit') {
+    await db.prepare('INSERT INTO audit_log (at_ms, rand, action, target, actor, ip, at, detail_json, value_json, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT (at_ms, rand) DO UPDATE SET action = excluded.action, target = excluded.target, actor = excluded.actor, ip = excluded.ip, at = excluded.at, detail_json = excluded.detail_json, value_json = excluded.value_json, expires_at = excluded.expires_at')
+      .bind(p.atMs, p.rand, doc.action || null, doc.target || null, (doc.actor === undefined ? null : doc.actor), doc.ip || null, doc.at || null, (doc.detail ? JSON.stringify(doc.detail) : null), value, exp).run();
+    return true;
+  }
+  if (p.fam === 'seedrun') {
+    await db.prepare('INSERT INTO seed_runs (run_id, puts, updated_at, expires_at) VALUES (?,?,?,?) ON CONFLICT (run_id) DO UPDATE SET puts = excluded.puts, updated_at = excluded.updated_at, expires_at = excluded.expires_at')
+      .bind(p.id, Number(doc.puts) || 0, doc.updatedAt || null, exp).run();
+    return true;
+  }
+  return ACAD_STORE_MISS;
+}
+
+/* ---- generic store: delete -------------------------------------------- */
+async function acadStoreDelete(env, key) {
+  const db = acadD1(env);
+  if (!db) return ACAD_STORE_MISS;
+  const p = acadParseKey(key);
+  if (!p || p.fam === 'booklet') return ACAD_STORE_MISS;
+  if (p.fam === 'content_meta') { await db.prepare('DELETE FROM content_meta WHERE id = 1').run(); return true; }
+  if (p.fam === 'student') { await db.prepare('DELETE FROM students WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'snap') { await db.prepare('DELETE FROM cohort_snapshots WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'session') { await db.prepare('DELETE FROM student_sessions WHERE token_hash = ?').bind(p.hash).run(); return true; }
+  if (p.fam === 'setpw') { await db.prepare('DELETE FROM setpw_tokens WHERE token_hash = ?').bind(p.hash).run(); return true; }
+  if (p.fam === 'lock') { await db.prepare('DELETE FROM login_locks WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'progress') { await db.prepare('DELETE FROM progress WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'attempt') { await db.prepare('DELETE FROM attempts WHERE email = ? AND lesson_id = ?').bind(p.email, p.lesson).run(); return true; }
+  if (p.fam === 'mistakes') { await db.batch([db.prepare('DELETE FROM mistake_items WHERE email = ?').bind(p.email), db.prepare('DELETE FROM mistakes_rollup WHERE email = ?').bind(p.email)]); return true; }
+  if (p.fam === 'ready') { await db.batch([db.prepare('DELETE FROM readiness_snapshots WHERE email = ?').bind(p.email), db.prepare('DELETE FROM readiness WHERE email = ?').bind(p.email)]); return true; }
+  if (p.fam === 'quiz') { await db.prepare('DELETE FROM quiz_sessions WHERE email = ? AND attempt_id = ?').bind(p.email, p.attempt).run(); return true; }
+  if (p.fam === 'acsec_count') { await db.prepare("UPDATE acsec_daily SET booklet_gets = NULL, booklets_json = NULL, quiz_serves = NULL, video_tokens = NULL, count_updated_at = NULL WHERE day = ? AND email = ?").bind(p.day, p.email).run(); return true; }
+  if (p.fam === 'acsec_flag') { await db.prepare("UPDATE acsec_daily SET flag_reasons_json = NULL, flagged_at = NULL WHERE day = ? AND email = ?").bind(p.day, p.email).run(); return true; }
+  if (p.fam === 'thread') { await db.prepare('DELETE FROM tutor_threads WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'miscon') { await db.prepare('DELETE FROM tutor_misconceptions WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'counter') { await db.prepare('DELETE FROM tutor_counters WHERE kind = ? AND day = ? AND scope = ?').bind(p.kind, p.day, p.scope).run(); return true; }
+  if (p.fam === 'verify') { await db.prepare('DELETE FROM tutor_verify_days WHERE day = ?').bind(p.day).run(); return true; }
+  if (p.fam === 'gaps') { await db.prepare('DELETE FROM tutor_gap_items WHERE day = ?').bind(p.day).run(); return true; }
+  if (p.fam === 'feedback') { await db.prepare('DELETE FROM tutor_feedback_days WHERE day = ?').bind(p.day).run(); return true; }
+  if (p.fam === 'fbdown') { await db.prepare('DELETE FROM tutor_feedback_down_items WHERE day = ?').bind(p.day).run(); return true; }
+  if (p.fam === 'corpus') { await db.prepare('DELETE FROM corpus_docs WHERE family = ? AND lang = ? AND module = ?').bind(p.family, p.lang, p.module).run(); return true; }
+  if (p.fam === 'bank') { await db.prepare('DELETE FROM bank_docs WHERE lang = ? AND module = ?').bind(p.lang, p.module).run(); return true; }
+  if (p.fam === 'stripe') { await db.prepare('DELETE FROM stripe_events WHERE event_id = ?').bind(p.id).run(); return true; }
+  if (p.fam === 'audit') { await db.prepare('DELETE FROM audit_log WHERE at_ms = ? AND rand = ?').bind(p.atMs, p.rand).run(); return true; }
+  if (p.fam === 'seedrun') { await db.prepare('DELETE FROM seed_runs WHERE run_id = ?').bind(p.id).run(); return true; }
+  return ACAD_STORE_MISS;
+}
+
+/* ---- raw-site facade: D1 when the switch is on, else the exact KV
+   call the site used to make. ttlSeconds mirrors KV expirationTtl. */
+async function acadRawGet(env, key, opts) {
+  if (acadD1(env)) { const r = await acadStoreGet(env, key, opts); if (r !== ACAD_STORE_MISS) return r; }
+  return await env.LEADS.get(key, opts);
+}
+async function acadRawPut(env, key, value, ttlSeconds) {
+  if (acadD1(env)) { const r = await acadStorePut(env, key, value, ttlSeconds); if (r !== ACAD_STORE_MISS) return; }
+  const o = (typeof ttlSeconds === 'number' && ttlSeconds > 0) ? { expirationTtl: ttlSeconds } : undefined;
+  await env.LEADS.put(key, value, o);
+}
+async function acadRawDelete(env, key) {
+  if (acadD1(env)) { const r = await acadStoreDelete(env, key); if (r !== ACAD_STORE_MISS) return; }
+  await env.LEADS.delete(key);
+}
+
+/* ---- prefix scans: synthesise KV-shaped key names from D1 ----------
+   Returns [{name}, …] sorted lexicographically (KV list order),
+   expired rows excluded; null when the switch is off or the prefix
+   is outside the academy keyspace (caller falls back to KV list). */
+async function acadListKeys(env, prefix, cap) {
+  const db = acadD1(env);
+  if (!db) return null;
+  const names = await acadD1Names(env, db, prefix);
+  if (names === null) return null;
+  const out = [];
+  for (const n of names) { out.push({ name: n }); if (cap && out.length >= cap) break; }
+  return out;
+}
+async function acadListKeysC(env, prefix, cap) {
+  const keys = await acadListKeys(env, prefix, cap);
+  if (keys === null) return null;
+  return { keys: keys, complete: !(cap && keys.length >= cap) };
+}
+/* KV-list-shaped page for the raw env.LEADS.list call sites. */
+async function acadKvList(env, opts) {
+  if (acadD1(env)) {
+    const keys = await acadListKeys(env, (opts && opts.prefix) || '', (opts && opts.limit) || 1000);
+    if (keys !== null) return { keys: keys, list_complete: true, cursor: undefined };
+  }
+  return await env.LEADS.list(opts);
+}
+async function acadD1Names(env, db, prefix) {
+  const now = Date.now();
+  const LIVE = '(expires_at IS NULL OR expires_at > ' + now + ')';
+  const names = [];
+  const push = function (arr) { for (const n of arr) if (n.indexOf(prefix) === 0) names.push(n); };
+  const all = async function (sql, fmt) { const r = await db.prepare(sql).all(); return ((r && r.results) || []).map(fmt); };
+  const heads = ['academy:', 'stok:', 'acsetpw:', 'acloginlock:', 'acprogress:', 'acattempt:', 'acmistakes:', 'acready:', 'acquiz:', 'acsec:', 'tutor:', 'stripe:evt:', 'audit:', 'seedrun:', 'booklet:'];
+  let inScope = prefix === '';
+  if (!inScope) for (const h of heads) { if (prefix.indexOf(h) === 0 || h.indexOf(prefix) === 0) { inScope = true; break; } }
+  if (!inScope) return null;
+  if ('academy:'.indexOf(prefix) === 0 || prefix.indexOf('academy:') === 0 || prefix === '') {
+    push(await all('SELECT email FROM students', function (r) { return 'academy:' + r.email; }));
+    push(await all('SELECT email FROM cohort_snapshots', function (r) { return 'academy:snap:' + r.email; }));
+    const cm = await db.prepare('SELECT content_updated_at FROM content_meta WHERE id = 1').first();
+    if (cm && cm.content_updated_at) push(['academy:contentUpdatedAt']);
+  }
+  if ('stok:'.indexOf(prefix) === 0 || prefix.indexOf('stok:') === 0 || prefix === '') push(await all('SELECT token_hash FROM student_sessions WHERE ' + LIVE, function (r) { return 'stok:' + r.token_hash; }));
+  if ('acsetpw:'.indexOf(prefix) === 0 || prefix.indexOf('acsetpw:') === 0 || prefix === '') push(await all('SELECT token_hash FROM setpw_tokens WHERE ' + LIVE, function (r) { return 'acsetpw:' + r.token_hash; }));
+  if ('acloginlock:'.indexOf(prefix) === 0 || prefix.indexOf('acloginlock:') === 0 || prefix === '') push(await all('SELECT email FROM login_locks WHERE ' + LIVE, function (r) { return 'acloginlock:' + r.email; }));
+  if ('acprogress:'.indexOf(prefix) === 0 || prefix.indexOf('acprogress:') === 0 || prefix === '') push(await all('SELECT email FROM progress', function (r) { return 'acprogress:' + r.email; }));
+  if ('acattempt:'.indexOf(prefix) === 0 || prefix.indexOf('acattempt:') === 0 || prefix === '') push(await all('SELECT email, lesson_id FROM attempts', function (r) { return 'acattempt:' + r.email + ':' + r.lesson_id; }));
+  if ('acmistakes:'.indexOf(prefix) === 0 || prefix.indexOf('acmistakes:') === 0 || prefix === '') push(await all('SELECT email FROM mistakes_rollup', function (r) { return 'acmistakes:' + r.email; }));
+  if ('acready:'.indexOf(prefix) === 0 || prefix.indexOf('acready:') === 0 || prefix === '') push(await all('SELECT email FROM readiness', function (r) { return 'acready:' + r.email; }));
+  if ('acquiz:'.indexOf(prefix) === 0 || prefix.indexOf('acquiz:') === 0 || prefix === '') push(await all('SELECT email, attempt_id FROM quiz_sessions WHERE ' + LIVE, function (r) { return 'acquiz:' + r.email + ':' + r.attempt_id; }));
+  if ('acsec:'.indexOf(prefix) === 0 || prefix.indexOf('acsec:') === 0 || prefix === '') {
+    push(await all('SELECT day, email FROM acsec_daily WHERE booklet_gets IS NOT NULL AND ' + LIVE, function (r) { return 'acsec:count:' + r.day + ':' + r.email; }));
+    push(await all('SELECT day, email FROM acsec_daily WHERE flag_reasons_json IS NOT NULL AND ' + LIVE, function (r) { return 'acsec:flag:' + r.day + ':' + r.email; }));
+  }
+  if ('tutor:'.indexOf(prefix) === 0 || prefix.indexOf('tutor:') === 0 || prefix === '') {
+    push(await all('SELECT email FROM tutor_threads WHERE ' + LIVE, function (r) { return 'tutor:thread:' + r.email; }));
+    push(await all('SELECT email FROM tutor_misconceptions', function (r) { return 'tutor:miscon:' + r.email; }));
+    push(await all("SELECT day, scope FROM tutor_counters WHERE kind = 'usage' AND " + LIVE, function (r) { return 'tutor:usage:' + r.day + ':' + r.scope; }));
+    push(await all("SELECT day, scope FROM tutor_counters WHERE kind = 'voice' AND " + LIVE, function (r) { return 'tutor:voiceusage:' + r.day + ':' + r.scope; }));
+    push(await all('SELECT day FROM tutor_verify_days WHERE ' + LIVE, function (r) { return 'tutor:verify:' + r.day; }));
+    push(await all('SELECT DISTINCT day FROM tutor_gap_items WHERE ' + LIVE, function (r) { return 'tutor:gaps:' + r.day; }));
+    push(await all('SELECT day FROM tutor_feedback_days WHERE ' + LIVE, function (r) { return 'tutor:feedback:' + r.day; }));
+    push(await all('SELECT DISTINCT day FROM tutor_feedback_down_items WHERE ' + LIVE, function (r) { return 'tutor:feedback-down:' + r.day; }));
+    push(await all("SELECT family, lang, module FROM corpus_docs", function (r) {
+      if (r.family === 'corpus_v2') return r.lang ? ('tutor:corpus:v2:' + r.lang + ':' + r.module) : 'tutor:corpus:v2:glossary';
+      return 'tutor:corpus:' + r.lang + ':' + r.module;
+    }));
+    push(await all('SELECT lang, module FROM bank_docs', function (r) { return 'tutor:bank:' + r.lang + ':' + r.module; }));
+  }
+  if ('stripe:evt:'.indexOf(prefix) === 0 || prefix.indexOf('stripe:evt:') === 0 || prefix === '') push(await all('SELECT event_id FROM stripe_events WHERE ' + LIVE, function (r) { return 'stripe:evt:' + r.event_id; }));
+  if ('audit:'.indexOf(prefix) === 0 || prefix.indexOf('audit:') === 0 || prefix === '') push(await all('SELECT at_ms, rand FROM audit_log WHERE ' + LIVE, function (r) { return 'audit:' + r.at_ms + ':' + r.rand; }));
+  if ('seedrun:'.indexOf(prefix) === 0 || prefix.indexOf('seedrun:') === 0 || prefix === '') push(await all('SELECT run_id FROM seed_runs WHERE ' + LIVE, function (r) { return 'seedrun:' + r.run_id; }));
+  if ('booklet:'.indexOf(prefix) === 0 || prefix.indexOf('booklet:') === 0 || prefix === '') push(await all('SELECT kind, id, lang FROM booklets', function (r) { return 'booklet:' + r.kind + ':' + r.id + ':' + r.lang; }));
+  names.sort();
+  return names;
+}
+
+/* ---- audit writer (academyAudit + every inline audit: put) -------- */
+async function acadAuditPut(env, valueStr) {
+  if (acadD1(env)) {
+    const r = await acadStorePut(env, 'audit:' + Date.now() + ':' + randHex(6), valueStr, 730 * 86400);
+    if (r !== ACAD_STORE_MISS) return;
+  }
+  await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), valueStr, { expirationTtl: 730 * 86400 });
+}
+
+/* ---- kv-drain replay write: in D1 mode the drained envelope lands
+   in D1 (the drain becomes the migration's own merge tool); in KV
+   mode it is the drain's original raw put, byte-identical. */
+async function acadDrainPut(env, key, value, ttlSeconds) {
+  if (acadD1(env)) { const r = await acadStorePut(env, key, value, ttlSeconds); if (r !== ACAD_STORE_MISS) return; }
+  const o = (typeof ttlSeconds === 'number' && ttlSeconds > 0) ? { expirationTtl: ttlSeconds } : undefined;
+  await env.LEADS.put(key, value, o);
+}
+
+/* ---- tutor usage counters: atomic upsert in D1 mode -----------------
+   acadCounterGet returns null when the switch is off (caller uses
+   the KV path); acadCounterBump returns the NEW count. */
+function acadCounterParse(key) {
+  const p = acadParseKey(key);
+  return (p && p.fam === 'counter') ? p : null;
+}
+async function acadCounterGet(env, key) {
+  const db = acadD1(env);
+  if (!db) return null;
+  const p = acadCounterParse(key);
+  if (!p) return 0;
+  const row = await db.prepare('SELECT count, expires_at FROM tutor_counters WHERE kind = ? AND day = ? AND scope = ?').bind(p.kind, p.day, p.scope).first();
+  if (!row || acadExpired(row, Date.now())) return 0;
+  return row.count;
+}
+async function acadCounterBump(env, key) {
+  const db = acadD1(env);
+  if (!db) return null;
+  const p = acadCounterParse(key);
+  if (!p) return 0;
+  const exp = Date.now() + 3 * 86400 * 1000;
+  const row = await db.prepare('INSERT INTO tutor_counters (kind, day, scope, count, expires_at) VALUES (?,?,?,1,?) ON CONFLICT (kind, day, scope) DO UPDATE SET count = count + 1, expires_at = excluded.expires_at RETURNING count')
+    .bind(p.kind, p.day, p.scope, exp).first();
+  return row ? row.count : 0;
+}
+
+/* ---- booklets: binaries in R2, index in D1 ----------------------------
+   R2 key: booklets/<kind>/<id>/<lang>.pdf in the ACADEMY_VIDEO bucket.
+   In KV mode both helpers are the exact raw KV calls the seed/serve
+   routes used to make. acadBookletGetB64 returns the base64 string
+   (the serve path's contract) or null. */
+function acadBookletR2Key(kind, id, lang) { return 'booklets/' + kind + '/' + id + '/' + lang + '.pdf'; }
+async function acadBookletPut(env, key, b64) {
+  if (acadD1(env)) {
+    const p = acadParseKey(key);
+    const bucket = env.ACADEMY_VIDEO;
+    if (p && p.fam === 'booklet' && bucket && typeof bucket.put === 'function') {
+      const bytes = bookletB64Decode(b64);
+      if (!bytes) throw new Error('booklet_decode_failed');
+      const sha = await bookletBytesSha256(bytes);
+      const r2key = acadBookletR2Key(p.kind, p.id, p.lang);
+      await bucket.put(r2key, bytes, { httpMetadata: { contentType: 'application/pdf' } });
+      await acadD1(env).prepare('INSERT INTO booklets (kind, id, lang, r2_key, sha256, bytes, seeded_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT (kind, id, lang) DO UPDATE SET r2_key = excluded.r2_key, sha256 = excluded.sha256, bytes = excluded.bytes, seeded_at = excluded.seeded_at')
+        .bind(p.kind, p.id, p.lang, r2key, sha, bytes.length, new Date().toISOString()).run();
+      return;
+    }
+  }
+  await env.LEADS.put(key, b64);
+}
+async function acadBookletGetB64(env, key) {
+  if (acadD1(env)) {
+    const p = acadParseKey(key);
+    const bucket = env.ACADEMY_VIDEO;
+    if (p && p.fam === 'booklet' && bucket && typeof bucket.get === 'function') {
+      const row = await acadD1(env).prepare('SELECT r2_key FROM booklets WHERE kind = ? AND id = ? AND lang = ?').bind(p.kind, p.id, p.lang).first();
+      if (!row) return null;
+      const obj = await bucket.get(row.r2_key);
+      if (!obj) return null;
+      const buf = new Uint8Array(await obj.arrayBuffer());
+      return acadB64Encode(buf);
+    }
+    return null;
+  }
+  return await env.LEADS.get(key);
+}
+/* ACADEMY-D1-LAYER-END */
 
 /* ================= Pack SiteKvSpillway (resilience P0-2, 2026-11-12) =================
    The MAIN SITE deployment's equivalent of the Academy spillway above,
@@ -14482,7 +15114,7 @@ async function siteSpillDrain(env, opts) {
   const limit = Math.max(1, Math.min(500, parseInt(o.limit, 10) || 200));
   const out = { ok: true, replayed: 0, expired: 0, deleted: 0, conflicts: 0, marked: 0, remaining: 0, stoppedAt: null };
   const finish = async function () {
-    try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'site_kv_drain', target: 'site-kv-overflow', ip: 'internal', at: new Date().toISOString(), detail: { replayed: out.replayed, expired: out.expired, deleted: out.deleted, conflicts: out.conflicts, marked: out.marked, remaining: out.remaining, stoppedAt: out.stoppedAt } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+    try { await acadAuditPut(env, JSON.stringify({ action: 'site_kv_drain', target: 'site-kv-overflow', ip: 'internal', at: new Date().toISOString(), detail: { replayed: out.replayed, expired: out.expired, deleted: out.deleted, conflicts: out.conflicts, marked: out.marked, remaining: out.remaining, stoppedAt: out.stoppedAt } })); } catch (e) {}
     return out;
   };
   const cfg = await siteSpillCfg(env);
@@ -14584,7 +15216,7 @@ async function academyLoadProfile(env, keyName) {
   // — academyPut). Anything else is skipped, never fatal.
   // Single-key readers (academyGet) are deliberately untouched.
   let rec = null;
-  try { rec = await env.LEADS.get(keyName, { type: 'json' }); } catch (e) { return null; }
+  try { rec = await acadRawGet(env, keyName, { type: 'json' }); } catch (e) { return null; }
   if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return null;
   if (typeof rec.email !== 'string' || rec.email.length === 0) return null;
   if (keyName !== 'academy:' + normEmail(rec.email)) return null;
@@ -14644,7 +15276,7 @@ async function academySummary(env, rec, nowMs) {
 async function academyAudit(env, action, target, ip, detail) {
   // §6 verbatim: key 'audit:'+Date.now()+':'+randHex(6), value
   // {action, target, actor, ip, at, detail}, TTL 730 days.
-  try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: action, target: target, actor: 'admin', ip: ip, at: new Date().toISOString(), detail: detail || {} }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+  try { await acadAuditPut(env, JSON.stringify({ action: action, target: target, actor: 'admin', ip: ip, at: new Date().toISOString(), detail: detail || {} })); } catch (e) {}
 }
 async function academyAuditScan(env, pred, cap, limit, budget) {
   // §6.3: bounded newest-first scan of the audit: prefix (newest 1,000).
@@ -14682,7 +15314,7 @@ async function academyAuditScan(env, pred, cap, limit, budget) {
     if (examined >= maxExamined) break;
     examined++;
     let v = null;
-    try { v = await env.LEADS.get(keys[i].name, { type: 'json' }); } catch (e) { v = null; }
+    try { v = await acadRawGet(env, keys[i].name, { type: 'json' }); } catch (e) { v = null; }
     if (v && pred(v)) { out.push(v); if (out.length >= max) break; }
   }
   return out;
@@ -14833,12 +15465,12 @@ async function acadRevokeSessions(env, ne, exceptKey) {
 // One live token per student: minting a new one retires the old.
 async function acadMintSetPwToken(env, ne) {
   for (const k of await listAllKeys(env, 'acsetpw:', 1000)) {
-    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
-    if (rec && normEmail(rec.email || '') === ne) await env.LEADS.delete(k.name);
+    const rec = await acadRawGet(env, k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) await acadRawDelete(env, k.name);
   }
   const token = randHex(32);
   const exp = Date.now() + ACAD_SETPW_TTL_MS;
-  await env.LEADS.put('acsetpw:' + await sha256hex(token), JSON.stringify({ email: ne, exp: exp }), { expirationTtl: Math.floor(ACAD_SETPW_TTL_MS / 1000) });
+  await acadRawPut(env, 'acsetpw:' + await sha256hex(token), JSON.stringify({ email: ne, exp: exp }), Math.floor(ACAD_SETPW_TTL_MS / 1000));
   return { token: token, expiresAt: new Date(exp).toISOString() };
 }
 
@@ -14898,8 +15530,8 @@ async function acadPurgeStudentData(env, ne) {
     await acadKvDelete(env, p + ne);
   }
   for (const k of await listAllKeys(env, 'acsetpw:', 1000)) {
-    const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
-    if (rec && normEmail(rec.email || '') === ne) { await env.LEADS.delete(k.name); keys.push(k.name); }
+    const rec = await acadRawGet(env, k.name, { type: 'json' }).catch(() => null);
+    if (rec && normEmail(rec.email || '') === ne) { await acadRawDelete(env, k.name); keys.push(k.name); }
   }
   const revoked = await acadRevokeSessions(env, ne, null);
   return { keys: keys, sessionsRevoked: revoked };
@@ -15306,14 +15938,14 @@ async function acsecLoad(env, st) {
   if (st.loaded) return st;
   st.loaded = true;
   try {
-    const rec = await env.LEADS.get('acsec:count:' + st.day + ':' + st.email, { type: 'json' });
+    const rec = await acadRawGet(env, 'acsec:count:' + st.day + ':' + st.email, { type: 'json' });
     if (rec) {
       st.bookletGets = Number(rec.bookletGets) || 0;
       for (const b of (Array.isArray(rec.booklets) ? rec.booklets : [])) st.booklets.add(String(b));
       st.quizServes = Number(rec.quizServes) || 0;
       st.videoTokens = Number(rec.videoTokens) || 0;
     }
-    const fl = await env.LEADS.get('acsec:flag:' + st.day + ':' + st.email, { type: 'json' });
+    const fl = await acadRawGet(env, 'acsec:flag:' + st.day + ':' + st.email, { type: 'json' });
     if (fl && Array.isArray(fl.reasons)) for (const r of fl.reasons) { st.reasons.add(String(r)); st.flushedReasons.add(String(r)); }
   } catch (e) {}
   return st;
@@ -15330,9 +15962,9 @@ async function acsecFlush(env, st, force) {
   const reasons = acsecReasons(st);
   const newReason = [...reasons].some(function (r) { return !st.flushedReasons.has(r); });
   try {
-    await env.LEADS.put('acsec:count:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, bookletGets: st.bookletGets, booklets: [...st.booklets], quizServes: st.quizServes, videoTokens: st.videoTokens, updatedAt: new Date().toISOString() }), { expirationTtl: 90 * 86400 });
+    await acadRawPut(env, 'acsec:count:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, bookletGets: st.bookletGets, booklets: [...st.booklets], quizServes: st.quizServes, videoTokens: st.videoTokens, updatedAt: new Date().toISOString() }), 90 * 86400);
     if (newReason) {
-      await env.LEADS.put('acsec:flag:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, reasons: [...reasons], flaggedAt: new Date().toISOString() }), { expirationTtl: 90 * 86400 });
+      await acadRawPut(env, 'acsec:flag:' + st.day + ':' + st.email, JSON.stringify({ email: st.email, day: st.day, reasons: [...reasons], flaggedAt: new Date().toISOString() }), 90 * 86400);
       st.flushedReasons = new Set(reasons);
     }
   } catch (e) { return false; }
@@ -15668,8 +16300,8 @@ function tutorTokenize(text) {
   for (const t of raw) { if (t.length >= 2 && !stop[t] && !faStop[t]) out.push(t); }
   return out;
 }
-async function tutorCorpusIndex(env, lang) { try { return await env.LEADS.get('tutor:corpus:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
-async function tutorCorpusModule(env, lang, moduleId) { try { return await env.LEADS.get('tutor:corpus:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusIndex(env, lang) { try { return await acadRawGet(env, 'tutor:corpus:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusModule(env, lang, moduleId) { try { return await acadRawGet(env, 'tutor:corpus:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
 function tutorScoreLessons(index, queryTokens, contextLessonId) {
   // Weighted deterministic overlap: concept-tag hit 3, title hit 2,
   // body-term hit 1; the lesson the student is viewing gets +100 so
@@ -15750,7 +16382,7 @@ function tutorNotCoveredReply(lang, nearest) {
   return 'That point is not covered in the course material I can search, and I won\'t guess at it.' + (ptr ? ' The nearest lesson to your question is ' + ptr + '.' : '') + ' Try asking again with the exact concept name from that lesson, and I\'ll answer strictly from the lesson text.';
 }
 async function tutorThreadGet(env, ne) {
-  try { const t = await env.LEADS.get('tutor:thread:' + ne, { type: 'json' }); if (t && Array.isArray(t.messages)) return t; } catch (e) {}
+  try { const t = await acadRawGet(env, 'tutor:thread:' + ne, { type: 'json' }); if (t && Array.isArray(t.messages)) return t; } catch (e) {}
   return { messages: [] };
 }
 function tutorThreadTtlSeconds(enrolment) {
@@ -15769,10 +16401,11 @@ async function tutorThreadPut(env, ne, thread, enrolment) {
   // preserved across writes so those flows are resumable.
   const rec = { messages: msgs, updatedAt: new Date().toISOString() };
   if (thread.state && typeof thread.state === 'object') rec.state = thread.state;
-  try { await env.LEADS.put('tutor:thread:' + ne, JSON.stringify(rec), { expirationTtl: tutorThreadTtlSeconds(enrolment) }); } catch (e) {}
+  try { await acadRawPut(env, 'tutor:thread:' + ne, JSON.stringify(rec), tutorThreadTtlSeconds(enrolment)); } catch (e) {}
   return msgs;
 }
 async function tutorUsageCount(env, key) {
+  if (acadD1(env)) { try { const nD = await acadCounterGet(env, key); return (typeof nD === 'number' && nD > 0) ? nD : 0; } catch (e) { return 0; } }
   try { const v = await env.LEADS.get(key, { type: 'json' }); return v && Number.isInteger(v.count) && v.count > 0 ? v.count : 0; } catch (e) { return 0; }
 }
 async function tutorUsageBump(env, key) {
@@ -15785,6 +16418,7 @@ async function tutorUsageBump(env, key) {
   // record would couple unrelated routes (chat/quiz/debrief/voice all
   // bump student+global+provider keys) to one hot record without
   // eliminating the cross-key race anyway.
+  if (acadD1(env)) { try { return await acadCounterBump(env, key); } catch (e) { return 0; } }
   const n = (await tutorUsageCount(env, key)) + 1;
   try { await env.LEADS.put(key, JSON.stringify({ count: n }), { expirationTtl: 3 * 86400 }); } catch (e) {}
   return n;
@@ -15806,11 +16440,11 @@ function tutorStripMisconception(text) {
 async function tutorRecordMisconception(env, ne, concept, lessonId) {
   try {
     const key = 'tutor:miscon:' + ne;
-    const cur = (await env.LEADS.get(key, { type: 'json' })) || { items: [] };
+    const cur = (await acadRawGet(env, key, { type: 'json' })) || { items: [] };
     if (!Array.isArray(cur.items)) cur.items = [];
     cur.items.push({ concept: concept, lessonId: lessonId || null, at: new Date().toISOString(), source: 'tutor' });
     if (cur.items.length > TUTOR_MISCON_CAP) cur.items = cur.items.slice(-TUTOR_MISCON_CAP);
-    await env.LEADS.put(key, JSON.stringify(cur));
+    await acadRawPut(env, key, JSON.stringify(cur));
   } catch (e) {}
 }
 async function tutorCallGroq(prov, turns) {
@@ -15979,9 +16613,9 @@ async function tutorGate(env, rawEmail, readOnly, origin) {
 }
 
 // ---------- Tier 1a: corpus v2 retrieval ----------
-async function tutorCorpusV2Index(env, lang) { try { return await env.LEADS.get('tutor:corpus:v2:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
-async function tutorCorpusV2Module(env, lang, moduleId) { try { return await env.LEADS.get('tutor:corpus:v2:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
-async function tutorGlossary(env) { try { return await env.LEADS.get('tutor:corpus:v2:glossary', { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusV2Index(env, lang) { try { return await acadRawGet(env, 'tutor:corpus:v2:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorCorpusV2Module(env, lang, moduleId) { try { return await acadRawGet(env, 'tutor:corpus:v2:' + lang + ':' + moduleId, { type: 'json' }); } catch (e) { return null; } }
+async function tutorGlossary(env) { try { return await acadRawGet(env, 'tutor:corpus:v2:glossary', { type: 'json' }); } catch (e) { return null; } }
 function tutorExpandTokens(tokens, glossary) {
   const out = new Set(tokens);
   const map = glossary && glossary.map && typeof glossary.map === 'object' ? glossary.map : null;
@@ -16131,7 +16765,7 @@ async function tutorStudentSnapshot(env, ne) {
       out.topConcepts = Object.keys(byConcept).map(function (c) { return { concept: c, count: byConcept[c] }; }).sort(function (a, b) { return b.count - a.count || (a.concept < b.concept ? -1 : 1); }).slice(0, 5);
     }
   } catch (e) {}
-  try { const mc = await env.LEADS.get('tutor:miscon:' + ne, { type: 'json' }); if (mc && Array.isArray(mc.items)) out.misconcepts = mc.items.slice(-5).map(function (i) { return i && i.concept; }).filter(Boolean); } catch (e) {}
+  try { const mc = await acadRawGet(env, 'tutor:miscon:' + ne, { type: 'json' }); if (mc && Array.isArray(mc.items)) out.misconcepts = mc.items.slice(-5).map(function (i) { return i && i.concept; }).filter(Boolean); } catch (e) {}
   try { const rd = await acadKvGet(env, 'acready:' + ne, { type: 'json' }); if (rd && typeof rd.score === 'number') out.readiness = { score: rd.score, components: rd.components || null }; } catch (e) {}
   try {
     const pr = await acadKvGet(env, 'acprogress:' + ne, { type: 'json' });
@@ -16154,7 +16788,7 @@ async function tutorStudentSnapshot(env, ne) {
     }
   } catch (e) {}
   try {
-    const lst = await env.LEADS.list({ prefix: 'acattempt:' + ne + ':', limit: 200 });
+    const lst = await acadKvList(env, { prefix: 'acattempt:' + ne + ':', limit: 200 });
     const keys = lst && Array.isArray(lst.keys) ? lst.keys : [];
     for (const k of keys) {
       const lid = k.name.slice(('acattempt:' + ne + ':').length);
@@ -16185,8 +16819,8 @@ async function tutorStudentSnapshot(env, ne) {
 }
 
 // ---------- Tier 1c/2b: the seeded question bank + server grading ----------
-async function tutorBankIndex(env, lang) { try { return await env.LEADS.get('tutor:bank:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
-async function tutorBankModule(env, lang, mod) { try { return await env.LEADS.get('tutor:bank:' + lang + ':' + mod, { type: 'json' }); } catch (e) { return null; } }
+async function tutorBankIndex(env, lang) { try { return await acadRawGet(env, 'tutor:bank:' + lang + ':index', { type: 'json' }); } catch (e) { return null; } }
+async function tutorBankModule(env, lang, mod) { try { return await acadRawGet(env, 'tutor:bank:' + lang + ':' + mod, { type: 'json' }); } catch (e) { return null; } }
 async function tutorBankQuestion(env, lang, qid) {
   const langs = lang === 'fa' ? ['fa', 'en'] : [lang, 'en'];
   for (const lg of langs) {
@@ -16277,7 +16911,7 @@ function tutorFeedbackText(lang, grade, q) {
 async function tutorLatestMockAttempt(env, ne) {
   let best = null;
   try {
-    const lst = await env.LEADS.list({ prefix: 'acattempt:' + ne + ':', limit: 200 });
+    const lst = await acadKvList(env, { prefix: 'acattempt:' + ne + ':', limit: 200 });
     const keys = lst && Array.isArray(lst.keys) ? lst.keys : [];
     for (const k of keys) {
       const lid = k.name.slice(('acattempt:' + ne + ':').length);
@@ -16366,20 +17000,20 @@ async function tutorVerifyDraft(env, cfg, lang, excerpts, nearest, draftText, pr
 async function tutorVerifyLog(env, outcome) {
   const key = 'tutor:verify:' + todayVancouver();
   let cur = { drafts: 0, clean: 0, regenerated: 0, trimmed: 0, inconclusive: 0, skippedBudget: 0 };
-  try { const v = await env.LEADS.get(key, { type: 'json' }); if (v && typeof v === 'object') cur = Object.assign(cur, v); } catch (e) {}
+  try { const v = await acadRawGet(env, key, { type: 'json' }); if (v && typeof v === 'object') cur = Object.assign(cur, v); } catch (e) {}
   cur.drafts++;
   if (outcome === 'clean') cur.clean++; else if (outcome === 'regenerated') cur.regenerated++; else if (outcome === 'trimmed') cur.trimmed++; else if (outcome === 'inconclusive') cur.inconclusive++; else if (outcome === 'skipped_budget') cur.skippedBudget++;
-  try { await env.LEADS.put(key, JSON.stringify(cur), { expirationTtl: 45 * 86400 }); } catch (e) {}
+  try { await acadRawPut(env, key, JSON.stringify(cur), 45 * 86400); } catch (e) {}
 }
 
 // ---------- Tier 3b: gap analytics ----------
 async function tutorLogGap(env, entry) {
   const key = 'tutor:gaps:' + todayVancouver();
   let cur = { items: [] };
-  try { const v = await env.LEADS.get(key, { type: 'json' }); if (v && Array.isArray(v.items)) cur = v; } catch (e) {}
+  try { const v = await acadRawGet(env, key, { type: 'json' }); if (v && Array.isArray(v.items)) cur = v; } catch (e) {}
   cur.items.push({ q: String(entry.q || '').slice(0, 500), lang: entry.lang || 'en', lessonId: entry.lessonId || null, reason: entry.reason || 'not_covered', at: new Date().toISOString() });
   if (cur.items.length > TUTOR_GAPS_CAP) cur.items = cur.items.slice(-TUTOR_GAPS_CAP);
-  try { await env.LEADS.put(key, JSON.stringify(cur), { expirationTtl: 45 * 86400 }); } catch (e) {}
+  try { await acadRawPut(env, key, JSON.stringify(cur), 45 * 86400); } catch (e) {}
 }
 
 // ---------- Tier 3a: voice (DEFAULT OFF, cfg-gated) ----------
@@ -21573,7 +22207,7 @@ async function handleRequest(request, env, ctx) {
       // resurrects if the same email re-enrols later.
       const dpurged = await acadPurgeStudentData(env, dne);
       const dafter = await acadKvGet(env, dkey);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', keysRemoved: dpurged.keys.length, sessionsRevoked: dpurged.sessionsRevoked } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await acadAuditPut(env, JSON.stringify({ action: 'academy_student_delete', target: dne, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', keysRemoved: dpurged.keys.length, sessionsRevoked: dpurged.sessionsRevoked } })); } catch (e) {}
       return json({ ok: true, deleted: true, absentAfter: dafter === null || dafter === undefined, keysRemoved: dpurged.keys.length }, 200, origin);
     }
     /* Pack BookletView (2026-11-11): booklet seed, INTERNAL family —
@@ -21637,18 +22271,18 @@ async function handleRequest(request, env, ctx) {
         let bstored = 0, btotal = 0;
         const bresults = [];
         for (let bij = 0; bij < bprep.length; bij++) {
-          try { await env.LEADS.put(bprep[bij].key, bprep[bij].b64); } catch (e) {
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          try { await acadBookletPut(env, bprep[bij].key, bprep[bij].b64); } catch (e) {
+            try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } })); } catch (e) {}
             if (bstored > 0) await bumpAcademyContent(env);
             await seedRunCommit(env, bkRunId, bGuard.used, bstored + 1 + (bstored > 0 ? 1 : 0));
             return json({ ok: false, error: 'seed_store_failed', stored: bstored }, 502, origin);
           }
-          const bback = bookletB64Decode((await env.LEADS.get(bprep[bij].key)) || '');
+          const bback = bookletB64Decode((await acadBookletGetB64(env, bprep[bij].key)) || '');
           const bsha = bback ? await bookletBytesSha256(bback) : null;
           bstored++; btotal += bprep[bij].bytes;
           bresults.push({ kind: bprep[bij].kind, id: bprep[bij].id, lang: bprep[bij].lang, bytes: bprep[bij].bytes, storedSha256: bsha });
         }
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } })); } catch (e) {}
         await bumpAcademyContent(env);
         await seedRunCommit(env, bkRunId, bGuard.used, bprojected);
         return json({ ok: true, items: bstored, bytes: btotal, failed: 0, results: bresults }, 200, origin);
@@ -21672,10 +22306,10 @@ async function handleRequest(request, env, ctx) {
       // projection exceeds the budget (zero writes on refusal).
       const bkGuard = await seedRunGuard(env, bkRunId, 3);
       if (!bkGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: bkGuard.used, runId: bkRunId }, 429, origin);
-      await env.LEADS.put(bkey, b64);
-      const backBytes = bookletB64Decode((await env.LEADS.get(bkey)) || '');
+      await acadBookletPut(env, bkey, b64);
+      const backBytes = bookletB64Decode((await acadBookletGetB64(env, bkey)) || '');
       const storedSha256 = backBytes ? await bookletBytesSha256(backBytes) : null;
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: bkey, ip: ipKey(request.headers.get('CF-Connecting-IP') || 'unknown'), at: new Date().toISOString(), detail: { via: 'internal', route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } })); } catch (e) {}
       await bumpAcademyContent(env);
       await seedRunCommit(env, bkRunId, bkGuard.used, 3);
       return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
@@ -21737,8 +22371,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'glossary') {
             if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadG = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map });
-            await env.LEADS.put('tutor:corpus:v2:glossary', tsPayloadG);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:glossary', tsPayloadG);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
@@ -21746,8 +22380,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'v2-index') {
             if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadVI = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
@@ -21757,8 +22391,8 @@ async function handleRequest(request, env, ctx) {
             if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
             if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadVM = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
@@ -21766,8 +22400,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'bank-index') {
             if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadBI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta });
-            await env.LEADS.put('tutor:bank:' + lang + ':index', tsPayloadBI);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:bank:' + lang + ':index', tsPayloadBI);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
@@ -21776,8 +22410,8 @@ async function handleRequest(request, env, ctx) {
           if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
           if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
           const tsPayloadBM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions });
-          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, tsPayloadBM);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:bank:' + lang + ':' + modB, tsPayloadBM);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
@@ -21786,8 +22420,8 @@ async function handleRequest(request, env, ctx) {
         if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
         if (d.part === 'index') {
           const tsPayloadI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
-          await env.LEADS.put('tutor:corpus:' + lang + ':index', tsPayloadI);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:corpus:' + lang + ':index', tsPayloadI);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
@@ -21796,8 +22430,8 @@ async function handleRequest(request, env, ctx) {
           const mod = String(d.module || '');
           if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
           const tsPayloadM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
-          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, tsPayloadM);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:corpus:' + lang + ':' + mod, tsPayloadM);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
@@ -21915,7 +22549,7 @@ async function handleRequest(request, env, ctx) {
         if (!mbytes.length) return json({ ok: false, error: 'empty_body' }, 400, origin);
         const mct = mkey.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : (mkey.endsWith('.ts') ? 'video/MP2T' : (mkey.endsWith('.vtt') ? 'text/vtt' : 'application/octet-stream'));
         try { await mbucket.put(mkey, mbytes, { httpMetadata: { contentType: mct } }); } catch (e) { return json({ ok: false, error: 'r2_put_failed' }, 502, origin); }
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put', items: 1, bytes: mbytes.length, outcome: 'ok', key: mkey, size: mbytes.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'r2_mig', target: mkey, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put', items: 1, bytes: mbytes.length, outcome: 'ok', key: mkey, size: mbytes.length } })); } catch (e) {}
         return json({ ok: true, size: mbytes.length }, 200, origin);
       }
       if (mop === 'head') {
@@ -21959,12 +22593,12 @@ async function handleRequest(request, env, ctx) {
           for (let mij = 0; mij < mprep.length; mij++) {
             try { await mbucket.put(mprep[mij].key, mprep[mij].bytes, { httpMetadata: { contentType: mprep[mij].ct } }); }
             catch (e) {
-              try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored + '/' + mprep.length, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'partial', failedKey: mprep[mij].key } }), { expirationTtl: 730 * 86400 }); } catch (e2) {}
+              try { await acadAuditPut(env, JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored + '/' + mprep.length, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'partial', failedKey: mprep[mij].key } })); } catch (e2) {}
               return json({ ok: false, error: 'r2_put_failed', stored: mstored }, 502, origin);
             }
             mstored++; mtotal += mprep[mij].bytes.length; mresults.push({ key: mprep[mij].key, size: mprep[mij].bytes.length });
           }
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          try { await acadAuditPut(env, JSON.stringify({ action: 'r2_mig', target: 'batch:' + mstored, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'put-batch', items: mstored, bytes: mtotal, outcome: 'ok' } })); } catch (e) {}
           return json({ ok: true, items: mstored, bytes: mtotal, results: mresults }, 200, origin);
         }
       const mprefix = String(md.prefix || 'media/');
@@ -21976,7 +22610,7 @@ async function handleRequest(request, env, ctx) {
       const mobjs = (mres && mres.objects) || [];
       const mkeys = mobjs.map(function (o) { return { key: o.key, size: o.size }; });
       const mtrunc = !!(mres && mres.truncated);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'list', items: mkeys.length, bytes: mkeys.reduce(function (a, o) { return a + (o.size || 0); }, 0), outcome: 'ok', prefix: mprefix, keys: mkeys.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await acadAuditPut(env, JSON.stringify({ action: 'r2_mig', target: mprefix, ip: mip, at: new Date().toISOString(), detail: { via: 'internal', route: 'r2-mig', op: 'list', items: mkeys.length, bytes: mkeys.reduce(function (a, o) { return a + (o.size || 0); }, 0), outcome: 'ok', prefix: mprefix, keys: mkeys.length } })); } catch (e) {}
       return json({ ok: true, keys: mkeys, cursor: (mtrunc && mres.cursor) ? String(mres.cursor) : null, truncated: mtrunc }, 200, origin);
     }
 
@@ -22039,8 +22673,7 @@ async function handleRequest(request, env, ctx) {
           continue;
         }
         try {
-          if (expKv !== null) await env.LEADS.put(ent.key, ent.value, { expirationTtl: Math.floor((expKv - nowKv) / 1000) });
-          else await env.LEADS.put(ent.key, ent.value);
+          await acadDrainPut(env, ent.key, ent.value, expKv !== null ? Math.floor((expKv - nowKv) / 1000) : undefined);
         } catch (e) { failed++; stopped = true; break; }
         try { await kvbucket.delete(ko.key); } catch (e) {}
         drained++;
@@ -22049,7 +22682,7 @@ async function handleRequest(request, env, ctx) {
       const pageDone = !stopped && processed >= kvobjs.length;
       const outCursor = stopped ? (kvreqCursor || null) : (pageDone && kvres.truncated && kvres.cursor ? String(kvres.cursor) : null);
       const remaining = stopped ? (kvobjs.length - processed) : (pageDone && kvres.truncated ? null : 0);
-      try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'kv_drain', target: SPILL_PREFIX, ip: kvip, at: new Date().toISOString(), detail: { via: 'internal', drained: drained, expired: expired, failed: failed } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+      try { await acadAuditPut(env, JSON.stringify({ action: 'kv_drain', target: SPILL_PREFIX, ip: kvip, at: new Date().toISOString(), detail: { via: 'internal', drained: drained, expired: expired, failed: failed } })); } catch (e) {}
       return json({ ok: true, drained: drained, expired: expired, failed: failed, cursor: outCursor, remaining: remaining }, 200, origin);
     }
     /* Pack SiteKvSpillway (resilience P0-2, 2026-11-12): the
@@ -24641,7 +25274,7 @@ async function handleRequest(request, env, ctx) {
           if (ent.error === 'blocked') return json({ error: 'blocked' }, 403, origin);
           return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
         }
-        try { await env.LEADS.delete('tutor:thread:' + normEmail(email)); } catch (e) {}
+        try { await acadRawDelete(env, 'tutor:thread:' + normEmail(email)); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
 
@@ -24699,7 +25332,7 @@ async function handleRequest(request, env, ctx) {
         if (!EMAIL_RE.test(email) || !password) return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
         const ne = normEmail(email);
         const lockKeyL = 'acloginlock:' + ne;
-        const lock = await env.LEADS.get(lockKeyL, { type: 'json' }).catch(() => null);
+        const lock = await acadRawGet(env, lockKeyL, { type: 'json' }).catch(() => null);
         const nowL = Date.now();
         if (lock && Number(lock.lockedUntil) > nowL) return json({ ok: false, error: 'locked', retryAfterMin: Math.ceil((Number(lock.lockedUntil) - nowL) / 60000) }, 429, origin);
         const rec = await academyGet(env, email);
@@ -24712,7 +25345,7 @@ async function handleRequest(request, env, ctx) {
           const fails = ((lock && Number(lock.fails)) || 0) + 1;
           const newLock = { fails: fails, lockedUntil: 0 };
           if (fails >= 5) { newLock.lockedUntil = nowL + 15 * 60000; newLock.fails = 0; }
-          try { await env.LEADS.put(lockKeyL, JSON.stringify(newLock), { expirationTtl: 3600 }); } catch (e) {}
+          try { await acadRawPut(env, lockKeyL, JSON.stringify(newLock), 3600); } catch (e) {}
           if (newLock.lockedUntil) return json({ ok: false, error: 'locked', retryAfterMin: 15 }, 429, origin);
           return json({ ok: false, error: 'invalid_credentials' }, 401, origin);
         }
@@ -24721,7 +25354,7 @@ async function handleRequest(request, env, ctx) {
           if (ent.error === 'blocked') return json({ ok: false, error: 'blocked' }, 403, origin);
           return json({ ok: false, error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
         }
-        try { await env.LEADS.delete(lockKeyL); } catch (e) {}
+        try { await acadRawDelete(env, lockKeyL); } catch (e) {}
         const sess = await acadIssueSession(env, ne, d.remember === true);
         return json({ ok: true, token: sess.token, expiresAt: sess.expiresAt, remember: sess.remember, email: rec.email, grace: !!ent.grace }, 200, origin);
       }
@@ -24740,17 +25373,17 @@ async function handleRequest(request, env, ctx) {
         const token = String(d.token || '');
         if (!/^[0-9a-f]{64}$/.test(token)) return json({ ok: false, error: 'invalid_token' }, 400, origin);
         const tkey = 'acsetpw:' + await sha256hex(token);
-        const trec = await env.LEADS.get(tkey, { type: 'json' }).catch(() => null);
+        const trec = await acadRawGet(env, tkey, { type: 'json' }).catch(() => null);
         if (!trec || !trec.email || !(Number(trec.exp) > Date.now())) return json({ ok: false, error: 'invalid_token' }, 400, origin);
         const rec = await academyGet(env, trec.email);
         if (!rec) return json({ ok: false, error: 'invalid_token' }, 400, origin);
         if (!acadPwPolicy(d.password, rec.email)) return json({ ok: false, error: 'weak_password' }, 400, origin);
         rec.pw = await acadPwMake(d.password);
         await academyPut(env, rec);
-        await env.LEADS.delete(tkey); // single-use: the token dies
+        await acadRawDelete(env, tkey); // single-use: the token dies
         const ne2 = normEmail(rec.email);
         await acadRevokeSessions(env, ne2, null); // every old session dies
-        try { await env.LEADS.delete('acloginlock:' + ne2); } catch (e) {}
+        try { await acadRawDelete(env, 'acloginlock:' + ne2); } catch (e) {}
         const sess = await acadIssueSession(env, ne2, false);
         return json({ ok: true, token: sess.token, expiresAt: sess.expiresAt, email: rec.email }, 200, origin);
       }
@@ -24982,7 +25615,7 @@ async function handleRequest(request, env, ctx) {
           questions.push({ qid: qq.id, lessonId: qq.lessonId, moduleId: qq.moduleId, concept: qq.concept, difficulty: qq.difficulty || null, trap: qq.trap || null, stem: qq.stem, options: acadServedOptions(qq, attemptId + ':' + qid) });
         }
         const startedAtS = Date.now();
-        await env.LEADS.put('acquiz:' + g.ne + ':' + attemptId, JSON.stringify(Object.assign({ lessonId: lessonId, lang: lang, servedIds: served, answers: {}, answerAt: {}, startedAt: startedAtS }, isMock ? { mock: true, deadlineAt: startedAtS + 3 * 3600 * 1000 } : {})), { expirationTtl: 86400 });
+        await acadRawPut(env, 'acquiz:' + g.ne + ':' + attemptId, JSON.stringify(Object.assign({ lessonId: lessonId, lang: lang, servedIds: served, answers: {}, answerAt: {}, startedAt: startedAtS }, isMock ? { mock: true, deadlineAt: startedAtS + 3 * 3600 * 1000 } : {})), 86400);
         await acsecEvent(env, g.ne, 'quiz'); // Pack AcademyProtect: harvest counter (awaited; acsecEvent swallows its own errors, so counting never blocks or breaks a serve)
         const serveResp = { ok: true, attemptId: attemptId, lessonId: lessonId, total: served.length, questions: questions };
         if (isMock) { serveResp.mock = true; serveResp.deadlineAt = startedAtS + 3 * 3600 * 1000; serveResp.durationSecs = 10800; }
@@ -25002,7 +25635,7 @@ async function handleRequest(request, env, ctx) {
         const chosen = String(d.chosen || '').trim().toUpperCase();
         if (!/^[A-E]$/.test(chosen)) return json({ ok: false, error: 'validation' }, 400, origin);
         const akey = 'acquiz:' + g.ne + ':' + attemptId;
-        const att = await env.LEADS.get(akey, { type: 'json' }).catch(() => null);
+        const att = await acadRawGet(env, akey, { type: 'json' }).catch(() => null);
         if (!att || !Array.isArray(att.servedIds)) return json({ ok: false, error: 'no_active_attempt' }, 409, origin);
         if (att.servedIds.indexOf(qid) === -1) return json({ ok: false, error: 'not_served' }, 400, origin);
         const qq = await tutorBankQuestion(env, att.lang || 'en', qid);
@@ -25021,7 +25654,7 @@ async function handleRequest(request, env, ctx) {
           if (!alreadyM) {
             att.answers = att.answers || {}; att.answerAt = att.answerAt || {};
             att.answers[qid] = chosen; att.answerAt[qid] = Date.now();
-            await env.LEADS.put(akey, JSON.stringify(att), { expirationTtl: 86400 });
+            await acadRawPut(env, akey, JSON.stringify(att), 86400);
           }
           const answeredCountM = Object.keys(att.answers || {}).length;
           return json({ ok: true, qid: qid, mock: true, recorded: !alreadyM, answeredCount: answeredCountM, total: att.servedIds.length, allAnswered: answeredCountM === att.servedIds.length }, 200, origin);
@@ -25034,7 +25667,7 @@ async function handleRequest(request, env, ctx) {
           att.answers = att.answers || {}; att.answerAt = att.answerAt || {};
           att.answers[qid] = chosen; att.answerAt[qid] = Date.now();
           if (!grade.correct) { const mk = await tutorLoadMistakes(env, g.ne); acadQuizMistakeWrite(mk, qq, chosen, Date.now()); await acadKvPut(env, 'acmistakes:' + g.ne, JSON.stringify(mk)); }
-          await env.LEADS.put(akey, JSON.stringify(att), { expirationTtl: 86400 });
+          await acadRawPut(env, akey, JSON.stringify(att), 86400);
         }
         const answeredCount = Object.keys(att.answers || {}).length;
         return json({ ok: true, qid: qid, correct: grade.correct, answeredCount: answeredCount, total: att.servedIds.length, allAnswered: answeredCount === att.servedIds.length, feedback: Object.assign({ qid: qid, concept: qq.concept, trap: qq.trap || null, chosen: att.answers[qid] }, grade) }, 200, origin);
@@ -25050,7 +25683,7 @@ async function handleRequest(request, env, ctx) {
         if (g.resp) return g.resp;
         const attemptId = String(d.attemptId || '');
         const akey = 'acquiz:' + g.ne + ':' + attemptId;
-        const att = await env.LEADS.get(akey, { type: 'json' }).catch(() => null);
+        const att = await acadRawGet(env, akey, { type: 'json' }).catch(() => null);
         if (!att || !Array.isArray(att.servedIds)) return json({ ok: false, error: 'no_active_attempt' }, 409, origin);
         const nowF = Date.now();
         const feedback = [];
@@ -25098,7 +25731,7 @@ async function handleRequest(request, env, ctx) {
         lp.status = lp.mastery >= 80 ? 'mastered' : (lp.completedAt ? 'completed' : 'in_progress');
         prog.lessons[att.lessonId] = lp;
         await acadKvPut(env, 'acprogress:' + g.ne, JSON.stringify(prog));
-        await env.LEADS.delete(akey);
+        await acadRawDelete(env, akey);
         // Pack Line1FixA (F2): the readiness snapshot is
         // bookkeeping AFTER every state write has landed — a
         // transient KV failure inside it (its attempt scan lists
@@ -25455,16 +26088,16 @@ async function handleRequest(request, env, ctx) {
         const dayF = todayVancouver();
         const fkey = 'tutor:feedback:' + dayF;
         let agg = { up: 0, down: 0 };
-        try { const v = await env.LEADS.get(fkey, { type: 'json' }); if (v && typeof v === 'object') agg = { up: v.up | 0, down: v.down | 0 }; } catch (e) {}
+        try { const v = await acadRawGet(env, fkey, { type: 'json' }); if (v && typeof v === 'object') agg = { up: v.up | 0, down: v.down | 0 }; } catch (e) {}
         agg[vote]++;
-        try { await env.LEADS.put(fkey, JSON.stringify(agg), { expirationTtl: 45 * 86400 }); } catch (e) {}
+        try { await acadRawPut(env, fkey, JSON.stringify(agg), 45 * 86400); } catch (e) {}
         if (vote === 'down' && d.excerpt) {
           const dkey = 'tutor:feedback-down:' + dayF;
           let lst = { items: [] };
-          try { const v = await env.LEADS.get(dkey, { type: 'json' }); if (v && Array.isArray(v.items)) lst = v; } catch (e) {}
+          try { const v = await acadRawGet(env, dkey, { type: 'json' }); if (v && Array.isArray(v.items)) lst = v; } catch (e) {}
           lst.items.push({ excerpt: String(d.excerpt).slice(0, 500), lang: TUTOR_LANGS.indexOf(String(d.lang || '')) !== -1 ? String(d.lang) : 'en', at: new Date().toISOString() });
           if (lst.items.length > TUTOR_FEEDBACK_DOWN_CAP) lst.items = lst.items.slice(-TUTOR_FEEDBACK_DOWN_CAP);
-          try { await env.LEADS.put(dkey, JSON.stringify(lst), { expirationTtl: 45 * 86400 }); } catch (e) {}
+          try { await acadRawPut(env, dkey, JSON.stringify(lst), 45 * 86400); } catch (e) {}
         }
         return json({ ok: true }, 200, origin);
       }
@@ -25529,7 +26162,7 @@ async function handleRequest(request, env, ctx) {
         const sampleReq = url.searchParams.get('sample');
         if ((sampleReq === '1' || sampleReq === 'true') && bkind === 'lesson' && bid === 'm5-l1' && blang === 'en') {
           if (limited('acbooklet:' + ip, 120, 3600000)) return json({ ok: false, error: 'rate_limit' }, 429, origin);
-          const sb64 = await env.LEADS.get('booklet:lesson:m5-l1:en');
+          const sb64 = await acadBookletGetB64(env, 'booklet:lesson:m5-l1:en');
           if (!sb64) return json({ ok: false, error: 'not_found' }, 404, origin);
           const sbytes = bookletB64Decode(sb64);
           if (!sbytes) return json({ ok: false, error: 'not_found' }, 404, origin);
@@ -25563,13 +26196,13 @@ async function handleRequest(request, env, ctx) {
           return json({ error: 'expired', expiresAt: ent.expiresAt }, 403, origin);
         }
         let servedLang = blang;
-        let b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':' + blang);
+        let b64 = await acadBookletGetB64(env, 'booklet:' + bkind + ':' + bid + ':' + blang);
         // Pack AcademyBuildA: the EN fallback exists ONLY for fa —
         // the one other produced booklet language. hi/zh/es have no
         // booklets yet and answer the HONEST not_available_lang
         // (no fake files, no silent EN dressed as their edition);
         // the portal surfaces X-Booklet-Fallback in the UI (L1-M6).
-        if (!b64 && blang === 'fa') { b64 = await env.LEADS.get('booklet:' + bkind + ':' + bid + ':en'); servedLang = 'en'; }
+        if (!b64 && blang === 'fa') { b64 = await acadBookletGetB64(env, 'booklet:' + bkind + ':' + bid + ':en'); servedLang = 'en'; }
         if (!b64) return json({ ok: false, error: blang === 'en' || blang === 'fa' ? 'not_found' : 'not_available_lang' }, 404, origin);
         const bytes = bookletB64Decode(b64);
         if (!bytes) return json({ ok: false, error: 'not_found' }, 404, origin);
@@ -27261,7 +27894,7 @@ async function handleRequest(request, env, ctx) {
         meta.mergedInto = canonicalTo;
         await saveCMeta(env, from, meta); // mergedInto written LAST: a failure above leaves the merge retryable instead of hiding `from` behind an incomplete target
         await pushActivity(env, canonicalTo, 'note', 'Merged duplicate contact ' + from + ' into this profile');
-        await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'crm_merge', target: canonicalTo, from: from, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
+        await acadAuditPut(env, JSON.stringify({ action: 'crm_merge', target: canonicalTo, from: from, ip: ip, at: new Date().toISOString() }));
         adminCache.delete('contacts'); adminCache.delete('desk');
         return json({ ok: true }, 200, origin);
       }
@@ -27450,7 +28083,7 @@ async function handleRequest(request, env, ctx) {
         const meta = await getCMeta(env, nk);
         if (d && Array.isArray(d.tags)) meta.tags = d.tags.map(function (t) { return cleanText(t, 30); }).filter(Boolean).slice(0, 12);
         if (d && d.stage !== undefined) { if (['new', 'contacted', 'viewing', 'offer', 'closed', 'dropped', ''].indexOf(d.stage) === -1) return json({ ok: false, error: 'validation' }, 400, origin); meta.stage = d.stage; }
-        if (d && d.dnc !== undefined) { const nd = !!d.dnc; if (nd !== !!meta.dnc) { meta.dnc = nd; await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'crm_dnc', target: nk, dnc: nd, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } }
+        if (d && d.dnc !== undefined) { const nd = !!d.dnc; if (nd !== !!meta.dnc) { meta.dnc = nd; await acadAuditPut(env, JSON.stringify({ action: 'crm_dnc', target: nk, dnc: nd, ip: ip, at: new Date().toISOString() })); } }
         if (d && d.dnc !== undefined) { await ebConsentSet(env, nk, 'email', { status: !!d.dnc ? 'optout' : 'ok', basis: 'crm-dnc', source: 'crm-dnc' }); } // Pack EB-2 dual-write: the CRM do-not-contact flag mirrors into the Consent Ledger (cmeta reads unchanged)
         await saveCMeta(env, nk, meta);
         return json({ ok: true, meta: { tags: meta.tags || [], stage: meta.stage || '', dnc: !!meta.dnc } }, 200, origin);
@@ -27567,7 +28200,7 @@ async function handleRequest(request, env, ctx) {
           await siteKvDelete(env, 'user:' + target);
           await idxRemove(env, 'users', target);
           await purgeUserSessions(env, target);
-          await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'user_delete', target: target, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
+          await acadAuditPut(env, JSON.stringify({ action: 'user_delete', target: target, ip: ip, at: new Date().toISOString() }));
           return json({ ok: true }, 200, origin);
         }
         if (d.action === 'ban') {
@@ -27583,7 +28216,7 @@ async function handleRequest(request, env, ctx) {
           } catch (e) {}
           banCache.set(normEmail(target), { t: Date.now(), banned: true });
           await purgeUserSessions(env, target);
-          await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'user_ban', target: target, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
+          await acadAuditPut(env, JSON.stringify({ action: 'user_ban', target: target, ip: ip, at: new Date().toISOString() }));
           return json({ ok: true }, 200, origin);
         }
         if (d.action === 'unban') {
@@ -27602,7 +28235,7 @@ async function handleRequest(request, env, ctx) {
             }
           } catch (e) {}
           banCache.set(normEmail(target), { t: Date.now(), banned: false });
-          await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'user_unban', target: target, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
+          await acadAuditPut(env, JSON.stringify({ action: 'user_unban', target: target, ip: ip, at: new Date().toISOString() }));
           return json({ ok: true }, 200, origin);
         }
         return json({ ok: false, error: 'validation' }, 400, origin);
@@ -27696,7 +28329,7 @@ async function handleRequest(request, env, ctx) {
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
         const pdel = upBody.deleted === true;
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'academy_student_purge', target: pne, ip: ip, at: new Date().toISOString(), detail: { via: 'service', deleted: pdel } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'academy_student_purge', target: pne, ip: ip, at: new Date().toISOString(), detail: { via: 'service', deleted: pdel } })); } catch (e) {}
         return json(upBody, up.status, origin);
       }
       if (path === '/api/admin/academy/booklet-seed-proxy' && request.method === 'POST') {
@@ -27726,7 +28359,7 @@ async function handleRequest(request, env, ctx) {
           upBody = await up.json().catch(() => null);
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'booklet-seed-proxy', items: Array.isArray(qbd.items) ? qbd.items.length : 1, bytes: upBody.bytes || null, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed_proxy', target: 'booklet:' + String(qbd.kind || '') + ':' + String(qbd.id || '') + ':' + String(qbd.lang || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'booklet-seed-proxy', items: Array.isArray(qbd.items) ? qbd.items.length : 1, bytes: upBody.bytes || null, outcome: 'ok' } })); } catch (e) {}
         await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
@@ -27758,7 +28391,7 @@ async function handleRequest(request, env, ctx) {
           upBody = await up.json().catch(() => null);
         } catch (e) { return json({ ok: false, error: 'upstream_failed', upstreamStatus: 0 }, 502, origin); }
         if (!up.ok || !upBody || upBody.ok !== true) return json({ ok: false, error: 'upstream_failed', upstreamStatus: up.status }, 502, origin);
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'tutor-seed-proxy', items: (tsd.part === 'glossary' && tsd.map) ? Object.keys(tsd.map).length : (Array.isArray(tsd.questions) ? tsd.questions.length : (Array.isArray(tsd.lessons) ? tsd.lessons.length : (tsd.qmeta ? Object.keys(tsd.qmeta).length : 1))), bytes: JSON.stringify(tsd).length, outcome: 'ok', lang: String(tsd.lang || ''), part: String(tsd.part || '') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed_proxy', target: 'tutor:corpus:' + String(tsd.lang || '') + ':' + String(tsd.part || ''), ip: ip, at: new Date().toISOString(), detail: { via: 'service', route: 'tutor-seed-proxy', items: (tsd.part === 'glossary' && tsd.map) ? Object.keys(tsd.map).length : (Array.isArray(tsd.questions) ? tsd.questions.length : (Array.isArray(tsd.lessons) ? tsd.lessons.length : (tsd.qmeta ? Object.keys(tsd.qmeta).length : 1))), bytes: JSON.stringify(tsd).length, outcome: 'ok', lang: String(tsd.lang || ''), part: String(tsd.part || '') } })); } catch (e) {}
         await bumpAcademyContent(env);
         return json(upBody, up.status, origin);
       }
@@ -27886,14 +28519,14 @@ async function handleRequest(request, env, ctx) {
           cur.provisionedAt = new Date().toISOString();
           cur.repairedAt = cur.provisionedAt;
           await env.LEADS.put('cfg:stripe', JSON.stringify(cur));
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_provision_repair', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'service_headers' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          try { await acadAuditPut(env, JSON.stringify({ action: 'stripe_provision_repair', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'service_headers' } })); } catch (e) {}
           return json({ ok: true, apiKeyStored: true, repaired: true }, 200, origin);
         }
         cur.webhookSecret = ws;
         if (ak) cur.apiKey = ak;
         cur.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:stripe', JSON.stringify(cur));
-        if (bearerMode) { try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_provision', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'bearer' } }), { expirationTtl: 730 * 86400 }); } catch (e) {} }
+        if (bearerMode) { try { await acadAuditPut(env, JSON.stringify({ action: 'stripe_provision', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: 'bearer' } })); } catch (e) {} }
         return json({ ok: true, apiKeyStored: !!ak }, 200, origin);
       }
       if (path === '/api/admin/academy/stripe-status' && request.method === 'GET') {
@@ -27939,7 +28572,7 @@ async function handleRequest(request, env, ctx) {
         const curC = await env.LEADS.get('cfg:stripe');
         if (curC === null) return json({ ok: true, cleared: false }, 200, origin);
         await env.LEADS.delete('cfg:stripe');
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'stripe_clear', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: viaClear } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'stripe_clear', target: 'cfg:stripe', ip: ip, at: new Date().toISOString(), detail: { via: viaClear } })); } catch (e) {}
         return json({ ok: true, cleared: true }, 200, origin);
       }
       if (path === '/api/admin/academy/b2-clear' && request.method === 'POST') {
@@ -27976,7 +28609,7 @@ async function handleRequest(request, env, ctx) {
         const curB2 = await env.LEADS.get('cfg:b2');
         if (curB2 === null) return json({ ok: true, cleared: false }, 200, origin);
         await env.LEADS.delete('cfg:b2');
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'b2_clear', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { via: viaClearB2 } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'b2_clear', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { via: viaClearB2 } })); } catch (e) {}
         return json({ ok: true, cleared: true }, 200, origin);
       }
       if (path === '/api/admin/academy/students' && request.method === 'POST') {
@@ -28336,7 +28969,7 @@ async function handleRequest(request, env, ctx) {
         cur.tokenSecret = sec;
         cur.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:video', JSON.stringify(cur));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'video_provision', target: 'cfg:video', ip: ip, at: new Date().toISOString(), detail: { via: viaService ? 'service_generated' : (supplied ? 'session' : 'session_generated') } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'video_provision', target: 'cfg:video', ip: ip, at: new Date().toISOString(), detail: { via: viaService ? 'service_generated' : (supplied ? 'session' : 'session_generated') } })); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/academy/video-status' && request.method === 'GET') {
@@ -28402,7 +29035,7 @@ async function handleRequest(request, env, ctx) {
         if (psd !== null && psd > 0 && psd <= 10000) next.perStudentDaily = psd;
         if (gd !== null && gd > 0 && gd <= 100000) next.globalDaily = gd;
         await env.LEADS.put('cfg:tutor', JSON.stringify(next));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_provision', target: 'cfg:tutor', ip: ip, at: new Date().toISOString(), detail: { providers: clean.map(function (p) { return p.kind; }), replace: d.replace === true, voiceEnabled: !!(next.voice && next.voice.enabled) } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_provision', target: 'cfg:tutor', ip: ip, at: new Date().toISOString(), detail: { providers: clean.map(function (p) { return p.kind; }), replace: d.replace === true, voiceEnabled: !!(next.voice && next.voice.enabled) } })); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/academy/tutor-status' && request.method === 'GET') {
@@ -28432,10 +29065,10 @@ async function handleRequest(request, env, ctx) {
         let fbUpI = 0, fbDownI = 0; const downExcerptsI = [];
         const verifyI = { drafts: 0, clean: 0, regenerated: 0, trimmed: 0, inconclusive: 0, skippedBudget: 0 };
         for (const dy of daysI) {
-          try { const gv = await env.LEADS.get('tutor:gaps:' + dy, { type: 'json' }); if (gv && Array.isArray(gv.items)) { gapsTotalI += gv.items.length; for (const it of gv.items) { const rsn = it.reason || 'not_covered'; gapsByReasonI[rsn] = (gapsByReasonI[rsn] || 0) + 1; recentGapsI.push({ q: it.q, lang: it.lang, lessonId: it.lessonId, reason: it.reason, at: it.at, day: dy }); } } } catch (e) {}
-          try { const fv = await env.LEADS.get('tutor:feedback:' + dy, { type: 'json' }); if (fv) { fbUpI += fv.up | 0; fbDownI += fv.down | 0; } } catch (e) {}
-          try { const dv = await env.LEADS.get('tutor:feedback-down:' + dy, { type: 'json' }); if (dv && Array.isArray(dv.items)) for (const it of dv.items) downExcerptsI.push({ excerpt: it.excerpt, lang: it.lang, at: it.at, day: dy }); } catch (e) {}
-          try { const vv = await env.LEADS.get('tutor:verify:' + dy, { type: 'json' }); if (vv) for (const k of Object.keys(verifyI)) verifyI[k] += vv[k] | 0; } catch (e) {}
+          try { const gv = await acadRawGet(env, 'tutor:gaps:' + dy, { type: 'json' }); if (gv && Array.isArray(gv.items)) { gapsTotalI += gv.items.length; for (const it of gv.items) { const rsn = it.reason || 'not_covered'; gapsByReasonI[rsn] = (gapsByReasonI[rsn] || 0) + 1; recentGapsI.push({ q: it.q, lang: it.lang, lessonId: it.lessonId, reason: it.reason, at: it.at, day: dy }); } } } catch (e) {}
+          try { const fv = await acadRawGet(env, 'tutor:feedback:' + dy, { type: 'json' }); if (fv) { fbUpI += fv.up | 0; fbDownI += fv.down | 0; } } catch (e) {}
+          try { const dv = await acadRawGet(env, 'tutor:feedback-down:' + dy, { type: 'json' }); if (dv && Array.isArray(dv.items)) for (const it of dv.items) downExcerptsI.push({ excerpt: it.excerpt, lang: it.lang, at: it.at, day: dy }); } catch (e) {}
+          try { const vv = await acadRawGet(env, 'tutor:verify:' + dy, { type: 'json' }); if (vv) for (const k of Object.keys(verifyI)) verifyI[k] += vv[k] | 0; } catch (e) {}
         }
         recentGapsI.sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); });
         downExcerptsI.sort(function (a, b) { return String(b.at || '').localeCompare(String(a.at || '')); });
@@ -28461,7 +29094,7 @@ async function handleRequest(request, env, ctx) {
         try {
           let cursorI = undefined;
           do {
-            const pageI = await env.LEADS.list({ prefix: 'tutor:usage:' + todayI + ':', limit: 1000, cursor: cursorI });
+            const pageI = await acadKvList(env, { prefix: 'tutor:usage:' + todayI + ':', limit: 1000, cursor: cursorI });
             for (const kI of (pageI.keys || [])) {
               const suffixI = kI.name.slice(('tutor:usage:' + todayI + ':').length);
               if (!suffixI || suffixI === '_global' || suffixI.indexOf('prov:') === 0) continue;
@@ -28474,10 +29107,10 @@ async function handleRequest(request, env, ctx) {
         const verifyCallsOfI = function (vv) { return vv ? ((vv.clean | 0) + (vv.regenerated | 0) + (vv.trimmed | 0) + (vv.inconclusive | 0)) : 0; };
         const last7I = [];
         for (const dy7 of daysI) {
-          let vv7 = null; try { vv7 = await env.LEADS.get('tutor:verify:' + dy7, { type: 'json' }); } catch (e) {}
+          let vv7 = null; try { vv7 = await acadRawGet(env, 'tutor:verify:' + dy7, { type: 'json' }); } catch (e) {}
           last7I.push({ day: dy7, globalUsed: await tutorUsageCount(env, 'tutor:usage:' + dy7 + ':_global'), verifyCalls: verifyCallsOfI(vv7) });
         }
-        let verifyTodayRecI = null; try { verifyTodayRecI = await env.LEADS.get('tutor:verify:' + todayI, { type: 'json' }); } catch (e) {}
+        let verifyTodayRecI = null; try { verifyTodayRecI = await acadRawGet(env, 'tutor:verify:' + todayI, { type: 'json' }); } catch (e) {}
         const creditsI = {
           configured: tutorReady(cfgI),
           today: { day: todayI, globalUsed: await tutorUsageCount(env, 'tutor:usage:' + todayI + ':_global'), globalCap: capsI.global, studentsActiveToday: Object.keys(usageByStudentI).filter(function (emI) { return usageByStudentI[emI] > 0; }).length, perProvider: perProviderI, verifyCalls: verifyCallsOfI(verifyTodayRecI), voiceUsed: voiceUsedTodayI },
@@ -28519,8 +29152,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'glossary') {
             if (!d.map || typeof d.map !== 'object' || Array.isArray(d.map)) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadG = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), map: d.map });
-            await env.LEADS.put('tutor:corpus:v2:glossary', tsPayloadG);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:glossary', tsPayloadG);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:glossary', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', part: 'glossary', items: Object.keys(d.map).length, bytes: tsPayloadG.length, outcome: 'ok', keys: Object.keys(d.map).length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'glossary', keys: Object.keys(d.map).length }, 200, origin);
@@ -28528,8 +29161,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'v2-index') {
             if (!Array.isArray(d.lessons) || !d.lessons.length || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadVI = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:' + lang + ':index', tsPayloadVI);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-index', items: d.lessons.length, bytes: tsPayloadVI.length, outcome: 'ok', lessons: d.lessons.length, concepts: d.concepts.length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-index', lessons: d.lessons.length, concepts: d.concepts.length }, 200, origin);
@@ -28539,8 +29172,8 @@ async function handleRequest(request, env, ctx) {
             if (!/^m[0-8]$/.test(mod2)) return json({ ok: false, error: 'validation' }, 400, origin);
             if (!Array.isArray(d.lessons) || d.lessons.length > 200 || !Array.isArray(d.concepts) || d.concepts.length > 800) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadVM = JSON.stringify({ v: 2, seededAt: new Date().toISOString(), lessons: d.lessons, concepts: d.concepts });
-            await env.LEADS.put('tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:corpus:v2:' + lang + ':' + mod2, tsPayloadVM);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:v2:' + lang + ':' + mod2, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'v2-module', items: d.concepts.length, bytes: tsPayloadVM.length, outcome: 'ok', module: mod2, concepts: d.concepts.length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'v2-module', module: mod2, concepts: d.concepts.length }, 200, origin);
@@ -28548,8 +29181,8 @@ async function handleRequest(request, env, ctx) {
           if (d.part === 'bank-index') {
             if (!d.concepts || typeof d.concepts !== 'object' || Array.isArray(d.concepts) || !d.qmeta || typeof d.qmeta !== 'object' || Array.isArray(d.qmeta)) return json({ ok: false, error: 'validation' }, 400, origin);
             const tsPayloadBI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), concepts: d.concepts, qmeta: d.qmeta });
-            await env.LEADS.put('tutor:bank:' + lang + ':index', tsPayloadBI);
-            try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            await acadRawPut(env, 'tutor:bank:' + lang + ':index', tsPayloadBI);
+            try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-index', items: Object.keys(d.qmeta).length, bytes: tsPayloadBI.length, outcome: 'ok', questions: Object.keys(d.qmeta).length } })); } catch (e) {}
             await bumpAcademyContent(env);
             await seedRunCommit(env, tsRunId, tsGuard.used, 3);
             return json({ ok: true, part: 'bank-index', questions: Object.keys(d.qmeta).length }, 200, origin);
@@ -28558,8 +29191,8 @@ async function handleRequest(request, env, ctx) {
           if (!/^m[0-8]$/.test(modB)) return json({ ok: false, error: 'validation' }, 400, origin);
           if (!Array.isArray(d.questions) || !d.questions.length || d.questions.length > 400) return json({ ok: false, error: 'validation' }, 400, origin);
           const tsPayloadBM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), questions: d.questions });
-          await env.LEADS.put('tutor:bank:' + lang + ':' + modB, tsPayloadBM);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:bank:' + lang + ':' + modB, tsPayloadBM);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:bank:' + lang + ':' + modB, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'bank-module', items: d.questions.length, bytes: tsPayloadBM.length, outcome: 'ok', module: modB, questions: d.questions.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'bank-module', module: modB, questions: d.questions.length }, 200, origin);
@@ -28568,8 +29201,8 @@ async function handleRequest(request, env, ctx) {
         if (JSON.stringify(d).length > 2500000) return json({ ok: false, error: 'too_large' }, 413, origin);
         if (d.part === 'index') {
           const tsPayloadI = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
-          await env.LEADS.put('tutor:corpus:' + lang + ':index', tsPayloadI);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:corpus:' + lang + ':index', tsPayloadI);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':index', ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'index', items: d.lessons.length, bytes: tsPayloadI.length, outcome: 'ok', lessons: d.lessons.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'index', lessons: d.lessons.length }, 200, origin);
@@ -28578,8 +29211,8 @@ async function handleRequest(request, env, ctx) {
           const mod = String(d.module || '');
           if (!/^m[0-8]$/.test(mod)) return json({ ok: false, error: 'validation' }, 400, origin);
           const tsPayloadM = JSON.stringify({ v: 1, seededAt: new Date().toISOString(), lessons: d.lessons });
-          await env.LEADS.put('tutor:corpus:' + lang + ':' + mod, tsPayloadM);
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          await acadRawPut(env, 'tutor:corpus:' + lang + ':' + mod, tsPayloadM);
+          try { await acadAuditPut(env, JSON.stringify({ action: 'tutor_seed', target: 'tutor:corpus:' + lang + ':' + mod, ip: ip, at: new Date().toISOString(), detail: { route: 'tutor-seed', lang: lang, part: 'module', items: d.lessons.length, bytes: tsPayloadM.length, outcome: 'ok', module: mod, lessons: d.lessons.length } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, tsRunId, tsGuard.used, 3);
           return json({ ok: true, part: 'module', module: mod, lessons: d.lessons.length }, 200, origin);
@@ -28635,18 +29268,18 @@ async function handleRequest(request, env, ctx) {
           let bstored = 0, btotal = 0;
           const bresults = [];
           for (let bij = 0; bij < bprep.length; bij++) {
-            try { await env.LEADS.put(bprep[bij].key, bprep[bij].b64); } catch (e) {
-              try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+            try { await acadBookletPut(env, bprep[bij].key, bprep[bij].b64); } catch (e) {
+              try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored + '/' + bprep.length, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'partial', failedKey: bprep[bij].key } })); } catch (e) {}
               if (bstored > 0) await bumpAcademyContent(env);
               await seedRunCommit(env, bkRunId, bGuard.used, bstored + 1 + (bstored > 0 ? 1 : 0));
               return json({ ok: false, error: 'seed_store_failed', stored: bstored }, 502, origin);
             }
-            const bback = bookletB64Decode((await env.LEADS.get(bprep[bij].key)) || '');
+            const bback = bookletB64Decode((await acadBookletGetB64(env, bprep[bij].key)) || '');
             const bsha = bback ? await bookletBytesSha256(bback) : null;
             bstored++; btotal += bprep[bij].bytes;
             bresults.push({ kind: bprep[bij].kind, id: bprep[bij].id, lang: bprep[bij].lang, bytes: bprep[bij].bytes, storedSha256: bsha });
           }
-          try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+          try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: 'booklet:batch:' + bstored, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: bstored, bytes: btotal, outcome: 'ok' } })); } catch (e) {}
           await bumpAcademyContent(env);
           await seedRunCommit(env, bkRunId, bGuard.used, bprojected);
           return json({ ok: true, items: bstored, bytes: btotal, failed: 0, results: bresults }, 200, origin);
@@ -28669,10 +29302,10 @@ async function handleRequest(request, env, ctx) {
         // projection exceeds the budget (zero writes on refusal).
         const bkGuard = await seedRunGuard(env, bkRunId, 3);
         if (!bkGuard.ok) return json({ ok: false, error: 'seed_budget', budget: SEED_PUT_BUDGET, projected: 3, runUsed: bkGuard.used, runId: bkRunId }, 429, origin);
-        await env.LEADS.put('booklet:' + kind + ':' + bid + ':' + lang, b64);
-        const backBytes2 = bookletB64Decode((await env.LEADS.get('booklet:' + kind + ':' + bid + ':' + lang)) || '');
+        await acadBookletPut(env, 'booklet:' + kind + ':' + bid + ':' + lang, b64);
+        const backBytes2 = bookletB64Decode((await acadBookletGetB64(env, 'booklet:' + kind + ':' + bid + ':' + lang)) || '');
         const storedSha256 = backBytes2 ? await bookletBytesSha256(backBytes2) : null;
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'booklet_seed', target: 'booklet:' + kind + ':' + bid + ':' + lang, ip: ip, at: new Date().toISOString(), detail: { route: 'booklet-seed', items: 1, bytes: bytes.length, outcome: 'ok', kind: kind, id: bid, lang: lang } })); } catch (e) {}
         await bumpAcademyContent(env);
         await seedRunCommit(env, bkRunId, bkGuard.used, 3);
         return json({ ok: true, kind: kind, id: bid, lang: lang, bytes: bytes.length, storedSha256: storedSha256 }, 200, origin);
@@ -28759,7 +29392,7 @@ async function handleRequest(request, env, ctx) {
         if (cur.keyId && cur.appKey && !cur.provisionedAt) cur.provisionedAt = new Date().toISOString();
         cur.updatedAt = new Date().toISOString();
         await env.LEADS.put('cfg:b2', JSON.stringify(cur));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'b2_provision', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { part: part, via: (/^[0-9a-f]{64}$/.test(bearer) || !bearer) ? 'session' : 'service_bearer' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'b2_provision', target: 'cfg:b2', ip: ip, at: new Date().toISOString(), detail: { part: part, via: (/^[0-9a-f]{64}$/.test(bearer) || !bearer) ? 'session' : 'service_bearer' } })); } catch (e) {}
         return json({ ok: true, part: part, complete: !!(cur.keyId && cur.appKey) }, 200, origin);
       }
       if (path === '/api/admin/academy/security-flags' && request.method === 'GET') {
@@ -28771,7 +29404,7 @@ async function handleRequest(request, env, ctx) {
         const dayF = todayVancouver();
         const flags = [];
         for (const k of await listAllKeys(env, 'acsec:flag:' + dayF + ':', 500)) {
-          const rec = await env.LEADS.get(k.name, { type: 'json' }).catch(() => null);
+          const rec = await acadRawGet(env, k.name, { type: 'json' }).catch(() => null);
           if (rec && rec.email) flags.push({ email: rec.email, day: rec.day || dayF, reasons: Array.isArray(rec.reasons) ? rec.reasons : [], flaggedAt: rec.flaggedAt || null });
         }
         flags.sort(function (a, b) { return a.email < b.email ? -1 : 1; });
@@ -29614,7 +30247,7 @@ async function handleRequest(request, env, ctx) {
         if (recD && recD.sent) return json({ ok: false, error: 'conflict' }, 409, origin);
         await env.LEADS.delete('mailq:' + mqm[1]);
         await idxRemove(env, 'mailq', mqm[1]);
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mailq_discard', target: mqm[1], ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'mailq_discard', target: mqm[1], ip: ip, at: new Date().toISOString() })); } catch (e) {}
         return json({ ok: true }, 200, origin);
       }
       if (mqm && request.method === 'PATCH') {
@@ -29663,7 +30296,7 @@ async function handleRequest(request, env, ctx) {
         curM.fromAcademy = MAIL_FROM_ACADEMY;
         curM.provisionedAt = new Date().toISOString();
         await env.LEADS.put('cfg:mail', JSON.stringify(curM));
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'mail_provision', target: 'cfg:mail', ip: ip, at: new Date().toISOString(), detail: { provider: 'resend' } }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'mail_provision', target: 'cfg:mail', ip: ip, at: new Date().toISOString(), detail: { provider: 'resend' } })); } catch (e) {}
         return json({ ok: true, provider: 'resend' }, 200, origin);
       }
       if (path === '/api/admin/mail/status' && request.method === 'GET') {
@@ -29707,7 +30340,7 @@ async function handleRequest(request, env, ctx) {
           cfgWriteVal = cfgMerged;
         }
         await siteKvPut(env, 'cfg:' + key, JSON.stringify(cfgWriteVal), { baseHash: cfgPrevS ? await sha256hex(cfgPrevS) : null }); // Pack SiteKvSpillway: only allow-listed non-secret cfg (cfg:platform) actually spills; secret-bearing keys degrade to the raw put inside siteKvPut
-        await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'config_set', target: key, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 });
+        await acadAuditPut(env, JSON.stringify({ action: 'config_set', target: key, ip: ip, at: new Date().toISOString() }));
         return json({ ok: true }, 200, origin);
       }
       if (path === '/api/admin/config' && request.method === 'GET') {
@@ -31196,7 +31829,7 @@ async function handleRequest(request, env, ctx) {
         if (enabled && !(await prPostLicense(env))) return json({ ok: false, error: 'licence_required' }, 403, origin);
         const prevSet = (await env.LEADS.get('radar:settings', { type: 'json' })) || {};
         await env.LEADS.put('radar:settings', JSON.stringify({ enabled: enabled, enabledAt: enabled ? (prevSet.enabledAt || new Date().toISOString()) : null, updated_at: new Date().toISOString() })); // Pack PF (PF-04): enabledAt lets the portal grace the empty-ledger alarm for the first ~3h after switch-on
-        try { await env.LEADS.put('audit:' + Date.now() + ':' + randHex(6), JSON.stringify({ action: 'radar_toggle', target: 'radar:settings', enabled: enabled, ip: ip, at: new Date().toISOString() }), { expirationTtl: 730 * 86400 }); } catch (e) {}
+        try { await acadAuditPut(env, JSON.stringify({ action: 'radar_toggle', target: 'radar:settings', enabled: enabled, ip: ip, at: new Date().toISOString() })); } catch (e) {}
         return json({ ok: true, enabled: enabled }, 200, origin);
       }
 
