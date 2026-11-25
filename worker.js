@@ -14269,6 +14269,7 @@ function acadParseKey(key) {
   if (typeof key !== 'string' || !key) return null;
   if (key === 'academy:contentUpdatedAt') return { fam: 'content_meta' };
   let rest, i;
+  if (key.indexOf('academy:watch:') === 0) { rest = key.slice(14); if (!/^\d{8}$/.test(rest)) return null; return { fam: 'watch', day: rest }; }
   if (key.indexOf('academy:snap:') === 0) return { fam: 'snap', email: key.slice(13) };
   if (key.indexOf('academy:') === 0) return { fam: 'student', email: key.slice(8) };
   if (key.indexOf('stok:') === 0) return { fam: 'session', hash: key.slice(5) };
@@ -14352,6 +14353,10 @@ async function acadStoreGet(env, key, opts) {
   } else if (p.fam === 'snap') {
     const row = await db.prepare('SELECT per_module_mastery_json, ts FROM cohort_snapshots WHERE email = ?').bind(p.email).first();
     if (row) str = JSON.stringify({ perModuleMastery: acadJParse(row.per_module_mastery_json) || {}, ts: row.ts });
+  } else if (p.fam === 'watch') {
+    const row = await db.prepare('SELECT doc_json, expires_at FROM watch_days WHERE day = ?').bind(p.day).first();
+    if (row && !acadExpired(row, now)) str = row.doc_json;
+    else if (row) expiredStmt = db.prepare('DELETE FROM watch_days WHERE day = ?').bind(p.day);
   } else if (p.fam === 'session') {
     const row = await db.prepare('SELECT email, exp_ms, remember, renewed_day, expires_at FROM student_sessions WHERE token_hash = ?').bind(p.hash).first();
     if (row && !acadExpired(row, now)) str = JSON.stringify({ email: row.email, exp: row.exp_ms, remember: !!row.remember, renewedDay: row.renewed_day });
@@ -14470,6 +14475,13 @@ async function acadStorePut(env, key, value, ttlSeconds) {
   const exp = acadD1Exp(ttlSeconds);
   if (p.fam === 'content_meta') {
     await db.prepare('INSERT INTO content_meta (id, content_updated_at) VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET content_updated_at = excluded.content_updated_at').bind(value).run();
+    return true;
+  }
+  if (p.fam === 'watch') {
+    // Daily tutor-watch aggregate: whole doc verbatim. expires_at via
+    // acadD1Exp from the caller's TTL — the video-token writer passes
+    // 90 d, mirroring its KV expirationTtl (DELTA-6).
+    await db.prepare('INSERT INTO watch_days (day, doc_json, expires_at) VALUES (?,?,?) ON CONFLICT (day) DO UPDATE SET doc_json = excluded.doc_json, expires_at = excluded.expires_at').bind(p.day, value, exp).run();
     return true;
   }
   const doc = acadJParse(value);
@@ -14639,6 +14651,7 @@ async function acadStoreDelete(env, key) {
   if (p.fam === 'content_meta') { await db.prepare('DELETE FROM content_meta WHERE id = 1').run(); return true; }
   if (p.fam === 'student') { await db.prepare('DELETE FROM students WHERE email = ?').bind(p.email).run(); return true; }
   if (p.fam === 'snap') { await db.prepare('DELETE FROM cohort_snapshots WHERE email = ?').bind(p.email).run(); return true; }
+  if (p.fam === 'watch') { await db.prepare('DELETE FROM watch_days WHERE day = ?').bind(p.day).run(); return true; }
   if (p.fam === 'session') { await db.prepare('DELETE FROM student_sessions WHERE token_hash = ?').bind(p.hash).run(); return true; }
   if (p.fam === 'setpw') { await db.prepare('DELETE FROM setpw_tokens WHERE token_hash = ?').bind(p.hash).run(); return true; }
   if (p.fam === 'lock') { await db.prepare('DELETE FROM login_locks WHERE email = ?').bind(p.email).run(); return true; }
@@ -14719,6 +14732,7 @@ async function acadD1Names(env, db, prefix) {
   if ('academy:'.indexOf(prefix) === 0 || prefix.indexOf('academy:') === 0 || prefix === '') {
     push(await all('SELECT email FROM students', function (r) { return 'academy:' + r.email; }));
     push(await all('SELECT email FROM cohort_snapshots', function (r) { return 'academy:snap:' + r.email; }));
+    push(await all('SELECT day FROM watch_days WHERE ' + LIVE, function (r) { return 'academy:watch:' + r.day; }));
     const cm = await db.prepare('SELECT content_updated_at FROM content_meta WHERE id = 1').first();
     if (cm && cm.content_updated_at) push(['academy:contentUpdatedAt']);
   }
@@ -24844,11 +24858,11 @@ async function handleRequest(request, env, ctx) {
           const sToken = await academyVideoMintToken(String(cfgV.tokenSecret), sClaims);
           try {
             const dayKeyS = 'academy:watch:' + todayVancouver().replace(/-/g, '');
-            const curS = (await env.LEADS.get(dayKeyS, { type: 'json' })) || { tokens: 0, students: {} };
+            const curS = (await acadRawGet(env, dayKeyS, { type: 'json' })) || { tokens: 0, students: {} };
             curS.tokens = (curS.tokens || 0) + 1;
             curS.students = curS.students || {};
             curS.students.sample = (curS.students.sample || 0) + 1;
-            await env.LEADS.put(dayKeyS, JSON.stringify(curS), { expirationTtl: 90 * 86400 });
+            await acadRawPut(env, dayKeyS, JSON.stringify(curS), 90 * 86400);
           } catch (e) {}
           return json({ ok: true, token: sToken, expiresAt: new Date(sClaims.exp).toISOString(), playlistUrl: '/api/academy/video/' + lessonId + '/' + lang + '/master.m3u8?t=' + sToken, wm: 'SAMPLE', sample: true }, 200, origin);
         }
@@ -24879,11 +24893,11 @@ async function handleRequest(request, env, ctx) {
         // like every other academy counter — it was a UTC day.
         try {
           const dayKey = 'academy:watch:' + todayVancouver().replace(/-/g, '');
-          const cur = (await env.LEADS.get(dayKey, { type: 'json' })) || { tokens: 0, students: {} };
+          const cur = (await acadRawGet(env, dayKey, { type: 'json' })) || { tokens: 0, students: {} };
           cur.tokens = (cur.tokens || 0) + 1;
           cur.students = cur.students || {};
           cur.students[sub] = (cur.students[sub] || 0) + 1;
-          await env.LEADS.put(dayKey, JSON.stringify(cur), { expirationTtl: 90 * 86400 });
+          await acadRawPut(env, dayKey, JSON.stringify(cur), 90 * 86400);
         } catch (e) {}
         await acsecEvent(env, normEmail(email), 'video'); // Pack AcademyProtect: harvest counter on entitled token issues (the public sample path above is never counted)
         const base = '/api/academy/video/' + lessonId + '/' + lang + '/master.m3u8?t=' + token;
