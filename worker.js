@@ -1802,6 +1802,37 @@ async function prKvJson(env, key) {
   // upstream-cache MISS and a corrupted cache entry look the same (null)
   try { return await env.LEADS.get(key, { type: 'json' }); } catch (e) { return null; }
 }
+/* Pack AdvisorKvFix (B3): the hourly prbudget counter mirrors
+   countListOp — accumulate in-isolate, flush the MERGED hourly total
+   every 10 increments (TTL 3700 s unchanged). The 300/hour upstream
+   budget is conservative and race-tolerant by design; a <=10-call lag
+   is inside its existing tolerance. */
+let prBudgetBuf = { hour: '', base: -1, pending: 0 };
+let prBudgetChain = Promise.resolve();
+function prBudgetHour() { return new Date().toISOString().slice(0, 13); }
+async function prBudgetLoad(env, h) { try { return Number(await env.LEADS.get('prbudget:' + h)) || 0; } catch (e) { return 0; } }
+async function prBudgetTotal(env) {
+  const h = prBudgetHour();
+  if (prBudgetBuf.hour !== h) prBudgetBuf = { hour: h, base: -1, pending: 0 };
+  if (prBudgetBuf.base < 0) prBudgetBuf.base = await prBudgetLoad(env, h);
+  return prBudgetBuf.base + prBudgetBuf.pending;
+}
+function flushPrBudget(env) {
+  if (prBudgetBuf.pending === 0) return prBudgetChain;
+  const h = prBudgetBuf.hour;
+  const total = prBudgetBuf.base + prBudgetBuf.pending;
+  prBudgetBuf.base = total; prBudgetBuf.pending = 0;
+  prBudgetChain = prBudgetChain.then(function () { return env.LEADS.put('prbudget:' + h, String(total), { expirationTtl: 3700 }); }).catch(function () {});
+  return prBudgetChain;
+}
+async function prBudgetSpend(env) {
+  const h = prBudgetHour();
+  if (prBudgetBuf.hour !== h) prBudgetBuf = { hour: h, base: -1, pending: 0 };
+  if (prBudgetBuf.base < 0) prBudgetBuf.base = await prBudgetLoad(env, h);
+  prBudgetBuf.pending++;
+  if (prBudgetBuf.pending >= 10) return flushPrBudget(env);
+  return prBudgetChain;
+}
 async function prGeocode(env, query, byPostal) {
   // returns { geo, status } with status 'ok' | 'not_found' | 'unavailable'
   // (PR-01 M4) — the routes surface it in their sources block.
@@ -1825,9 +1856,10 @@ async function prGeocode(env, query, byPostal) {
   // KV counter (race-tolerant by design) defers NEW lookups past a
   // conservative cap; cache hits never consume budget.
   let budgetN = 0;
+  const prAcademy = scopeOf(env) === 'academy';
   try {
-    const bk = 'prbudget:' + new Date().toISOString().slice(0, 13);
-    budgetN = Number(await env.LEADS.get(bk)) || 0;
+    if (prAcademy) { const bk = 'prbudget:' + new Date().toISOString().slice(0, 13); budgetN = Number(await env.LEADS.get(bk)) || 0; }
+    else budgetN = await prBudgetTotal(env);
     if (budgetN >= 300) return { geo: null, status: 'unavailable' };
   } catch (e) {}
   const u = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&countrycodes=ca&' +
@@ -1836,7 +1868,7 @@ async function prGeocode(env, query, byPostal) {
   if (!t.ok) return { geo: null, status: 'unavailable' };
   // PG-01 M2: the hourly budget is spent only by a successful upstream
   // answer (a Nominatim outage must not burn the hour's allowance)
-  try { await env.LEADS.put('prbudget:' + new Date().toISOString().slice(0, 13), String(budgetN + 1), { expirationTtl: 3700 }); } catch (e) {}
+  try { if (prAcademy) { await env.LEADS.put('prbudget:' + new Date().toISOString().slice(0, 13), String(budgetN + 1), { expirationTtl: 3700 }); } else { await prBudgetSpend(env); } } catch (e) {} // Pack AdvisorKvFix (B3): site scope coalesces (flush every 10); academy scope legacy
   const r0 = Array.isArray(t.data) && t.data[0];
   const negCache = async () => { try { await env.LEADS.put(key, JSON.stringify({ none: 1 }), { expirationTtl: 21600 }); } catch (e) {} };
   if (!r0) { await negCache(); return { geo: null, status: 'not_found' }; } // negative cache ~6h (M2)
@@ -2217,6 +2249,23 @@ async function ensureCatalog(env) {
 function catalogIsFresh() {
   return customCatalogAt > 0 && (Date.now() - customCatalogAt) < 90000;
 }
+/* Pack AdvisorKvFix (B6): catalog:snap becomes hash-gated — the
+   content hash (listings+deleted, NOT the build stamp) is stored
+   beside the doc at catalog:snap:h and a rebuild/update puts ONLY
+   when the hash differs. Academy scope keeps the legacy
+   unconditional put and never writes the hash key. */
+async function catalogSnapWrite(env, listings, deleted, atMs) {
+  const body = JSON.stringify({ listings: listings, deleted: deleted, at: atMs });
+  if (scopeOf(env) === 'academy') { await env.LEADS.put('catalog:snap', body); catalogDataAt = Math.max(catalogDataAt, atMs); return true; }
+  const h = await sha256hex(JSON.stringify({ listings: listings, deleted: deleted }));
+  let oldH = null;
+  try { oldH = await env.LEADS.get('catalog:snap:h'); } catch (e) {}
+  if (oldH === h) { catalogDataAt = Math.max(catalogDataAt, atMs); return false; }
+  await env.LEADS.put('catalog:snap', body);
+  try { await env.LEADS.put('catalog:snap:h', h); } catch (e) {}
+  catalogDataAt = Math.max(catalogDataAt, atMs);
+  return true;
+}
 async function buildCatalogSnap(env) {
   const full = [], deleted = [];
   const seeds = Object.create(null); // Pack PK (supp3 C6): null-prototype, keyed by mls
@@ -2236,7 +2285,7 @@ async function buildCatalogSnap(env) {
   // Pack PK (supp3 C2): a failed snapshot write is SURFACED (error
   // log), never swallowed silently — other isolates keep serving the
   // old catalog and nobody used to notice.
-  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: full, deleted: deleted, at: builtAt })); catalogDataAt = Math.max(catalogDataAt, builtAt); }
+  try { await catalogSnapWrite(env, full, deleted, builtAt); }
   catch (e) { console.error('catalog snapshot write failed (buildCatalogSnap): ' + (e && e.message || e)); }
   return { full: full, deleted: deleted };
 }
@@ -2253,7 +2302,7 @@ async function updateCatalogSnap(env, rec, removedMls, tombstone) {
     if (tombstone && deleted.indexOf(removedMls) === -1) deleted.push(removedMls);
   }
   const writeAt = Date.now();
-  try { await env.LEADS.put('catalog:snap', JSON.stringify({ listings: listings, deleted: deleted, at: writeAt })); catalogDataAt = Math.max(catalogDataAt, writeAt); }
+  try { await catalogSnapWrite(env, listings, deleted, writeAt); }
   catch (e) { console.error('catalog snapshot write failed (updateCatalogSnap): ' + (e && e.message || e)); }
 }
 async function doRefreshCustomCatalog(env) {
@@ -2633,7 +2682,17 @@ async function runUsageAlertWatchdog(env, opts) {
       if (m.pct >= 95) await ebEmit(env, 'system.degraded', { what: 'usage-critical', system: 'usage-watchdog', metric: m.key, pct: m.pct, impact: (m.label || m.key) + ' is at ' + m.pct + '% of its cap — the service is at risk of hitting its limit before the reset.', fix: 'See the held usage-alert mail for the per-metric solution and reset time.' }, { source: 'usage-watchdog', now: now });
     }
   }
-  try { await env.LEADS.put('usagealert:lastcheck', JSON.stringify({ at: out.at, crossed: out.crossed, alerted: out.alerted })); } catch (e) {}
+  /* Pack AdvisorKvFix (B7): the heartbeat stamp is WRITE-ON-CHANGE —
+     put only when crossed/alerted differ from the stored stamp, or
+     once per UTC day as a liveness floor. A quiet day costs ~1 put
+     instead of 24. Academy scope keeps the legacy unconditional put
+     (the watchdog never runs there; defence in depth). */
+  try {
+    const prevLc = await env.LEADS.get('usagealert:lastcheck', { type: 'json' }).catch(function () { return null; });
+    const sameSets = !!prevLc && JSON.stringify(prevLc.crossed || []) === JSON.stringify(out.crossed) && JSON.stringify(prevLc.alerted || []) === JSON.stringify(out.alerted);
+    const sameUtcDay = !!prevLc && String(prevLc.at || '').slice(0, 10) === out.at.slice(0, 10);
+    if (scopeOf(env) === 'academy' || !sameSets || !sameUtcDay) await env.LEADS.put('usagealert:lastcheck', JSON.stringify({ at: out.at, crossed: out.crossed, alerted: out.alerted }));
+  } catch (e) {}
   return out;
 }
 
@@ -2663,6 +2722,9 @@ async function buildUsageSplit(env) {
         let wrS = null;
         try { wrS = await kvWriteUsage(env); } catch (e) {}
         siteM.push({ key: 'kv_writes_self', label: 'LEADS KV writes (self-counted)', used: wrS ? wrS.count : null, limit: 1000, unit: 'writes', pct: wrS ? pctOf(wrS.count, 1000) : null, resetText: RESET_UTC, resetKind: 'utc-day', fallback: 'Spillway to R2 is LIVE on the site deployment: on a write-cap day, records divert to R2 and drain back into KV after the reset.', state: wrS ? 'ok' : 'unreadable', note: 'Counted by the worker itself (usage:writes, coalesced flush every 20 writes).', extra: wrS ? { families: wrS.families, puts: wrS.puts, deletes: wrS.deletes } : null });
+        let spillB = null;
+        try { spillB = await siteSpillBacklog(env); } catch (e) {}
+        siteM.push({ key: 'spill_backlog', label: 'Site KV spill backlog', used: (spillB && spillB.available) ? spillB.total : null, limit: null, unit: 'entries', pct: null, resetText: 'Drips back at \u226425/hour outside the 00:00\u201301:00 UTC reset hour.', resetKind: 'none', fallback: 'This IS the fallback working \u2014 overflow records stay readable from R2 until drained.', state: (spillB && spillB.available) ? 'info' : 'unreadable', note: (spillB && spillB.available && spillB.total > 0) ? 'Entries waiting in the R2 overflow; the hourly drip replays \u226425 per tick.' : 'Empty \u2014 no spill waiting.', extra: spillB ? { families: spillB.families } : null });
         let mqUnsent = null, mqOldest = null;
         try {
           const mk = await listAllKeys(env, 'mailq:', 2000);
@@ -10841,8 +10903,17 @@ async function mailReleaseSend(env, mid, ip) {
   if (!text.trim()) return hold('empty_body');
   /* --- the state machine transitions --- */
   const attempts = (typeof prev.attempts === 'number' ? prev.attempts : 0) + 1;
-  rec.sendState = { state: 'released', at: new Date().toISOString(), by: 'owner', attempts: attempts };
-  await siteKvPut(env, 'mailq:' + mid, JSON.stringify(rec));
+  /* Pack AdvisorKvFix (B5): the released->sending stamps collapse into
+     ONE put — 'sending' (with attempts) is stamped before the provider
+     call, preserving the documented crash semantics (a record never
+     reads 'never attempted' once the call starts). Per release the
+     state puts go 3 -> 2 (sending + final); the audit put stays
+     per-event, unchanged. Academy scope keeps the legacy two-stamp
+     sequence byte-identically. */
+  if (scopeOf(env) === 'academy') {
+    rec.sendState = { state: 'released', at: new Date().toISOString(), by: 'owner', attempts: attempts };
+    await siteKvPut(env, 'mailq:' + mid, JSON.stringify(rec));
+  }
   rec.sendState = { state: 'sending', at: new Date().toISOString(), by: 'owner', attempts: attempts };
   await env.LEADS.put('mailq:' + mid, JSON.stringify(rec)); // Pack SiteKvSpillway: 'sending' stays RAW by design (audit §5.6) — a capped KV fails the release BEFORE Resend is called
   const out = await mailSend(env, { from: mailFromFor(rec), to: to, subject: subject, text: text, html: mailHtmlFor(rec, text, pnaPostLic) });
@@ -13378,8 +13449,9 @@ async function runFullBackup(env, source) {
   } catch (e) {
     try {
       const log2 = (await env.LEADS.get('backup:log', { type: 'json' })) || [];
-      log2.unshift({ day: day, at: at, ok: false, error: String((e && e.message) || e).slice(0, 160), source: source || 'cron' });
-      await env.LEADS.put('backup:log', JSON.stringify(log2.slice(0, 40)));
+      const failEntry = { day: day, at: at, ok: false, error: String((e && e.message) || e).slice(0, 160), source: source || 'cron' };
+      const newest2 = log2[0];
+      if (!(newest2 && newest2.day === failEntry.day && newest2.ok === false && newest2.error === failEntry.error && newest2.source === failEntry.source)) { log2.unshift(failEntry); await env.LEADS.put('backup:log', JSON.stringify(log2.slice(0, 40))); } // Pack AdvisorKvFix (§3): the failure entry is write-on-change — skip when the newest entry is identical (modulo its timestamp)
     } catch (e2) {}
     return { ok: false, day: day, error: String((e && e.message) || e) };
   }
@@ -15125,10 +15197,18 @@ async function vidxMergedRecords(env, capN) {
    aggregate audit record per call. */
 async function siteSpillDrain(env, opts) {
   const o = opts || {};
-  const limit = Math.max(1, Math.min(500, parseInt(o.limit, 10) || 200));
-  const out = { ok: true, replayed: 0, expired: 0, deleted: 0, conflicts: 0, marked: 0, remaining: 0, stoppedAt: null };
+  /* Pack AdvisorKvFix (Stage 3, §2): THROTTLED DRIP — default 25 per
+     call. Only an explicit owner-manual call (opts.manual) may raise
+     the limit (hard cap 500, the pre-pack maximum); scheduled callers
+     and any caller that does not authenticate as the owner-manual
+     path are capped at 25 regardless of the limit passed (survey U2
+     protection). Requested/effective limits land in the audit. */
+  const limitRequested = parseInt(o.limit, 10);
+  const limitCap = (o.manual === true) ? 500 : 25;
+  const limit = Math.max(1, Math.min(limitCap, (isFinite(limitRequested) && limitRequested > 0) ? limitRequested : 25));
+  const out = { ok: true, replayed: 0, expired: 0, deleted: 0, conflicts: 0, marked: 0, remaining: 0, stoppedAt: null, limitRequested: isFinite(limitRequested) ? limitRequested : null, limitEffective: limit, scheduled: o.scheduled === true, manual: o.manual === true };
   const finish = async function () {
-    try { await acadAuditPut(env, JSON.stringify({ action: 'site_kv_drain', target: 'site-kv-overflow', ip: 'internal', at: new Date().toISOString(), detail: { replayed: out.replayed, expired: out.expired, deleted: out.deleted, conflicts: out.conflicts, marked: out.marked, remaining: out.remaining, stoppedAt: out.stoppedAt } })); } catch (e) {}
+    try { await acadAuditPut(env, JSON.stringify({ action: 'site_kv_drain', target: 'site-kv-overflow', ip: 'internal', at: new Date().toISOString(), detail: { replayed: out.replayed, expired: out.expired, deleted: out.deleted, conflicts: out.conflicts, marked: out.marked, remaining: out.remaining, stoppedAt: out.stoppedAt, limitRequested: out.limitRequested, limitEffective: out.limitEffective, scheduled: out.scheduled, manual: out.manual } })); } catch (e) {}
     return out;
   };
   const cfg = await siteSpillCfg(env);
@@ -15204,6 +15284,50 @@ async function siteSpillDrain(env, opts) {
   }
   out.remaining = total - processed;
   return finish();
+}
+/* Pack AdvisorKvFix (§2.4): spill backlog visibility — per-family
+   manifest counts, surfaced in the usage split as 'spill backlog'.
+   Read-only: manifests come from the bridge; no KV writes. */
+async function siteSpillBacklog(env) {
+  const cfg = await siteSpillCfg(env);
+  if (!cfg) return { available: false, total: 0, families: {} };
+  const families = {};
+  let total = 0, any = false;
+  for (const f of SITE_SPILL_FAMILIES) {
+    const man = await siteSpillManifest(env, f, false);
+    if (!man) continue;
+    any = true;
+    const n = Object.keys(man.entries || {}).length;
+    families[f] = n; total += n;
+  }
+  return { available: any, total: total, families: families };
+}
+/* Deterministic ±0–4 min jitter derived from the UTC day+hour, so the
+   drip never aligns with the :07 watchdog's own writes or the
+   maintenance burst (design §2.2). */
+function spillDripJitterMs(d) {
+  const s = d.toISOString().slice(0, 13);
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h * 31) + s.charCodeAt(i)) >>> 0;
+  return h % 240001;
+}
+/* The scheduled drip (design §2.2/§2.3): TOTAL SILENCE during
+   00:00–01:00 UTC (the reset hour) — the hour check runs BEFORE any
+   backlog probe, so not even a manifest read is spent then. With no
+   backlog (or no bridge) it is a no-op and writes NO audit; with a
+   backlog it waits out the jitter, then runs ONE drain batch of
+   <=25 with scheduled:true (hard-capped at 25 inside the drain). */
+async function siteSpillDrip(env, opts) {
+  const o = opts || {};
+  const now = o.now ? new Date(o.now) : new Date();
+  if (now.getUTCHours() === 0) return { skipped: 'reset_hour', replayed: 0 };
+  const backlog = await siteSpillBacklog(env);
+  if (!backlog.available || backlog.total <= 0) return { skipped: 'no_backlog', backlog: backlog.total, replayed: 0 };
+  const jitter = (typeof o.jitterMs === 'number') ? o.jitterMs : spillDripJitterMs(now);
+  if (jitter > 0) { try { await new Promise(function (r) { setTimeout(r, jitter); }); } catch (e) {} }
+  const res = await siteSpillDrain(env, { limit: 25, scheduled: true });
+  res.backlogBefore = backlog.total;
+  return res;
 }
 
 function effectiveStatus(rec, nowMs) {
@@ -18249,7 +18373,7 @@ async function runAutomations(env, source) {
     // just queued or stamped would stay hidden behind gen-matched
     // admin cache entries until the GEN_CACHE_MAX_AGE cap. The memo
     // reset mirrors the wrapper so this isolate re-reads it too.
-    try { await env.LEADS.put('admin:gen', String(Date.now())); genMemo = { t: 0, v: null }; } catch (e) {}
+    try { if (genBumpDue()) { await env.LEADS.put('admin:gen', String(Date.now())); genMemo = { t: 0, v: null }; } } catch (e) {} // Pack AdvisorKvFix (B2): the cron path shares the fetch wrapper's 60 s per-isolate throttle
   } finally {
     try {
       const curLock = await env.LEADS.get('lock:automations', { type: 'json' });
@@ -20065,15 +20189,181 @@ function brainPaidHints(cfg) {
   }
   return Object.keys(out).length ? out : undefined;
 }
-async function brainUsage(env) {
-  try { return parseInt(await env.LEADS.get('brain:usage:' + todayVancouver()) || '0', 10) || 0; } catch (e) { return 0; }
+/* ---- Pack AdvisorKvFix (Stage 3, B1): brain counters -> delta+fold,
+   the perf/stat pattern. brainCall no longer RMW-puts brain:usage:<day>
+   or brain:log per call. Charges accumulate in this isolate's buffer
+   and flush ONE delta key 'brain:d:<day>:<isolate>:<seq>' per 10 charges
+   or 60 s (TTL 2 d, matching the old usage TTL); log entries buffer and
+   flush ONE delta doc 'brain:logd:<isolate>:<seq>' per 10 entries or
+   60 s. brainUsage/brainLogRead MERGE the stored totals/log +
+   outstanding deltas + this isolate's own buffer (the statReadMerged
+   shape), so the PM8b pre-charge cap check in brainCall stays the
+   authority: the merged read keeps the soft cap honest within one
+   flush window (<=10 charges). brainFold (scheduled() only) is the
+   sole writer of brain:usage:<day> and brain:log; its folded-name map
+   lives at 'brain:folded' (perfFold idempotency: totals put lands
+   before deletes; a delta already in the map is re-deleted without
+   re-adding; an unreadable delta is left in place, never deleted
+   unfolded). brain:usage:<day> values written by the fold are JSON
+   {n} docs; brainUsageParse still reads the legacy plain-string shape.
+   ACADEMY SCOPE: legacy per-call RMW behaviour, byte-identical. ---- */
+let brainIsoId = null;
+function brainIso() { if (!brainIsoId) brainIsoId = crypto.randomUUID(); return brainIsoId; }
+let brainSeq = 0, brainLogSeq = 0;
+let brainBuf = { day: '', usage: 0, log: [], firstTs: 0 };
+let brainFlushChain = Promise.resolve();
+function brainUsageParse(raw) {
+  if (raw === null || raw === undefined) return 0;
+  const s = String(raw);
+  if (s.charAt(0) === '{') { try { const j = JSON.parse(s); return (j && typeof j.n === 'number' && isFinite(j.n)) ? Math.floor(j.n) : 0; } catch (e) { return 0; } }
+  return parseInt(s, 10) || 0;
 }
-async function brainLog(env, entry) {
+function flushBrain(env) {
+  if (brainBuf.usage === 0 && brainBuf.log.length === 0) return brainFlushChain;
+  const day = brainBuf.day || todayVancouver();
+  const usage = brainBuf.usage;
+  const entries = brainBuf.log.slice();
+  brainBuf = { day: day, usage: 0, log: [], firstTs: 0 };
+  brainFlushChain = brainFlushChain.then(async function () {
+    if (usage > 0) { try { await env.LEADS.put('brain:d:' + day + ':' + brainIso() + ':' + (++brainSeq), JSON.stringify({ usage: usage, at: new Date().toISOString() }), { expirationTtl: 172800 }); } catch (e) {} }
+    if (entries.length) { try { await env.LEADS.put('brain:logd:' + brainIso() + ':' + (++brainLogSeq), JSON.stringify({ entries: entries, at: new Date().toISOString() }), { expirationTtl: 172800 }); } catch (e) {} }
+  }).catch(function () {});
+  return brainFlushChain;
+}
+function brainBufDay(env) {
+  const day = todayVancouver();
+  if (brainBuf.day && brainBuf.day !== day) { flushBrain(env); brainBuf.day = day; }
+  if (!brainBuf.day) brainBuf.day = day;
+  if (!brainBuf.firstTs) brainBuf.firstTs = Date.now();
+}
+function brainNoteUsage(env, charge) {
+  brainBufDay(env);
+  brainBuf.usage += charge;
+  if (brainBuf.usage >= 10 || Date.now() - brainBuf.firstTs >= 60000) return flushBrain(env);
+  return brainFlushChain;
+}
+function brainNoteLog(env, entry) {
+  brainBufDay(env);
+  brainBuf.log.push(Object.assign({ at: new Date().toISOString() }, entry));
+  if (brainBuf.log.length >= 10 || Date.now() - brainBuf.firstTs >= 60000) return flushBrain(env);
+  return brainFlushChain;
+}
+async function brainFoldedMap(env) {
+  const meta = { u: {}, l: {} };
+  try { const m = await env.LEADS.get('brain:folded', { type: 'json' }); if (m && typeof m === 'object') { if (m.u && typeof m.u === 'object') meta.u = m.u; if (m.l && typeof m.l === 'object') meta.l = m.l; } } catch (e) {}
+  return meta;
+}
+async function brainUsage(env) {
+  const day = todayVancouver();
+  let total = 0;
+  try { total = brainUsageParse(await env.LEADS.get('brain:usage:' + day)); } catch (e) { return (brainBuf.day === day) ? brainBuf.usage : 0; }
+  try {
+    const meta = await brainFoldedMap(env);
+    let cursor;
+    do {
+      const page = await kvList(env, { prefix: 'brain:d:' + day + ':', limit: 1000, cursor: cursor });
+      for (const k of page.keys) {
+        if (meta.u[k.name]) continue;
+        const d = await env.LEADS.get(k.name, { type: 'json' }).catch(function () { return null; });
+        if (d && typeof d.usage === 'number' && isFinite(d.usage)) total += d.usage;
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch (e) {}
+  if (brainBuf.day === day) total += brainBuf.usage;
+  return total;
+}
+async function brainLogRead(env) {
+  let stored = [];
+  try { stored = (await env.LEADS.get('brain:log', { type: 'json' })) || []; } catch (e) {}
+  if (scopeOf(env) === 'academy') return stored;
+  const fresh = [];
+  try {
+    const meta = await brainFoldedMap(env);
+    let cursor;
+    do {
+      const page = await kvList(env, { prefix: 'brain:logd:', limit: 1000, cursor: cursor });
+      for (const k of page.keys) {
+        if (meta.l[k.name]) continue;
+        const d = await env.LEADS.get(k.name, { type: 'json' }).catch(function () { return null; });
+        if (d && Array.isArray(d.entries)) for (const e of d.entries) fresh.push(e);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch (e) {}
+  fresh.sort(function (a, b) { return String((b && b.at) || '').localeCompare(String((a && a.at) || '')); });
+  const own = brainBuf.log.slice().reverse();
+  return own.concat(fresh).concat(stored).slice(0, 200);
+}
+async function brainLogLegacy(env, entry) {
   try {
     const log = (await env.LEADS.get('brain:log', { type: 'json' })) || [];
     log.unshift(Object.assign({ at: new Date().toISOString() }, entry));
     await env.LEADS.put('brain:log', JSON.stringify(log.slice(0, 200)));
   } catch (e) {}
+}
+async function brainLog(env, entry) {
+  if (scopeOf(env) === 'academy') return brainLogLegacy(env, entry);
+  try { brainNoteLog(env, entry); } catch (e) {}
+}
+/* The brain fold — runs ONLY from scheduled(), the sole writer of
+   brain:usage:<day> and brain:log. Mirrors perfFold's contract. */
+async function brainFold(env) {
+  const res = { usageDeltas: 0, logDeltas: 0, days: 0 };
+  try { await flushBrain(env); } catch (e) {}
+  const meta = await brainFoldedMap(env);
+  try {
+    const uKeys = [];
+    let cursor;
+    do { const page = await kvList(env, { prefix: 'brain:d:', limit: 1000, cursor: cursor }); for (const k of page.keys) uKeys.push(k.name); cursor = page.list_complete ? undefined : page.cursor; } while (cursor);
+    const byDay = {};
+    for (const k of uKeys) { const m = /^brain:d:(\d{4}-\d{2}-\d{2}):/.exec(k); if (m) { (byDay[m[1]] = byDay[m[1]] || []).push(k); } }
+    for (const day of Object.keys(byDay)) {
+      let stored = 0;
+      try { stored = brainUsageParse(await env.LEADS.get('brain:usage:' + day)); } catch (e) { continue; }
+      let add = 0; const del = []; const freshKeys = [];
+      for (const k of byDay[day]) {
+        if (meta.u[k]) { del.push(k); continue; }
+        let d = null; try { d = await env.LEADS.get(k, { type: 'json' }); } catch (e) { d = null; }
+        if (!d || typeof d.usage !== 'number') continue;
+        add += d.usage; freshKeys.push(k); del.push(k);
+      }
+      if (add > 0) {
+        try { await env.LEADS.put('brain:usage:' + day, JSON.stringify({ n: stored + add }), { expirationTtl: 172800 }); } catch (e) { continue; }
+        for (const k of freshKeys) { meta.u[k] = 1; res.usageDeltas++; }
+      }
+      for (const k of del) { try { await env.LEADS.delete(k); } catch (e) {} }
+      res.days++;
+    }
+  } catch (e) {}
+  try {
+    const lKeys = [];
+    let cursor2;
+    do { const page = await kvList(env, { prefix: 'brain:logd:', limit: 1000, cursor: cursor2 }); for (const k of page.keys) lKeys.push(k.name); cursor2 = page.list_complete ? undefined : page.cursor; } while (cursor2);
+    if (lKeys.length) {
+      let storedLog = [];
+      try { storedLog = (await env.LEADS.get('brain:log', { type: 'json' })) || []; } catch (e) { storedLog = []; }
+      const fresh = []; const del = []; const freshKeys = [];
+      for (const k of lKeys) {
+        if (meta.l[k]) { del.push(k); continue; }
+        let d = null; try { d = await env.LEADS.get(k, { type: 'json' }); } catch (e) { d = null; }
+        if (!d || !Array.isArray(d.entries)) continue;
+        for (const e of d.entries) fresh.push(e);
+        freshKeys.push(k); del.push(k);
+      }
+      if (fresh.length) {
+        fresh.sort(function (a, b) { return String((b && b.at) || '').localeCompare(String((a && a.at) || '')); });
+        let putOk = false;
+        try { await env.LEADS.put('brain:log', JSON.stringify(fresh.concat(storedLog).slice(0, 200))); putOk = true; } catch (e) {}
+        if (putOk) { for (const k of freshKeys) { meta.l[k] = 1; res.logDeltas++; } }
+        else { for (const k of freshKeys) { const ix = del.indexOf(k); if (ix >= 0) del.splice(ix, 1); } }
+      }
+      for (const k of del) { try { await env.LEADS.delete(k); } catch (e) {} }
+    }
+  } catch (e) {}
+  for (const sec of ['u', 'l']) { const ks = Object.keys(meta[sec]); if (ks.length > 400) { const nm = {}; for (const k of ks.slice(-400)) nm[k] = 1; meta[sec] = nm; } }
+  try { await env.LEADS.put('brain:folded', JSON.stringify(meta)); } catch (e) {}
+  return res;
 }
 /* The one transport for every brain feature. Never throws; the result
    is always {ok, text?, via?, error?}. Mirrors aiInternal's binding +
@@ -20144,7 +20434,13 @@ async function brainCall(env, opts) {
     return { ok: false, error: err };
   }
   if (opts.count !== false) {
-    try { await env.LEADS.put('brain:usage:' + todayVancouver(), String(used + charge), { expirationTtl: 172800 }); } catch (e) {}
+    /* Pack AdvisorKvFix (B1): the charge lands in the isolate buffer
+       (delta+fold) on site scope; academy scope keeps the legacy
+       per-call RMW put. The cap check above already read the MERGED
+       usage (stored + deltas + buffer), so the pre-charge authority
+       is unchanged. */
+    if (scopeOf(env) === 'academy') { try { await env.LEADS.put('brain:usage:' + todayVancouver(), String(used + charge), { expirationTtl: 172800 }); } catch (e) {} }
+    else { try { brainNoteUsage(env, charge); } catch (e) {} }
     await brainLog(env, { task: task, via: j.via || '', ok: true, ch: res.ch || '' });
   }
   return { ok: true, text: String(j.text), via: j.via || '', sources: brainSanSources(j.sources), researchNote: typeof j.researchNote === 'string' ? j.researchNote : '' };
@@ -22877,7 +23173,7 @@ async function handleRequest(request, env, ctx) {
       if (!dsec || !timingSafeEqual(dsec, String(dicfg.secret))) return json({ ok: false, error: 'unauthorized' }, 401, origin);
       let dbody = null;
       try { dbody = await request.json(); } catch (e) {}
-      const dres = await siteSpillDrain(env, { limit: dbody && dbody.limit });
+      const dres = await siteSpillDrain(env, { limit: dbody && dbody.limit, manual: !!(dbody && dbody.manual === true), scheduled: !!(dbody && dbody.scheduled === true) }); // Pack AdvisorKvFix (§2.1): no manual flag -> capped at 25 whatever limit is passed
       return json(dres, dres.ok ? 200 : 503, origin);
     }
 
@@ -28941,7 +29237,7 @@ async function handleRequest(request, env, ctx) {
         const cfg = await brainCfg(env);
         const used = await brainUsage(env);
         let log = [];
-        try { log = (await env.LEADS.get('brain:log', { type: 'json' })) || []; } catch (e) {}
+        try { log = await brainLogRead(env); } catch (e) {} // Pack AdvisorKvFix (B1): merged read (stored + log deltas + own buffer)
         let predCheck = null;
         try { predCheck = await env.LEADS.get('brain:predcheck', { type: 'json' }); } catch (e) {}
         return json({ ok: true, configured: !!cfg.secret, cap: cfg.dailyCap, used: used, left: Math.max(0, cfg.dailyCap - used), binding: !!(env.AICHAT && typeof env.AICHAT.fetch === 'function'), providers: { claude: !!(cfg.providers && cfg.providers.claude), grok: !!(cfg.providers && cfg.providers.grok), perplexity: !!(cfg.providers && cfg.providers.perplexity) }, predictionAccuracy: predCheck, log: log.slice(0, 10) }, 200, origin);
@@ -31424,7 +31720,9 @@ async function handleRequest(request, env, ctx) {
             for (const [nm, pfx] of IDX_DEFS) {
               const names = await listAll(pfx);
               if (!names.length) { const oldIdx = (await env.LEADS.get('idx:' + nm, { type: 'json' })) || []; if (oldIdx.length) { repairs.push('Reindex kept the old ' + nm + ' index — the ground-truth list came back empty'); continue; } } // a transient empty list must not wipe a good index (cycle 30, Claude M4)
-              await env.LEADS.put('idx:' + nm, JSON.stringify(names.map(function (n) { return n.slice(pfx.length); })));
+              const rebuiltIdx = JSON.stringify(names.map(function (n) { return n.slice(pfx.length); }));
+              const storedIdx = await env.LEADS.get('idx:' + nm);
+              if (storedIdx !== rebuiltIdx) await env.LEADS.put('idx:' + nm, rebuiltIdx); // Pack AdvisorKvFix (B6): compare-first — no put when the rebuild changes nothing
             }
             await buildCatalogSnap(env);
           } catch (e) {}
@@ -31457,10 +31755,11 @@ async function handleRequest(request, env, ctx) {
           try { const r = await newsFetch('https://newsletter-signup.erfanbillion.workers.dev', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }); check('newsletter service', r.status < 500, 'status ' + r.status); } catch (e) { check('newsletter service', false, 'unreachable'); }
           // repairs: expired admin tokens + visitor sessions
           let purged = 0;
-          for (const k of (await listAll('tok:')).slice(0, 300)) { const exp = parseInt((await env.LEADS.get(k)) || '0', 10); if (!exp || Date.now() > exp) { await env.LEADS.delete(k); purged++; } }
+          let purgeLeft = 100; // Pack AdvisorKvFix (§3): ONE shared purge budget of 100 deletes per maintenance run across both families — the remainder waits for the next run (expired tokens/sessions are TTL-unreadable regardless)
+          for (const k of (await listAll('tok:')).slice(0, 300)) { if (purgeLeft <= 0) break; const exp = parseInt((await env.LEADS.get(k)) || '0', 10); if (!exp || Date.now() > exp) { await env.LEADS.delete(k); purged++; purgeLeft--; } }
           if (purged) repairs.push('Purged ' + purged + ' expired admin tokens');
           let sessPurged = 0;
-          for (const k of (await listAll('usess:')).slice(0, 300)) { let exp = 0; try { exp = (JSON.parse((await env.LEADS.get(k)) || '{}')).exp || 0; } catch (e) {} if (!exp || Date.now() > exp) { await env.LEADS.delete(k); sessPurged++; } }
+          for (const k of (await listAll('usess:')).slice(0, 300)) { if (purgeLeft <= 0) break; let exp = 0; try { exp = (JSON.parse((await env.LEADS.get(k)) || '{}')).exp || 0; } catch (e) {} if (!exp || Date.now() > exp) { await env.LEADS.delete(k); sessPurged++; purgeLeft--; } }
           if (sessPurged) repairs.push('Purged ' + sessPurged + ' expired visitor sessions');
           // mail queue: count unsent directly from the records (queueMail no
           // longer maintains an index key — records are the source of truth).
@@ -31927,10 +32226,21 @@ export default {
       try { await ebTickWrite(env, cronStr); } catch (e) { console.error(e); }
       try { await eb4BriefTick(env, { now: (event && typeof event.scheduledTime === 'number') ? event.scheduledTime : undefined }); } catch (e) { console.error(e); } /* Pack EB-4: briefing generation on the hourly chain (once-only markers inside; counted-env = silent no-op) */
       try { await eb8Hourly(env); } catch (e) { console.error(e); } /* Pack EB-8: IT Support hourly (proactive pre-diagnosis, self-tests, secblock expiry sweep, silence alarms, escalation ladder, upstream status; site scope only, counted-env no-op inside) */
+      /* Pack AdvisorKvFix (§3): the heavy daily jobs ROTATE onto this
+         hourly tick under their existing 23 h guards — reconcile on
+         even UTC hours, catalog rebuild on odd — instead of bursting
+         together inside the 09:00 UTC nightly chain. They ride AFTER
+         the EB steps above (rebase note: the true base's hourly branch
+         carries EB-1/EB-4/EB-8 steps the original pack base lacked). */
+      try { if (new Date().getUTCHours() % 2 === 0) await idxReconcile(env); else await catalogSnapRebuild(env); } catch (e) { console.error(e); }
+      /* Pack AdvisorKvFix (§2): the spillway DRIP rides the same tick,
+         last — <=25 entries, jittered, and TOTAL SILENCE during
+         00:00–01:00 UTC (the reset hour). */
+      try { await siteSpillDrip(env); } catch (e) { console.error(e); }
     })()); return; }
     ctx.waitUntil((async function () {
       if (heavyOk) {
-        await runFullBackup(env, 'cron').catch(async function (e) { try { console.error(e); const bl = (await env.LEADS.get('backup:log', { type: 'json' })) || []; bl.unshift({ at: new Date().toISOString(), day: vancouverDay(), ok: false, via: 'cron-catch', error: String((e && e.message) || e).slice(0, 160) }); await env.LEADS.put('backup:log', JSON.stringify(bl.slice(0, 40))); } catch (e2) {} }); // a rejected backup must still leave a failure entry the freshness alarm can see (cycle 30, Claude M7)
+        await runFullBackup(env, 'cron').catch(async function (e) { try { console.error(e); const bl = (await env.LEADS.get('backup:log', { type: 'json' })) || []; const fe = { at: new Date().toISOString(), day: vancouverDay(), ok: false, via: 'cron-catch', error: String((e && e.message) || e).slice(0, 160) }; const nb = bl[0]; if (!(nb && nb.day === fe.day && nb.ok === false && nb.error === fe.error && nb.via === 'cron-catch')) { bl.unshift(fe); await env.LEADS.put('backup:log', JSON.stringify(bl.slice(0, 40))); } } catch (e2) {} }); // Pack AdvisorKvFix (§3): failure entry write-on-change, same rule as runFullBackup // a rejected backup must still leave a failure entry the freshness alarm can see (cycle 30, Claude M7)
       }
       // Perf counters (F-01 redesign): flush THIS isolate's trailing
       // delta first, then fold every outstanding delta key into
@@ -31945,19 +32255,21 @@ export default {
       // isolate's trailing stat delta, then fold every outstanding
       // 'stat:d:' key into its day doc (statFold is its sole writer).
       try { await flushTrack(env); await statFold(env); } catch (e) { console.error(e); }
+      // Pack AdvisorKvFix (B1): same discipline for the brain counters —
+      // flush this isolate's trailing brain delta first, then fold every
+      // outstanding 'brain:d:'/'brain:logd:' key (brainFold is the sole
+      // writer of brain:usage:<day> and brain:log).
+      try { await flushBrain(env); await brainFold(env); } catch (e) { console.error(e); }
       // Automations (feature build 2026-10-29; Pack A runner): queue
       // saved-search alerts + viewing reminders through the shared
       // runner — lock, proven-fresh catalog, sequential isolation,
       // automation:last heartbeat. Queue-only: nothing is ever sent.
       try { await runAutomations(env, 'cron'); } catch (e) { console.error(e); }
-      // Daily index reconcile (Pack D): union any ids a lost idxAdd
-      // update dropped back into their indexes — at most once a day
-      // (the guard key lives inside idxReconcile).
-      if (heavyOk) { try { await idxReconcile(env); } catch (e) { console.error(e); } }
-      // Pack PK4: periodic catalog snapshot rebuild (23h guard
-      // inside catalogSnapRebuild) — heals a listing an RMW race
-      // dropped from catalog:snap.
-      if (heavyOk) { try { await catalogSnapRebuild(env); } catch (e) { console.error(e); } }
+      // Pack AdvisorKvFix (§3): idxReconcile + catalogSnapRebuild MOVED
+      // off this nightly chain onto the hourly watchdog tick (rotating
+      // even/odd UTC hours, same 23 h guards inside each job) — the
+      // 09:00 UTC burst keeps only the folds, runAutomations and the
+      // heavy-only backup.
       /* Pack EB-1: nightly ledger fold (roll past days into eb:roll:*,
          prune raw records >14d) + the nightly heartbeat tick. Both
          fail-open and isolated from the chain above. */
