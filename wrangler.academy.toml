@@ -27,7 +27,7 @@ SITE_API_BASE = "https://advisor-api.erfanbillion.workers.dev"
 # flipping it back — KV data is never deleted. The data layer also
 # requires SCOPE='academy' (above) and the ACAD_DB binding (below),
 # so this var alone can never affect the site deployment.
-ACADEMY_STORE = "kv"
+ACADEMY_STORE = "d1"
 
 # The business account's ACADEMY namespace, bound under the SAME name
 # the code expects (env.LEADS). Academy data only: academy:* student
