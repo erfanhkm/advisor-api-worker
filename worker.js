@@ -17363,7 +17363,7 @@ async function speedCheck(env) {
     try { const r = await fetch(url, { method: 'GET', signal: AbortSignal.timeout(8000) }); const txt = await r.text(); return { ms: Date.now() - st, bytes: new TextEncoder().encode(txt).length, status: r.status }; }
     catch (e) { return { ms: null, bytes: 0, status: 0 }; }
   }
-  const both = await Promise.all([fetchTimed('https://ehrealtybc.com/'), fetchTimed('https://ehrealtybc.com/listings.html')]);
+  const both = await Promise.all([fetchTimed('https://ehrealtybc.com/'), fetchTimed('https://ehrealtybc.com/listings')]);
   const home = both[0], lst = both[1];
   out.homeMs = home.ms; out.homeKB = Math.round(home.bytes / 1024); out.homeStatus = home.status;
   out.listMs = lst.ms; out.listKB = Math.round(lst.bytes / 1024); out.listStatus = lst.status;
@@ -31727,9 +31727,9 @@ async function handleRequest(request, env, ctx) {
             await buildCatalogSnap(env);
           } catch (e) {}
           const SITE = 'https://ehrealtybc.com';
-          const PAGES = ['', 'listings.html', 'mortgage-calculator.html', 'buy-vs-rent.html', 'affordability.html', 'investor-analysis.html', 'ai-assistant.html', 'seller-tools.html', 'first-time-buyers.html', 'knowledge-centre.html', 'contact.html', 'listing-R2991001.html', 'listing-R2991002.html', 'listing-R2991003.html', 'listing-R2991004.html', 'listing-R2991005.html', 'listing-R2991006.html', 'area-burnaby-metrotown.html', 'area-coquitlam-coquitlam-centre.html', 'area-surrey-surrey-city-centre.html', 'area-vancouver-downtown.html', 'area-richmond.html', 'area-port-coquitlam.html'];
+          const PAGES = ['', 'listings', 'mortgage-calculator', 'buy-vs-rent', 'affordability', 'investor-analysis', 'ai-assistant', 'seller-tools', 'first-time-buyers', 'knowledge-centre', 'contact', 'listing-R2991001', 'listing-R2991002', 'listing-R2991003', 'listing-R2991004', 'listing-R2991005', 'listing-R2991006', 'area-burnaby-metrotown', 'area-coquitlam-coquitlam-centre', 'area-surrey-surrey-city-centre', 'area-vancouver-downtown', 'area-richmond', 'area-port-coquitlam'];
           for (const p of PAGES) {
-            const label = p || 'index.html';
+            const label = p === '' ? 'index.html' : p + '.html';
             try {
               const r = await fetch(SITE + '/' + p, { headers: { 'User-Agent': 'ErfanMaint/1.0' } });
               const buf = await r.arrayBuffer();
